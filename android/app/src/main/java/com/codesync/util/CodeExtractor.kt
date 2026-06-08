@@ -5,10 +5,13 @@ import java.util.regex.Pattern
 object CodeExtractor {
 
     private val CODE_PATTERNS = listOf(
+        Pattern.compile("""(?:验证码|校验码|动态码|登录码|安全码|确认码|短信码|一次性密码|OTP)[^\p{Alnum}]{0,10}([A-Za-z0-9]{4,8})""", Pattern.CASE_INSENSITIVE),
         Pattern.compile("""验证码[：:]\s*(\d{4,8})"""),
         Pattern.compile("""验证码是\s*(\d{4,8})"""),
         Pattern.compile("""code[：:]\s*(\d{4,8})""", Pattern.CASE_INSENSITIVE),
+        Pattern.compile("""(?:code|otp|pin)[^\p{Alnum}]{0,10}([A-Za-z0-9]{4,8})""", Pattern.CASE_INSENSITIVE),
         Pattern.compile("""(?:verification|verify|auth)\s*code[：:]\s*(\d{4,8})""", Pattern.CASE_INSENSITIVE),
+        Pattern.compile("""(?:verification|verify|auth)\s*code[^\p{Alnum}]{0,10}([A-Za-z0-9]{4,8})""", Pattern.CASE_INSENSITIVE),
         Pattern.compile("""(\d{4,8})\s*(?:是|为).*验证码"""),
         Pattern.compile("""【.{2,8}】\s*(\d{4,8})"""),
         Pattern.compile("""(\d{6})\b"""),

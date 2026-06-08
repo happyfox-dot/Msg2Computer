@@ -46,7 +46,7 @@ body {
   padding: 10px 14px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.05);
   overflow-y: auto;
-  max-height: 200px;
+  max-height: 180px;
 }
 
 .section-header {
@@ -54,9 +54,48 @@ body {
   letter-spacing: 1px; margin-bottom: 8px; font-weight: 600;
 }
 
+.codes-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.display-mode-toggle {
+  display: inline-flex;
+  padding: 2px;
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 6px;
+  background: rgba(255,255,255,0.05);
+  -webkit-app-region: no-drag;
+}
+
+.display-mode-toggle button {
+  min-width: 42px;
+  height: 22px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: #888;
+  font-size: 10px;
+  letter-spacing: 0;
+  text-transform: none;
+  cursor: pointer;
+}
+
+.display-mode-toggle button.active {
+  background: rgba(124,138,255,0.24);
+  color: #d8dcff;
+}
+
 #qr-container { text-align: center; margin: 8px 0; }
-#qr-image { width: 180px; height: 180px; border-radius: 8px; background: #fff; padding: 4px; }
+#pairing-section { max-height: 230px; }
+#phones-section { max-height: 132px; }
+#codes-section, #totp-section { flex: 1; min-height: 90px; }
+
+#qr-image { width: 168px; height: 168px; border-radius: 8px; background: #fff; padding: 4px; }
 .hint { font-size: 10px; color: #888; margin-top: 6px; }
+.pairing-address { font-size: 10px; color: #aaa; margin-top: 4px; word-break: break-all; }
 
 .btn-secondary {
   width: 100%; padding: 6px; border: 1px solid rgba(255,255,255,0.15);
@@ -66,10 +105,114 @@ body {
 }
 .btn-secondary:hover { background: rgba(255,255,255,0.1); color: #fff; }
 
-#codes-list, #totp-list { display: flex; flex-direction: column; gap: 6px; }
+#codes-list, #totp-list, #phones-list { display: flex; flex-direction: column; gap: 6px; }
 
 .empty-state { text-align: center; color: #666; font-size: 12px; padding: 16px 0; }
 
+.phone-row {
+  display: grid;
+  grid-template-columns: 1fr 34px 42px;
+  gap: 8px;
+  align-items: center;
+  padding: 8px 10px;
+  background: rgba(255,255,255,0.05);
+  border-radius: 8px;
+  border: 1px solid rgba(255,255,255,0.08);
+  -webkit-app-region: no-drag;
+}
+
+.phone-main { min-width: 0; }
+.phone-header { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.phone-name {
+  color: #e6e6e6;
+  font-size: 12px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.phone-status {
+  flex-shrink: 0;
+  padding: 2px 5px;
+  border-radius: 4px;
+  background: rgba(255,255,255,0.08);
+  color: #aaa;
+  font-size: 9px;
+}
+.phone-connected .phone-status { color: #5cdb8b; background: rgba(92,219,139,0.12); }
+.phone-disabled .phone-status,
+.phone-revoked .phone-status { color: #e0b060; background: rgba(224,176,96,0.12); }
+.phone-meta {
+  margin-top: 2px;
+  color: #777;
+  font-size: 9px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.phone-toggle {
+  width: 34px;
+  height: 20px;
+  position: relative;
+  cursor: pointer;
+}
+.phone-toggle input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+.phone-toggle span {
+  display: block;
+  width: 34px;
+  height: 20px;
+  border-radius: 10px;
+  background: rgba(255,255,255,0.12);
+  transition: all 0.15s;
+}
+.phone-toggle span::after {
+  content: "";
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #aaa;
+  transition: all 0.15s;
+}
+.phone-toggle input:checked + span { background: rgba(92,219,139,0.28); }
+.phone-toggle input:checked + span::after {
+  left: 17px;
+  background: #5cdb8b;
+}
+.phone-toggle input:disabled + span { opacity: 0.45; cursor: default; }
+
+.phone-revoke {
+  height: 24px;
+  border: 1px solid rgba(224,96,96,0.25);
+  border-radius: 5px;
+  background: rgba(224,96,96,0.08);
+  color: #e08080;
+  font-size: 10px;
+  cursor: pointer;
+  -webkit-app-region: no-drag;
+}
+.phone-revoke:hover:not(:disabled) { background: rgba(224,96,96,0.18); }
+.phone-revoke:disabled { opacity: 0.45; cursor: default; }
+
+.phone-restore {
+  height: 24px;
+  border: 1px solid rgba(92,219,139,0.3);
+  border-radius: 5px;
+  background: rgba(92,219,139,0.1);
+  color: #5cdb8b;
+  font-size: 10px;
+  cursor: pointer;
+  -webkit-app-region: no-drag;
+}
+.phone-restore:hover:not(:disabled) { background: rgba(92,219,139,0.2); }
+.phone-restore:disabled { opacity: 0.45; cursor: default; }
 .code-item {
   display: flex; align-items: center; justify-content: space-between;
   padding: 10px 12px; background: rgba(255,255,255,0.05);
@@ -91,7 +234,27 @@ body {
   color: #7c8aff; font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
 }
 
+.code-main { min-width: 0; }
+.code-raw-message {
+  max-height: 82px;
+  overflow-y: auto;
+  color: #e6e6e6;
+  font-size: 12px;
+  line-height: 17px;
+  word-break: break-word;
+  white-space: pre-wrap;
+  user-select: text;
+  -webkit-user-select: text;
+}
+.code-extracted {
+  margin-top: 5px;
+  color: #7c8aff;
+  font-size: 11px;
+  font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
+}
+.code-side { text-align: right; flex-shrink: 0; margin-left: 8px; }
 .code-source { font-size: 10px; color: #888; margin-top: 2px; }
+.code-phone { font-size: 10px; color: #aaa; margin-top: 2px; }
 .code-time { font-size: 10px; color: #666; }
 .code-actions { display: flex; gap: 4px; }
 .code-actions button {
@@ -100,6 +263,10 @@ body {
   font-size: 11px; cursor: pointer; transition: all 0.15s;
 }
 .code-actions button:hover { background: rgba(124,138,255,0.4); }
+.code-actions .toggle-raw-btn {
+  background: rgba(255,255,255,0.08); color: #aaa;
+}
+.code-actions .toggle-raw-btn:hover { background: rgba(255,255,255,0.18); color: #fff; }
 
 .totp-item {
   display: flex; align-items: center; gap: 10px;
@@ -114,7 +281,16 @@ body {
   color: #5cdb8b; font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
 }
 
-.totp-label { font-size: 11px; color: #aaa; flex: 1; }
+/* 按需模型下电脑端只持有推送时的码快照，超过当前周期即标记过期 */
+.totp-item.totp-expired .totp-code { color: #888; }
+.totp-item.totp-expired .totp-progress .fg { stroke: #e06060; }
+.totp-stale {
+  margin-left: 8px; font-size: 10px; font-weight: 600; letter-spacing: 0;
+  color: #e06060; vertical-align: middle;
+}
+
+.totp-main { min-width: 0; flex: 1; }
+.totp-label { font-size: 11px; color: #aaa; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .totp-progress {
   width: 40px; height: 40px; position: relative; flex-shrink: 0;
 }

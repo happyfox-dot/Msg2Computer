@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- TOTP 倒计时环：底圈 (background) + 随 progress 收缩的前景圈 (progress)。
+     必须使用 @android:id/background 和 @android:id/progress，
+     否则 ProgressBar 不会按进度裁剪，progressTintList 也不会生效。 -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:id="@android:id/background">
+        <shape android:shape="ring"
+            android:innerRadiusRatio="3.2"
+            android:thicknessRatio="9"
+            android:useLevel="false">
+            <solid android:color="@color/bg_surface_variant" />
+        </shape>
+    </item>
+    <item android:id="@android:id/progress">
+        <rotate
+            android:fromDegrees="-90"
+            android:toDegrees="-90"
+            android:pivotX="50%"
+            android:pivotY="50%">
+            <shape android:shape="ring"
+                android:innerRadiusRatio="3.2"
+                android:thicknessRatio="9"
+                android:useLevel="true">
+                <solid android:color="@color/accent_green" />
+            </shape>
+        </rotate>
+    </item>
+</layer-list>

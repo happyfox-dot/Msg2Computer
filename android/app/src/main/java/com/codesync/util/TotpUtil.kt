@@ -31,6 +31,11 @@ object TotpUtil {
         return (PERIOD - elapsed).toInt()
     }
 
+    /** 当前 30 秒周期的序号，周期切换时该值 +1，用于判断是否需要重新推送。 */
+    fun getCurrentCounter(): Long {
+        return (System.currentTimeMillis() / 1000) / PERIOD
+    }
+
     private fun base32Decode(base32: String): ByteArray {
         val alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
         val cleaned = base32.uppercase().replace(" ", "").replace("-", "")

@@ -14,4 +14,41 @@
     <string name="cancel">取消</string>
     <string name="disconnect">断开连接</string>
     <string name="connect">连接电脑</string>
+
+    <!-- 设备列表 -->
+    <string name="push_targets">推送目标</string>
+    <string name="no_device_paired">尚未配对电脑，请扫描电脑端二维码</string>
+    <string name="auto_sync">短信自动转发</string>
+    <string name="auto_sync_desc">收到验证码短信时自动推送到电脑</string>
+    <string name="totp_section">动态验证码 (TOTP)</string>
+    <string name="copy">复制</string>
+    <string name="connection_status">连接状态</string>
+    <string name="forwarding_on">已开启自动转发</string>
+    <string name="forwarding_off">已关闭自动转发</string>
+    <string name="status_idle">空闲（收到验证码时才连接）</string>
+    <string name="remove_device_title">移除电脑</string>
+    <string name="remove_device_message">确定移除「%1$s」？</string>
+    <string name="remove">移除</string>
+    <string name="device_address">%1$s:%2$d</string>
+
+    <!-- TOTP -->
+    <string name="totp_title">动态验证码 (TOTP)</string>
+    <string name="totp_empty">暂无 TOTP 验证码\n点击下方按钮添加</string>
+    <string name="totp_refresh_in">%1$d 秒后刷新</string>
+    <string name="totp_saved">已保存 TOTP「%1$s」</string>
+
+    <!-- 断开对话框 -->
+    <string name="select_disconnect_title">选择要断开的电脑</string>
+    <string name="disconnect_selected">断开所选</string>
+    <string name="disconnect_all">断开全部</string>
+    <string name="no_device_to_disconnect">暂无可断开的电脑</string>
+    <string name="select_device_to_disconnect">请选择要断开的电脑</string>
+    <string name="disconnected_n_devices">已断开 %1$d 台电脑</string>
+    <string name="push_enabled">推送已启用</string>
+    <string name="push_disabled">推送已禁用</string>
+
+    <!-- 电池优化 -->
+    <string name="battery_title">允许熄屏后台同步</string>
+    <string name="battery_message">为了熄屏后继续转发短信验证码，请允许应用不受电池优化限制。</string>
+    <string name="battery_go">去允许</string>
 </resources>

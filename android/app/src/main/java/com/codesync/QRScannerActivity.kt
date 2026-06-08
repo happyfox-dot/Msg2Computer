@@ -5,6 +5,7 @@ import android.os.Bundle
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import com.codesync.service.WebSocketService
+import com.codesync.util.DeviceStore
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import org.json.JSONObject
@@ -37,17 +38,24 @@ class QRScannerActivity : AppCompatActivity() {
             val host = json.optString("host", "")
             val port = json.optInt("port", 19527)
             val pairingKey = json.optString("pk", "")
+            val deviceName = json.optString("name", "Desktop $host:$port")
 
             if (host.isEmpty() || pairingKey.isEmpty()) {
                 Toast.makeText(this, "无效的二维码", Toast.LENGTH_SHORT).show()
                 return
             }
 
+            val device = DeviceStore.upsertDevice(
+                context = this,
+                host = host,
+                port = port,
+                pairingKey = pairingKey,
+                name = deviceName
+            )
+
             val serviceIntent = Intent(this, WebSocketService::class.java).apply {
                 action = WebSocketService.ACTION_CONNECT
-                putExtra("ws_host", host)
-                putExtra("ws_port", port)
-                putExtra("pairing_key", pairingKey)
+                putExtra(WebSocketService.EXTRA_DEVICE_ID, device.id)
             }
 
             if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {

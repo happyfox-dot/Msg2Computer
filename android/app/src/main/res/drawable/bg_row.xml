@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 卡片内的列表行背景：略浅于卡片，带圆角与点击水波纹 -->
+<ripple xmlns:android="http://schemas.android.com/apk/res/android"
+    android:color="#33FFFFFF">
+    <item>
+        <shape android:shape="rectangle">
+            <solid android:color="@color/bg_surface_variant" />
+            <corners android:radius="12dp" />
+        </shape>
+    </item>
+</ripple>

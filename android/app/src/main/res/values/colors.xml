@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 背景层次 -->
+    <color name="bg_window">#14141B</color>
+    <color name="bg_surface">#1E1E28</color>
+    <color name="bg_surface_variant">#2A2A38</color>
+    <color name="outline">#3A3A48</color>
+
+    <!-- 主题色 -->
+    <color name="primary">#7C8AFF</color>
+    <color name="on_primary">#FFFFFF</color>
+    <color name="primary_container">#2C3270</color>
+    <color name="accent_green">#5CDB8B</color>
+    <color name="danger">#E06060</color>
+    <color name="warning">#E0B060</color>
+
+    <!-- 文字层次 -->
+    <color name="text_primary">#ECECF2</color>
+    <color name="text_secondary">#9A9AA4</color>
+    <color name="text_tertiary">#6E6E7A</color>
+
+    <!-- 状态点 -->
+    <color name="status_online">#5CDB8B</color>
+    <color name="status_offline">#6E6E7A</color>
+</resources>

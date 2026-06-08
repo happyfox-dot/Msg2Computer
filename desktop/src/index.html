@@ -21,12 +21,26 @@
     <div id="qr-container">
       <img id="qr-image" src="" alt="配对二维码" />
       <p class="hint">使用手机端 App 扫描二维码完成配对</p>
+      <p id="pairing-address" class="pairing-address"></p>
     </div>
     <button id="btn-refresh-qr" class="btn-secondary">🔄 重新生成</button>
   </div>
 
+  <div id="phones-section" class="section">
+    <div class="section-header">📲 已授权手机 <span id="phones-count"></span></div>
+    <div id="phones-list">
+      <div class="empty-state">暂无已授权手机</div>
+    </div>
+  </div>
+
   <div id="codes-section" class="section">
-    <div class="section-header">📋 验证码列表</div>
+    <div class="section-header codes-header">
+      <span>📋 验证码列表</span>
+      <div class="display-mode-toggle" aria-label="短信显示模式">
+        <button id="btn-display-code" class="active" type="button">验证码</button>
+        <button id="btn-display-raw" type="button">原文</button>
+      </div>
+    </div>
     <div id="codes-list">
       <div class="empty-state">等待手机端连接...</div>
     </div>

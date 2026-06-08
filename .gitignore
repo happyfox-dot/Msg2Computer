@@ -1,0 +1,50 @@
+# ============================================================
+# 机密文件 —— 绝不可提交（公开仓库）
+# ============================================================
+# Android 签名密钥库与密码：泄露后任何人都能用你的身份签名/冒充更新
+*.jks
+*.keystore
+**/codebridge-release-passwords.txt
+**/*-passwords.txt
+key.properties
+keystore.properties
+
+# ============================================================
+# 构建产物 / 可分发包（体积大，应由 CI 或本地按需生成）
+# ============================================================
+# Android
+android/app/build/
+android/build/
+android/.gradle/
+android/release/*.apk
+android/release/*.aab
+android/release/*.idsig
+android/captures/
+android/.cxx/
+
+# Desktop（Electron）
+desktop/dist/
+desktop/out/
+desktop/node_modules/
+
+# ============================================================
+# 本地环境 / 机器相关配置
+# ============================================================
+android/local.properties
+*.log
+
+# ============================================================
+# IDE / 编辑器
+# ============================================================
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
+# ============================================================
+# Node
+# ============================================================
+node_modules/
+npm-debug.log*
+yarn-error.log*
