@@ -7,6 +7,9 @@ import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import com.codesync.service.WebSocketService
 import com.codesync.util.DeviceStore
+import com.codesync.util.GoogleAuthMigrationParser
+import com.codesync.util.TotpEntry
+import com.codesync.util.TotpStore
 import com.codesync.util.TotpUtil
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
@@ -25,7 +28,7 @@ class QRScannerActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
 
         val prompt = if (intent.getBooleanExtra(EXTRA_SCAN_TOTP_ONLY, false)) {
-            "扫描 TOTP 二维码\n（Google Authenticator 格式）"
+            "扫描 TOTP 二维码\n（支持标准 TOTP 和 Google Authenticator 批量导出）"
         } else {
             "扫描电脑配对二维码或 TOTP 二维码"
         }
@@ -45,11 +48,19 @@ class QRScannerActivity : AppCompatActivity() {
     }
 
     private fun handleScanResult(content: String) {
+        // Google Authenticator 批量迁移格式
+        if (content.startsWith("otpauth-migration://", ignoreCase = true)) {
+            handleGoogleMigration(content)
+            return
+        }
+
+        // 标准 TOTP 格式
         if (content.startsWith("otpauth://", ignoreCase = true)) {
             handleTotpQr(content)
             return
         }
 
+        // 配对二维码
         handlePairingQr(content)
     }
 
@@ -130,7 +141,15 @@ class QRScannerActivity : AppCompatActivity() {
             val digits = uri.getQueryParameter("digits")?.toIntOrNull()?.takeIf { it in 6..8 } ?: 6
             val period = uri.getQueryParameter("period")?.toIntOrNull()?.takeIf { it in 15..120 } ?: 30
 
-            saveTotpLocally(label, secret)
+            saveTotpLocally(
+                label = label,
+                secret = secret,
+                issuer = issuer,
+                accountName = accountName,
+                algorithm = algorithm,
+                digits = digits,
+                period = period
+            )
             sendTotpSeedToDesktop(
                 label = label,
                 secret = secret,
@@ -147,6 +166,61 @@ class QRScannerActivity : AppCompatActivity() {
         }
     }
 
+    private fun handleGoogleMigration(content: String) {
+        try {
+            val accounts = GoogleAuthMigrationParser.parse(content) ?: emptyList()
+
+            if (accounts.isEmpty()) {
+                Toast.makeText(this, "未能解析出任何账号", Toast.LENGTH_SHORT).show()
+                return
+            }
+
+            // 批量导入所有账号
+            var successCount = 0
+            var failCount = 0
+
+            accounts.forEach { account ->
+                try {
+                    if (TotpUtil.validateSecret(account.secret)) {
+                        saveTotpLocally(
+                            label = account.getDisplayLabel(),
+                            secret = account.secret,
+                            issuer = account.issuer,
+                            accountName = account.getAccountName(),
+                            algorithm = account.getAlgorithmString(),
+                            digits = account.getDigitsInt(),
+                            period = 30
+                        )
+                        sendTotpSeedToDesktop(
+                            label = account.getDisplayLabel(),
+                            secret = account.secret,
+                            issuer = account.issuer,
+                            accountName = account.getAccountName(),
+                            algorithm = account.getAlgorithmString(),
+                            digits = account.getDigitsInt(),
+                            period = 30
+                        )
+                        successCount++
+                    } else {
+                        failCount++
+                    }
+                } catch (e: Exception) {
+                    failCount++
+                }
+            }
+
+            val message = if (failCount == 0) {
+                "成功导入 $successCount 个 TOTP 账号"
+            } else {
+                "成功导入 $successCount 个，失败 $failCount 个"
+            }
+            Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+
+        } catch (e: Exception) {
+            Toast.makeText(this, "Google Authenticator 迁移数据解析失败: ${e.message}", Toast.LENGTH_LONG).show()
+        }
+    }
+
     private fun normalizeTotpAlgorithm(value: String?): String {
         return when (value?.uppercase()?.replace("-", "")) {
             "SHA256" -> "SHA256"
@@ -155,11 +229,25 @@ class QRScannerActivity : AppCompatActivity() {
         }
     }
 
-    private fun saveTotpLocally(label: String, secret: String) {
-        val prefs = getSharedPreferences("totp_secrets", MODE_PRIVATE)
-        val existing = prefs.getStringSet("entries", emptySet())?.toMutableSet() ?: mutableSetOf()
-        existing.add("$label|$secret")
-        prefs.edit().putStringSet("entries", existing).apply()
+    private fun saveTotpLocally(
+        label: String,
+        secret: String,
+        issuer: String = "",
+        accountName: String = "",
+        algorithm: String = "SHA1",
+        digits: Int = 6,
+        period: Int = 30
+    ) {
+        val entry = TotpEntry(
+            label = label,
+            secret = secret,
+            issuer = issuer,
+            accountName = accountName,
+            algorithm = algorithm,
+            digits = digits,
+            period = period
+        )
+        TotpStore.add(this, entry)
     }
 
     private fun sendTotpSeedToDesktop(
@@ -172,7 +260,6 @@ class QRScannerActivity : AppCompatActivity() {
         period: Int
     ) {
         if (DeviceStore.getEnabledDevices(this).isEmpty()) {
-            Toast.makeText(this, "已保存，本机暂无启用的电脑推送目标", Toast.LENGTH_SHORT).show()
             return
         }
 
