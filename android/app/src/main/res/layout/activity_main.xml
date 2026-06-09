@@ -158,6 +158,15 @@
 
                 </LinearLayout>
 
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btnRevokeTotpAccess"
+                    android:layout_width="match_parent"
+                    android:layout_height="48dp"
+                    android:layout_marginTop="8dp"
+                    android:text="@string/totp_access"
+                    style="@style/Widget.Material3.Button.OutlinedButton"
+                    app:cornerRadius="14dp" />
+
             </LinearLayout>
 
         </com.google.android.material.card.MaterialCardView>

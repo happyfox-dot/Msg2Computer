@@ -1,23 +1,26 @@
 const codes = []
 let authorizedPhones = []
+let desktopTotps = []
 let totpIntervals = new Map()
 let smsDisplayMode = localStorage.getItem('smsDisplayMode') === 'raw' ? 'raw' : 'code'
 // 每条短信卡片各自的显示状态（'code' / 'raw'）；未设置的卡片跟随 smsDisplayMode 全局默认
 const cardDisplayModes = new Map()
-let windowVisible = true
+let windowVisible = false
+let desktopTotpsDirty = false
 
 document.addEventListener('DOMContentLoaded', async () => {
   setupTitlebar()
+  setupTabs()
   setupPhoneList()
   setupSmsDisplayMode()
-  await loadPairingQR()
+  setupSettings()
 
   window.electronAPI.onNewCode((codeInfo) => {
     addCode(codeInfo)
   })
 
   window.electronAPI.onPairingQR((qrDataURL) => {
-    document.getElementById('qr-image').src = qrDataURL
+    setPairingQr(qrDataURL)
   })
 
   window.electronAPI.onPhonesChanged((phones) => {
@@ -34,14 +37,20 @@ document.addEventListener('DOMContentLoaded', async () => {
     await refreshAuthorizedPhones()
   })
 
-  window.electronAPI.onWindowVisibility((visible) => {
+  window.electronAPI.onWindowVisibility(async (visible) => {
     windowVisible = visible
     if (visible) {
-      // 重新显示：重建 TOTP 倒计时定时器并立即刷新一次
-      updateTotpDisplay()
+      await refreshDesktopTotps()
     } else {
       // 隐藏到托盘：清掉所有每秒重绘的 SVG 定时器，避免后台空转耗电
       pauseTotpIntervals()
+    }
+  })
+
+  window.electronAPI.onDesktopTotpsChanged(async () => {
+    desktopTotpsDirty = true
+    if (windowVisible) {
+      await refreshDesktopTotps()
     }
   })
 
@@ -49,6 +58,14 @@ document.addEventListener('DOMContentLoaded', async () => {
     await window.electronAPI.regeneratePairing()
     await loadPairingQR()
   })
+
+  windowVisible = await window.electronAPI.isWindowVisible()
+  await loadPairingQR()
+  if (windowVisible) {
+    await refreshDesktopTotps()
+  } else {
+    updateTotpDisplay()
+  }
 })
 
 function setupTitlebar() {
@@ -58,6 +75,41 @@ function setupTitlebar() {
   document.getElementById('btn-close').addEventListener('click', () => {
     window.electronAPI.hideWindow()
   })
+}
+
+function setupTabs() {
+  const tabButtons = document.querySelectorAll('.tab-btn')
+  const tabPanels = document.querySelectorAll('.tab-panel')
+
+  tabButtons.forEach(button => {
+    button.addEventListener('click', () => {
+      const targetTab = button.dataset.tab
+
+      // 更新按钮状态
+      tabButtons.forEach(btn => btn.classList.remove('active'))
+      button.classList.add('active')
+
+      // 更新面板显示
+      tabPanels.forEach(panel => {
+        if (panel.dataset.panel === targetTab) {
+          panel.classList.add('active')
+        } else {
+          panel.classList.remove('active')
+        }
+      })
+    })
+  })
+}
+
+function setupSettings() {
+  const githubLink = document.getElementById('link-github')
+  if (githubLink) {
+    githubLink.addEventListener('click', (e) => {
+      e.preventDefault()
+      window.electronAPI.openExternal?.('https://github.com/happyfox-dot/Msg2Computer')
+    })
+  }
+  updateSettingsStats()
 }
 
 function setupPhoneList() {
@@ -158,10 +210,18 @@ function setupSmsDisplayMode() {
 
 async function loadPairingQR() {
   const info = await window.electronAPI.getPairingInfo()
+  setPairingQr(info?.qrDataURL)
   updatePairingAddress(info)
   authorizedPhones = Array.isArray(info.authorizedPhones) ? info.authorizedPhones : []
   renderPhones()
   updateConnectionStatusFromPhones()
+}
+
+function setPairingQr(qrDataURL) {
+  const qrImage = document.getElementById('qr-image')
+  if (qrImage && qrDataURL) {
+    qrImage.src = qrDataURL
+  }
 }
 
 async function refreshAuthorizedPhones() {
@@ -169,6 +229,17 @@ async function refreshAuthorizedPhones() {
   authorizedPhones = Array.isArray(phones) ? phones : []
   renderPhones()
   updateConnectionStatusFromPhones()
+}
+
+async function refreshDesktopTotps() {
+  if (!windowVisible) {
+    desktopTotpsDirty = true
+    return
+  }
+  desktopTotpsDirty = false
+  desktopTotps = await window.electronAPI.getDesktopTotps()
+  if (!Array.isArray(desktopTotps)) desktopTotps = []
+  updateTotpDisplay()
 }
 
 function addCode(codeInfo) {
@@ -203,13 +274,21 @@ function addCode(codeInfo) {
   } else {
     updateConnectionStatus(true, 1)
   }
+
+  updateSettingsStats()
 }
 
 function renderPhones() {
   const container = document.getElementById('phones-list')
   const countEl = document.getElementById('phones-count')
 
-  countEl.textContent = authorizedPhones.length ? `(${authorizedPhones.length})` : ''
+  // 更新角标
+  if (authorizedPhones.length > 0) {
+    countEl.textContent = authorizedPhones.length
+    countEl.style.display = 'flex'
+  } else {
+    countEl.style.display = 'none'
+  }
 
   if (authorizedPhones.length === 0) {
     container.innerHTML = '<div class="empty-state">暂无已授权手机</div>'
@@ -349,7 +428,6 @@ function pauseTotpIntervals() {
 }
 
 function updateTotpDisplay() {
-  const totpCodes = codes.filter(c => c.type === 'totp')
   const container = document.getElementById('totp-list')
 
   for (const interval of totpIntervals.values()) {
@@ -357,6 +435,13 @@ function updateTotpDisplay() {
   }
   totpIntervals.clear()
 
+  if (desktopTotps.length > 0) {
+    renderDesktopTotps(container)
+    updateSettingsStats()
+    return
+  }
+
+  const totpCodes = codes.filter(c => c.type === 'totp')
   if (totpCodes.length === 0) {
     container.innerHTML = '<div class="empty-state">暂无 TOTP 验证码</div>'
     return
@@ -414,6 +499,49 @@ function updateTotpDisplay() {
   })
 }
 
+function renderDesktopTotps(container) {
+  container.innerHTML = desktopTotps.map(c => {
+    const progress = Number.isFinite(c.progress) ? c.progress : 1
+    const circumference = 2 * Math.PI * 16
+    const offset = circumference * (1 - progress)
+    const remaining = Number.isFinite(c.remaining) ? c.remaining : ''
+    const id = `totp-${hashString(c.id || getTotpKey(c))}`
+    return `
+      <div class="totp-item" data-id="${id}">
+        <div class="totp-progress">
+          <svg width="40" height="40" viewBox="0 0 40 40">
+            <circle class="bg" cx="20" cy="20" r="16"></circle>
+            <circle class="fg" cx="20" cy="20" r="16"
+              stroke-dasharray="${circumference}" stroke-dashoffset="${offset}"></circle>
+            <text class="remaining" x="20" y="20" dy=".35em">${remaining}s</text>
+          </svg>
+        </div>
+        <div class="totp-main">
+          <div class="totp-label">${escapeHtml(c.label || 'TOTP')}</div>
+          <div class="code-phone">电脑端本地刷新 · 来自: ${escapeHtml(c.phoneName || '未知手机')}</div>
+        </div>
+        <div class="totp-code" data-copy-value="${escapeHtml(c.code)}">${escapeHtml(c.code)}</div>
+      </div>
+    `
+  }).join('')
+
+  container.querySelectorAll('.totp-item').forEach(item => {
+    item.addEventListener('click', function() {
+      const codeEl = this.querySelector('.totp-code')
+      if (codeEl) {
+        window.electronAPI.copyToClipboard(codeEl.dataset.copyValue || codeEl.textContent)
+      }
+    })
+  })
+
+  if (windowVisible) {
+    const interval = setInterval(async () => {
+      await refreshDesktopTotps()
+    }, 1000)
+    totpIntervals.set('desktop-totps', interval)
+  }
+}
+
 function setupTotpProgressUpdate(id) {
   // 窗口隐藏到托盘时不创建每秒重绘的定时器，重新显示时由 updateTotpDisplay 重建
   if (!windowVisible) return
@@ -447,16 +575,46 @@ function updateConnectionStatusFromPhones() {
     phone.revoked !== true
   ).length
   updateConnectionStatus(connectedCount > 0, connectedCount)
+  updateSettingsStats()
 }
 
 function updateConnectionStatus(connected, count = 0) {
   const statusEl = document.getElementById('connection-status')
-  if (connected) {
-    statusEl.className = 'status-connected'
-    statusEl.textContent = count > 1 ? `● 已连接 ${count} 台手机` : '● 已连接'
-  } else {
-    statusEl.className = 'status-disconnected'
-    statusEl.textContent = '● 未连接'
+  const statusDetailEl = document.getElementById('connection-status-detail')
+
+  const statusClass = connected ? 'status-connected' : 'status-disconnected'
+  const statusText = connected
+    ? (count > 1 ? `● 已连接 ${count} 台手机` : '● 已连接')
+    : '● 未连接'
+
+  if (statusEl) {
+    statusEl.className = statusClass
+    statusEl.textContent = statusText
+  }
+
+  if (statusDetailEl) {
+    statusDetailEl.className = statusClass
+    statusDetailEl.textContent = statusText
+  }
+}
+
+function updateSettingsStats() {
+  const statsPhones = document.getElementById('stats-phones')
+  const statsSms = document.getElementById('stats-sms')
+  const statsTotp = document.getElementById('stats-totp')
+
+  if (statsPhones) {
+    statsPhones.textContent = `${authorizedPhones.length} 台`
+  }
+
+  if (statsSms) {
+    const smsCount = codes.filter(c => c.type !== 'totp').length
+    statsSms.textContent = `${smsCount} 条`
+  }
+
+  if (statsTotp) {
+    const totpCount = desktopTotps.length > 0 ? desktopTotps.length : codes.filter(c => c.type === 'totp').length
+    statsTotp.textContent = `${totpCount} 个`
   }
 }
 

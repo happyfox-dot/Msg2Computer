@@ -3,22 +3,49 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+import java.util.Properties
+import java.io.FileInputStream
+
+// 加载签名配置（如果文件存在）
+val keystorePropertiesFile = rootProject.file("keystore.properties")
+val keystoreProperties = Properties()
+if (keystorePropertiesFile.exists()) {
+    FileInputStream(keystorePropertiesFile).use { fis ->
+        keystoreProperties.load(fis)
+    }
+}
+
 android {
     namespace = "com.codesync"
     compileSdk = 34
 
     defaultConfig {
         applicationId = "com.codesync"
-        minSdk = 26
+        minSdk = 23
         targetSdk = 34
-        versionCode = 3
-        versionName = "1.0.2"
+        versionCode = 8
+        versionName = "1.0.7"
+    }
+
+    signingConfigs {
+        create("release") {
+            storeFile = file("../release/codebridge-release.jks")
+            keyAlias = "codebridge"
+            // PKCS12 格式：keyPassword 必须等于 storePassword
+            // 优先级：环境变量 > keystore.properties > gradle.properties
+            val password = System.getenv("KEYSTORE_PASSWORD")
+                ?: keystoreProperties.getProperty("KEYSTORE_PASSWORD")
+                ?: (project.findProperty("KEYSTORE_PASSWORD") as? String)
+            storePassword = password
+            keyPassword = password
+        }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            signingConfig = signingConfigs.getByName("release")
         }
     }
 
@@ -51,4 +78,7 @@ dependencies {
     implementation("com.journeyapps:zxing-android-embedded:4.3.0")
 
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
+
+    // Protobuf for Google Authenticator migration support
+    implementation("com.google.protobuf:protobuf-javalite:3.21.12")
 }

@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Tray, Menu, Notification, clipboard, ipcMain, nativeImage, screen } = require('electron')
+const { app, BrowserWindow, Tray, Menu, Notification, clipboard, ipcMain, nativeImage, screen, safeStorage, shell } = require('electron')
 const path = require('path')
 const fs = require('fs')
 const crypto = require('crypto')
@@ -15,6 +15,7 @@ let pairingKey = null
 let pairingQRData = null
 let authorizedPhones = new Map()
 let activePhoneConnections = new Map()
+let totpSeeds = new Map()
 
 const WS_PORT = 19527
 const CODE_TYPES = { SMS: 'sms', TOTP: 'totp' }
@@ -330,6 +331,13 @@ function loadOrCreatePairingKey() {
           connected: false
         }
       ]).filter(([id]) => !!id))
+      totpSeeds = new Map((saved.totpSeeds || []).map(seed => {
+        const normalized = normalizeTotpSeed({
+          ...seed,
+          secret: unprotectSecret(seed.secret)
+        })
+        return normalized ? [normalized.id, normalized] : null
+      }).filter(Boolean))
       if (saved.pairingKey) {
         pairingKey = saved.pairingKey
         return
@@ -360,6 +368,7 @@ function savePairingKey() {
           lastSeen: phone.lastSeen,
           lastIP: phone.lastIP
         })),
+        totpSeeds: getStoredTotpSeeds(),
         updatedAt: Date.now()
       }, null, 2),
       'utf8'
@@ -392,6 +401,7 @@ async function refreshPairingQR() {
   if (mainWindow) {
     mainWindow.webContents.send('pairing-qr', qrDataURL)
   }
+  return qrDataURL
 }
 
 function getLocalIP() {
@@ -559,6 +569,227 @@ function restorePhone(phoneId) {
   return getAuthorizedPhones()
 }
 
+function getStoredTotpSeeds() {
+  return Array.from(totpSeeds.values()).map(seed => ({
+    id: seed.id,
+    label: seed.label,
+    issuer: seed.issuer,
+    accountName: seed.accountName,
+    algorithm: seed.algorithm,
+    digits: seed.digits,
+    period: seed.period,
+    phoneId: seed.phoneId,
+    phoneName: seed.phoneName,
+    createdAt: seed.createdAt,
+    updatedAt: seed.updatedAt,
+    secret: protectSecret(seed.secret)
+  }))
+}
+
+function protectSecret(secret) {
+  const value = String(secret || '')
+  if (!value) return ''
+
+  try {
+    if (safeStorage?.isEncryptionAvailable()) {
+      return `safe:${safeStorage.encryptString(value).toString('base64')}`
+    }
+  } catch (e) {
+    console.error('Failed to encrypt TOTP secret:', e)
+  }
+
+  return `plain:${Buffer.from(value, 'utf8').toString('base64')}`
+}
+
+function unprotectSecret(value) {
+  const stored = String(value || '')
+  if (!stored) return ''
+
+  try {
+    if (stored.startsWith('safe:')) {
+      return safeStorage.decryptString(Buffer.from(stored.slice(5), 'base64'))
+    }
+    if (stored.startsWith('plain:')) {
+      return Buffer.from(stored.slice(6), 'base64').toString('utf8')
+    }
+  } catch (e) {
+    console.error('Failed to decrypt TOTP secret:', e)
+    return ''
+  }
+
+  return stored
+}
+
+function normalizeTotpSeed(seedData) {
+  const secret = normalizeTotpSecret(seedData.secret)
+  if (!secret) return null
+
+  const issuer = String(seedData.issuer || '').trim()
+  const accountName = String(seedData.accountName || '').trim()
+  const label = String(seedData.label || [issuer, accountName].filter(Boolean).join(': ') || 'TOTP').trim()
+  const algorithm = normalizeTotpAlgorithm(seedData.algorithm)
+  const digits = clampInteger(seedData.digits, 6, 8, 6)
+  const period = clampInteger(seedData.period, 15, 120, 30)
+  const id = seedData.id || `totp-${crypto
+    .createHash('sha256')
+    .update([secret, issuer, accountName, label, algorithm, digits, period].join('|'))
+    .digest('hex')
+    .slice(0, 20)}`
+  const now = Date.now()
+
+  return {
+    id,
+    label,
+    issuer,
+    accountName,
+    secret,
+    algorithm,
+    digits,
+    period,
+    phoneId: seedData.phoneId || '',
+    phoneName: seedData.phoneName || '未知手机',
+    createdAt: seedData.createdAt || now,
+    updatedAt: seedData.updatedAt || now
+  }
+}
+
+function normalizeTotpSecret(secret) {
+  const normalized = String(secret || '').toUpperCase().replace(/[\s-]/g, '')
+  return /^[A-Z2-7]{16,}$/.test(normalized) ? normalized : ''
+}
+
+function normalizeTotpAlgorithm(algorithm) {
+  const normalized = String(algorithm || '').toUpperCase().replace(/[-_]/g, '')
+  if (normalized === 'SHA256') return 'SHA256'
+  if (normalized === 'SHA512') return 'SHA512'
+  return 'SHA1'
+}
+
+function clampInteger(value, min, max, fallback) {
+  const parsed = Number.parseInt(value, 10)
+  if (!Number.isFinite(parsed)) return fallback
+  return Math.min(max, Math.max(min, parsed))
+}
+
+function upsertTotpSeed(seedData) {
+  const normalized = normalizeTotpSeed(seedData)
+  if (!normalized) return null
+
+  const existing = totpSeeds.get(normalized.id)
+  const seed = {
+    ...normalized,
+    createdAt: existing?.createdAt || normalized.createdAt,
+    updatedAt: Date.now()
+  }
+  totpSeeds.set(seed.id, seed)
+  savePairingKey()
+  notifyTotpSeedsChanged()
+  return seed
+}
+
+function notifyTotpSeedsChanged() {
+  if (mainWindow) {
+    mainWindow.webContents.send('desktop-totps-changed')
+  }
+}
+
+function revokeTotpSeeds(revokeData) {
+  const phoneId = String(revokeData.phoneId || '').trim()
+  const seedIds = Array.isArray(revokeData.seedIds)
+    ? new Set(revokeData.seedIds.map(id => String(id || '').trim()).filter(Boolean))
+    : null
+  if (!phoneId && (!seedIds || seedIds.size === 0)) return 0
+
+  let removed = 0
+  for (const [id, seed] of totpSeeds.entries()) {
+    const matchedById = seedIds && seedIds.has(id)
+    const matchedByPhone = !seedIds && phoneId && seed.phoneId === phoneId
+    if (matchedById || matchedByPhone) {
+      totpSeeds.delete(id)
+      removed += 1
+    }
+  }
+
+  if (removed > 0) {
+    savePairingKey()
+    notifyTotpSeedsChanged()
+  }
+  return removed
+}
+
+function getDesktopTotps() {
+  return Array.from(totpSeeds.values())
+    .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
+    .map(seed => {
+      const time = Math.floor(Date.now() / 1000)
+      const remaining = seed.period - (time % seed.period)
+      return {
+        id: seed.id,
+        label: seed.label,
+        issuer: seed.issuer,
+        accountName: seed.accountName,
+        phoneId: seed.phoneId,
+        phoneName: seed.phoneName,
+        type: CODE_TYPES.TOTP,
+        code: generateTotpCode(seed, time),
+        timestamp: Date.now(),
+        period: seed.period,
+        remaining,
+        progress: remaining / seed.period,
+        digits: seed.digits,
+        algorithm: seed.algorithm,
+        updatedAt: seed.updatedAt
+      }
+    })
+}
+
+function generateTotpCode(seed, timestampSeconds = Math.floor(Date.now() / 1000)) {
+  const key = base32ToBuffer(seed.secret)
+  if (key.length === 0) return ''.padStart(seed.digits, '0')
+
+  const counter = BigInt(Math.floor(timestampSeconds / seed.period))
+  const counterBuffer = Buffer.alloc(8)
+  let value = counter
+  for (let i = 7; i >= 0; i -= 1) {
+    counterBuffer[i] = Number(value & 0xffn)
+    value >>= 8n
+  }
+
+  const hmacAlgorithm = seed.algorithm === 'SHA512'
+    ? 'sha512'
+    : seed.algorithm === 'SHA256'
+      ? 'sha256'
+      : 'sha1'
+  const digest = crypto.createHmac(hmacAlgorithm, key).update(counterBuffer).digest()
+  const offset = digest[digest.length - 1] & 0x0f
+  const binary = ((digest[offset] & 0x7f) << 24) |
+    ((digest[offset + 1] & 0xff) << 16) |
+    ((digest[offset + 2] & 0xff) << 8) |
+    (digest[offset + 3] & 0xff)
+  const otp = binary % (10 ** seed.digits)
+  return String(otp).padStart(seed.digits, '0')
+}
+
+function base32ToBuffer(base32) {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'
+  let bits = 0
+  let value = 0
+  const bytes = []
+
+  for (const char of String(base32 || '').toUpperCase().replace(/[\s-=]/g, '')) {
+    const index = alphabet.indexOf(char)
+    if (index < 0) continue
+    value = (value << 5) | index
+    bits += 5
+    if (bits >= 8) {
+      bits -= 8
+      bytes.push((value >> bits) & 0xff)
+    }
+  }
+
+  return Buffer.from(bytes)
+}
+
 function startWebSocketServer() {
   wss = new WebSocketServer({ port: WS_PORT })
 
@@ -613,9 +844,15 @@ function startWebSocketServer() {
           const decrypted = decryptMessage(message.payload, connectionSessionKey)
           if (decrypted) {
             const codeData = JSON.parse(decrypted)
-            codeData.phoneId = codeData.phoneId || connectionPhoneId
-            codeData.phoneName = codeData.phoneName || connectionPhoneName
-            handleVerifyCode(codeData)
+            codeData.phoneId = connectionPhoneId
+            codeData.phoneName = connectionPhoneName || codeData.phoneName
+            if (codeData.type === 'totp_seed') {
+              handleTotpSeed(codeData)
+            } else if (codeData.type === 'totp_revoke') {
+              handleTotpRevoke(codeData)
+            } else {
+              handleVerifyCode(codeData)
+            }
             // 回 ACK：按需连接模型下手机收到 ACK 才安全断开，确保消息已落地
             ws.send(JSON.stringify({ type: 'code_ack', msgId: message.msgId || '' }))
           }
@@ -681,6 +918,26 @@ function handleVerifyCode(codeData) {
   clipboard.writeText(codeInfo.code)
 }
 
+function handleTotpSeed(seedData) {
+  const seed = upsertTotpSeed(seedData)
+  if (!seed) {
+    showNotification('TOTP 同步失败', '收到的 TOTP 密钥格式无效。')
+    return
+  }
+
+  showNotification('TOTP 已同步', `${seed.label}\n来源: ${seed.phoneName}`)
+}
+
+function handleTotpRevoke(revokeData) {
+  const removed = revokeTotpSeeds(revokeData)
+  const phoneName = revokeData.phoneName || '未知手机'
+  if (removed > 0) {
+    showNotification('TOTP 显示权限已撤销', `已删除 ${removed} 个验证码\n来源: ${phoneName}`)
+  } else {
+    showNotification('TOTP 显示权限已撤销', `没有可删除的验证码\n来源: ${phoneName}`)
+  }
+}
+
 function showNotification(title, body) {
   if (Notification.isSupported()) {
     new Notification({ title, body, urgency: 'critical' }).show()
@@ -691,10 +948,11 @@ ipcMain.handle('get-pairing-info', async () => {
   if (!pairingKey) {
     loadOrCreatePairingKey()
   }
-  await refreshPairingQR()
+  const qrDataURL = await refreshPairingQR()
   return {
     host: getLocalIP(),
     port: WS_PORT,
+    qrDataURL,
     hasPairingKey: !!pairingKey,
     authorizedPhones: getAuthorizedPhones()
   }
@@ -723,6 +981,12 @@ ipcMain.handle('regenerate-pairing', async () => {
 
 ipcMain.handle('get-authorized-phones', () => getAuthorizedPhones())
 
+ipcMain.handle('get-desktop-totps', () => getDesktopTotps())
+
+ipcMain.handle('is-window-visible', () => {
+  return mainWindow ? mainWindow.isVisible() : false
+})
+
 ipcMain.handle('set-phone-enabled', (event, phoneId, enabled) => {
   return setPhoneEnabled(phoneId, enabled)
 })
@@ -734,6 +998,11 @@ ipcMain.handle('revoke-phone', (event, phoneId) => {
 ipcMain.handle('restore-phone', (event, phoneId) => {
   return restorePhone(phoneId)
 })
+
+ipcMain.handle('open-external', async (event, url) => {
+  await shell.openExternal(url)
+})
+
 if (!gotSingleInstanceLock) {
   app.quit()
 } else {

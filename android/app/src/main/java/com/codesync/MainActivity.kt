@@ -7,6 +7,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
+import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -30,9 +31,18 @@ import com.codesync.databinding.ActivityMainBinding
 import com.codesync.service.WebSocketService
 import com.codesync.util.DesktopDevice
 import com.codesync.util.DeviceStore
+import com.codesync.util.GoogleAuthMigrationParser
+import com.codesync.util.MigrationOtpAccount
 import com.codesync.util.SettingsStore
+import com.codesync.util.TotpEntry
+import com.codesync.util.TotpStore
 import com.codesync.util.TotpUtil
 import com.google.android.material.materialswitch.MaterialSwitch
+import com.google.zxing.BinaryBitmap
+import com.google.zxing.DecodeHintType
+import com.google.zxing.MultiFormatReader
+import com.google.zxing.RGBLuminanceSource
+import com.google.zxing.common.HybridBinarizer
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -41,6 +51,11 @@ class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
     private var totpUpdateJob: Job? = null
     private var updatingForwardSwitch = false
+
+    // 相册图片选择器
+    private val pickImageLauncher = registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
+        uri?.let { handleImageFromGallery(it) }
+    }
 
     private val connectionReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -99,16 +114,25 @@ class MainActivity : AppCompatActivity() {
         ) {
             permissions.add(Manifest.permission.RECEIVE_SMS)
         }
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_SMS)
-            != PackageManager.PERMISSION_GRANTED
-        ) {
-            permissions.add(Manifest.permission.READ_SMS)
-        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
             != PackageManager.PERMISSION_GRANTED
         ) {
             permissions.add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        // 读取相册权限（Android 13+ 使用 READ_MEDIA_IMAGES）
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_IMAGES)
+                != PackageManager.PERMISSION_GRANTED
+            ) {
+                permissions.add(Manifest.permission.READ_MEDIA_IMAGES)
+            }
+        } else {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE)
+                != PackageManager.PERMISSION_GRANTED
+            ) {
+                permissions.add(Manifest.permission.READ_EXTERNAL_STORAGE)
+            }
         }
 
         if (permissions.isNotEmpty()) {
@@ -159,6 +183,10 @@ class MainActivity : AppCompatActivity() {
 
         binding.btnDisconnect.setOnClickListener {
             showDisconnectTargetsDialog()
+        }
+
+        binding.btnRevokeTotpAccess.setOnClickListener {
+            showRevokeTotpAccessDialog()
         }
 
         syncForwardSwitch()
@@ -296,12 +324,93 @@ class MainActivity : AppCompatActivity() {
         refreshConnectionSnapshot()
     }
 
+    private fun showRevokeTotpAccessDialog() {
+        val devices = DeviceStore.getDevices(this)
+        if (devices.isEmpty()) {
+            Toast.makeText(this, R.string.no_device_to_disconnect, Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val items = devices.map { device ->
+            val state = if (device.enabled) getString(R.string.push_enabled)
+            else getString(R.string.push_disabled)
+            "${device.name}\n${device.host}:${device.port} · $state"
+        }.toTypedArray()
+        val selected = BooleanArray(devices.size) { false }
+
+        AlertDialog.Builder(this)
+            .setTitle(R.string.revoke_totp_access_title)
+            .setMessage(R.string.revoke_totp_access_message)
+            .setMultiChoiceItems(items, selected) { _, index, checked ->
+                selected[index] = checked
+            }
+            .setPositiveButton(R.string.revoke_totp_access_selected) { _, _ ->
+                revokeTotpAccess(devices.filterIndexed { index, _ -> selected[index] })
+            }
+            .setNegativeButton(R.string.cancel, null)
+            .show()
+    }
+
+    private fun revokeTotpAccess(devices: List<DesktopDevice>) {
+        if (devices.isEmpty()) {
+            Toast.makeText(this, R.string.select_device_to_revoke_totp, Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        startServiceForAction(WebSocketService.ACTION_REVOKE_TOTP_ACCESS) {
+            putStringArrayListExtra(
+                WebSocketService.EXTRA_DEVICE_IDS,
+                ArrayList(devices.map { it.id })
+            )
+        }
+        Toast.makeText(
+            this,
+            getString(R.string.revoking_totp_access_n_devices, devices.size),
+            Toast.LENGTH_SHORT
+        ).show()
+        refreshConnectionSnapshot()
+    }
+
     private fun showAddTotpDialog() {
+        val items = arrayOf(
+            getString(R.string.add_totp_scan),      // 📷 扫描二维码
+            getString(R.string.add_totp_from_image), // 🖼️ 从相册导入
+            getString(R.string.add_totp_manual)     // ⌨️ 手动输入密钥
+        )
+
+        AlertDialog.Builder(this)
+            .setTitle(R.string.add_totp)
+            .setItems(items) { _, which ->
+                when (which) {
+                    0 -> {
+                        // 扫描二维码
+                        val intent = Intent(this, QRScannerActivity::class.java).apply {
+                            putExtra(QRScannerActivity.EXTRA_SCAN_TOTP_ONLY, true)
+                        }
+                        startActivity(intent)
+                    }
+                    1 -> {
+                        // 从相册导入
+                        pickImageLauncher.launch("image/*")
+                    }
+                    2 -> showManualTotpInputDialog()
+                }
+            }
+            .setNegativeButton(R.string.cancel, null)
+            .show()
+    }
+
+    private fun showManualTotpInputDialog() {
         val secretInput = com.google.android.material.textfield.TextInputEditText(this).apply {
             hint = getString(R.string.totp_secret_hint)
+            inputType = android.text.InputType.TYPE_CLASS_TEXT or
+                        android.text.InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS or
+                        android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
         }
         val labelInput = com.google.android.material.textfield.TextInputEditText(this).apply {
             hint = getString(R.string.totp_label_hint)
+            inputType = android.text.InputType.TYPE_CLASS_TEXT or
+                        android.text.InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
         }
 
         val layout = LinearLayout(this).apply {
@@ -322,36 +431,279 @@ class MainActivity : AppCompatActivity() {
         }
 
         AlertDialog.Builder(this)
-            .setTitle(R.string.add_totp)
+            .setTitle(R.string.add_totp_manual)
             .setView(layout)
             .setPositiveButton(R.string.save) { _, _ ->
-                val secret = secretInput.text?.toString()?.trim()?.replace(" ", "") ?: ""
+                val secret = secretInput.text?.toString()
+                    ?.trim()
+                    ?.uppercase()
+                    ?.replace(" ", "")
+                    ?.replace("-", "") ?: ""
                 val label = labelInput.text?.toString()?.trim()?.takeIf { it.isNotEmpty() } ?: "TOTP"
-                if (secret.isNotEmpty()) {
-                    saveTotpSecret(label, secret)
+
+                if (secret.isEmpty()) {
+                    Toast.makeText(this, R.string.totp_secret_required, Toast.LENGTH_SHORT).show()
+                    return@setPositiveButton
                 }
+
+                if (!TotpUtil.validateSecret(secret)) {
+                    Toast.makeText(this, R.string.totp_secret_invalid, Toast.LENGTH_LONG).show()
+                    return@setPositiveButton
+                }
+
+                saveTotpSecret(label, secret)
             }
             .setNegativeButton(R.string.cancel, null)
             .show()
     }
 
     private fun saveTotpSecret(label: String, secret: String) {
-        val prefs = getSharedPreferences("totp_secrets", MODE_PRIVATE)
-        val existing = prefs.getStringSet("entries", emptySet())?.toMutableSet() ?: mutableSetOf()
-        existing.add("$label|$secret")
-        prefs.edit().putStringSet("entries", existing).apply()
+        val entry = TotpEntry(
+            label = label,
+            secret = secret,
+            algorithm = "SHA1",
+            digits = 6,
+            period = 30
+        )
+        TotpStore.add(this, entry)
         Toast.makeText(this, getString(R.string.totp_saved, label), Toast.LENGTH_SHORT).show()
         rebuildTotpList()
         // 添加时推送一次到电脑端登记（按需模型：不再每周期反复推送）
-        syncTotpToDesktop(label, secret)
+        syncTotpToDesktop(entry)
     }
 
-    private fun syncTotpToDesktop(label: String, secret: String) {
+    private fun syncTotpToDesktop(entry: TotpEntry) {
         if (DeviceStore.getEnabledDevices(this).isEmpty()) return
-        startServiceForAction(WebSocketService.ACTION_SEND_TOTP) {
-            putExtra(WebSocketService.EXTRA_TOTP_LABEL, label)
-            putExtra(WebSocketService.EXTRA_TOTP_SECRET, secret)
+        startServiceForAction(WebSocketService.ACTION_SEND_TOTP_SEED) {
+            putExtra(WebSocketService.EXTRA_TOTP_LABEL, entry.label)
+            putExtra(WebSocketService.EXTRA_TOTP_SECRET, entry.secret)
+            putExtra(WebSocketService.EXTRA_TOTP_ALGORITHM, entry.algorithm)
+            putExtra(WebSocketService.EXTRA_TOTP_DIGITS, entry.digits)
+            putExtra(WebSocketService.EXTRA_TOTP_PERIOD, entry.period)
         }
+    }
+
+    /** 从相册选择的图片中解析二维码 */
+    private fun handleImageFromGallery(uri: Uri) {
+        try {
+            val inputStream = contentResolver.openInputStream(uri)
+            if (inputStream == null) {
+                Toast.makeText(this, R.string.totp_image_read_failed, Toast.LENGTH_SHORT).show()
+                return
+            }
+
+            val bitmap = BitmapFactory.decodeStream(inputStream)
+            inputStream.close()
+
+            if (bitmap == null) {
+                Toast.makeText(this, R.string.totp_image_read_failed, Toast.LENGTH_SHORT).show()
+                return
+            }
+
+            // 使用 ZXing 解析图片中的二维码
+            val width = bitmap.width
+            val height = bitmap.height
+            val pixels = IntArray(width * height)
+            bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
+
+            val source = RGBLuminanceSource(width, height, pixels)
+            val binaryBitmap = BinaryBitmap(HybridBinarizer(source))
+
+            val reader = MultiFormatReader()
+            val hints = mapOf(DecodeHintType.TRY_HARDER to true)
+
+            try {
+                val result = reader.decode(binaryBitmap, hints)
+                val qrContent = result.text
+
+                if (qrContent.isNullOrBlank()) {
+                    Toast.makeText(this, R.string.totp_qr_not_found, Toast.LENGTH_SHORT).show()
+                    return
+                }
+
+                // 判断是否是 TOTP 二维码
+                if (qrContent.startsWith("otpauth://totp", ignoreCase = true)) {
+                    parseTotpUri(qrContent)
+                } else {
+                    Toast.makeText(this, R.string.totp_qr_invalid, Toast.LENGTH_LONG).show()
+                }
+            } catch (e: Exception) {
+                Toast.makeText(this, R.string.totp_qr_not_found, Toast.LENGTH_SHORT).show()
+            } finally {
+                bitmap.recycle()
+            }
+        } catch (e: Exception) {
+            Toast.makeText(this, getString(R.string.totp_import_failed, e.message), Toast.LENGTH_LONG).show()
+        }
+    }
+
+    /** 解析 otpauth:// URI 并保存 TOTP */
+    private fun parseTotpUri(uri: String) {
+        try {
+            // 检查是否是 Google Authenticator 迁移格式
+            if (uri.startsWith("otpauth-migration://", ignoreCase = true)) {
+                handleGoogleMigration(uri)
+                return
+            }
+
+            val parsedUri = Uri.parse(uri)
+
+            if (!parsedUri.scheme.equals("otpauth", ignoreCase = true) ||
+                !parsedUri.host.equals("totp", ignoreCase = true)
+            ) {
+                Toast.makeText(this, R.string.totp_qr_invalid, Toast.LENGTH_SHORT).show()
+                return
+            }
+
+            val secret = parsedUri.getQueryParameter("secret")
+                ?.uppercase()
+                ?.replace(" ", "")
+                ?.replace("-", "")
+                ?.trim()
+                ?: ""
+
+            if (!TotpUtil.validateSecret(secret)) {
+                Toast.makeText(this, R.string.totp_secret_invalid, Toast.LENGTH_SHORT).show()
+                return
+            }
+
+            val rawLabel = parsedUri.pathSegments.firstOrNull()?.trim()?.takeIf { it.isNotEmpty() } ?: "TOTP"
+            val issuerFromQuery = parsedUri.getQueryParameter("issuer")?.trim().orEmpty()
+            val colonIndex = rawLabel.indexOf(':')
+            val issuer = issuerFromQuery.ifBlank {
+                if (colonIndex > 0) rawLabel.substring(0, colonIndex).trim() else ""
+            }
+            val accountName = if (colonIndex >= 0 && colonIndex < rawLabel.lastIndex) {
+                rawLabel.substring(colonIndex + 1).trim()
+            } else {
+                rawLabel
+            }.ifBlank { "TOTP" }
+            val label = listOf(issuer, accountName).filter { it.isNotBlank() }.joinToString(": ")
+                .ifBlank { accountName }
+
+            val algorithm = parsedUri.getQueryParameter("algorithm")?.uppercase() ?: "SHA1"
+            val digits = parsedUri.getQueryParameter("digits")?.toIntOrNull() ?: 6
+            val period = parsedUri.getQueryParameter("period")?.toIntOrNull() ?: 30
+
+            // 保存并同步到桌面
+            saveTotpSecretWithDetails(label, secret, issuer, accountName, algorithm, digits, period)
+
+            Toast.makeText(this, getString(R.string.totp_imported, label), Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) {
+            Toast.makeText(this, getString(R.string.totp_import_failed, e.message), Toast.LENGTH_LONG).show()
+        }
+    }
+
+    /** 处理 Google Authenticator 迁移协议（批量导入） */
+    private fun handleGoogleMigration(uri: String) {
+        try {
+            val accounts = GoogleAuthMigrationParser.parse(uri)
+
+            if (accounts.isNullOrEmpty()) {
+                Toast.makeText(this, R.string.google_migration_parse_failed, Toast.LENGTH_LONG).show()
+                return
+            }
+
+            // 显示批量导入确认对话框
+            showBatchImportDialog(accounts)
+        } catch (e: Exception) {
+            Toast.makeText(this, getString(R.string.totp_import_failed, e.message), Toast.LENGTH_LONG).show()
+        }
+    }
+
+    /** 显示批量导入确认对话框 */
+    private fun showBatchImportDialog(accounts: List<MigrationOtpAccount>) {
+        val accountNames: Array<String> = accounts.map { account ->
+            val label = account.getDisplayLabel()
+            val details = "${account.getAlgorithmString()}, ${account.getDigitsInt()} 位"
+            "$label\n  $details"
+        }.toTypedArray()
+
+        val selected = BooleanArray(accounts.size) { true } // 默认全选
+
+        AlertDialog.Builder(this)
+            .setTitle(getString(R.string.google_migration_found, accounts.size))
+            .setMultiChoiceItems(accountNames, selected) { _: android.content.DialogInterface, which: Int, isChecked: Boolean ->
+                selected[which] = isChecked
+            }
+            .setPositiveButton(R.string.import_selected) { _: android.content.DialogInterface, _: Int ->
+                val selectedAccounts = accounts.filterIndexed { index: Int, _: MigrationOtpAccount -> selected[index] }
+                if (selectedAccounts.isEmpty()) {
+                    Toast.makeText(this, R.string.no_account_selected, Toast.LENGTH_SHORT).show()
+                    return@setPositiveButton
+                }
+                batchImportAccounts(selectedAccounts)
+            }
+            .setNeutralButton(R.string.import_all) { _: android.content.DialogInterface, _: Int ->
+                batchImportAccounts(accounts)
+            }
+            .setNegativeButton(R.string.cancel, null)
+            .show()
+    }
+
+    /** 批量导入账号 */
+    private fun batchImportAccounts(accounts: List<MigrationOtpAccount>) {
+        var successCount = 0
+        var failCount = 0
+
+        accounts.forEach { account: MigrationOtpAccount ->
+            try {
+                if (TotpUtil.validateSecret(account.secret)) {
+                    saveTotpSecretWithDetails(
+                        label = account.getDisplayLabel(),
+                        secret = account.secret,
+                        issuer = account.issuer,
+                        accountName = account.getAccountName(),
+                        algorithm = account.getAlgorithmString(),
+                        digits = account.getDigitsInt(),
+                        period = 30
+                    )
+                    successCount++
+                } else {
+                    failCount++
+                }
+            } catch (e: Exception) {
+                failCount++
+            }
+        }
+
+        val message = if (failCount == 0) {
+            getString(R.string.batch_import_success, successCount)
+        } else {
+            getString(R.string.batch_import_partial, successCount, failCount)
+        }
+
+        Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+    }
+
+    /** 保存 TOTP 密钥（带完整参数）并同步到桌面 */
+    private fun saveTotpSecretWithDetails(
+        label: String,
+        secret: String,
+        issuer: String = "",
+        accountName: String = "",
+        algorithm: String = "SHA1",
+        digits: Int = 6,
+        period: Int = 30
+    ) {
+        val entry = TotpEntry(
+            label = label,
+            secret = secret,
+            issuer = issuer,
+            accountName = accountName,
+            algorithm = algorithm,
+            digits = digits,
+            period = period
+        )
+        TotpStore.add(this, entry)
+        rebuildTotpList()
+
+        // 同步到桌面（带完整参数）
+        syncTotpToDesktop(entry)
+    }
+
+    private fun loadTotpEntries(): List<TotpEntry> {
+        return TotpStore.loadAll(this)
     }
 
     private fun startServiceForAction(action: String, configure: Intent.() -> Unit = {}) {
@@ -366,15 +718,6 @@ class MainActivity : AppCompatActivity() {
         } else {
             startService(intent)
         }
-    }
-
-    private fun loadTotpEntries(): List<Pair<String, String>> {
-        val prefs = getSharedPreferences("totp_secrets", MODE_PRIVATE)
-        val entries = prefs.getStringSet("entries", emptySet()) ?: emptySet()
-        return entries.mapNotNull { entry ->
-            val parts = entry.split("|")
-            if (parts.size == 2) parts[0] to parts[1] else null
-        }.sortedBy { it.first.lowercase() }
     }
 
     private fun startTotpUpdates() {
@@ -398,7 +741,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 根据已保存的 TOTP 重建卡片列表（验证码本地生成）。 */
+    /** 根据已保存的 TOTP 重建卡片列表（验证码本地生成，支持完整参数）。 */
     private fun rebuildTotpList() {
         val entries = loadTotpEntries()
         val container = binding.totpList
@@ -416,35 +759,103 @@ class MainActivity : AppCompatActivity() {
         }
 
         val inflater = LayoutInflater.from(this)
-        entries.forEach { (label, secret) ->
+        entries.forEach { entry: TotpEntry ->
             val row = inflater.inflate(R.layout.item_totp, container, false)
-            row.findViewById<TextView>(R.id.totpLabel).text = label
-            row.findViewById<TextView>(R.id.totpCode).text = TotpUtil.generate(secret)
+            row.findViewById<TextView>(R.id.totpLabel).text = entry.label
+
+            // 使用完整参数生成 TOTP
+            val code = TotpUtil.generate(
+                entry.secret,
+                algorithm = entry.algorithm,
+                digits = entry.digits,
+                period = entry.period
+            )
+            row.findViewById<TextView>(R.id.totpCode).text = code
+
+            // 复制按钮
             row.findViewById<ImageView>(R.id.totpCopy).setOnClickListener {
-                copyToClipboard(TotpUtil.generate(secret))
+                copyToClipboard(TotpUtil.generate(
+                    entry.secret,
+                    algorithm = entry.algorithm,
+                    digits = entry.digits,
+                    period = entry.period
+                ))
             }
-            row.setOnClickListener { copyToClipboard(TotpUtil.generate(secret)) }
+
+            // 点击复制
+            row.setOnClickListener {
+                copyToClipboard(TotpUtil.generate(
+                    entry.secret,
+                    algorithm = entry.algorithm,
+                    digits = entry.digits,
+                    period = entry.period
+                ))
+            }
+
+            // 长按删除
+            row.setOnLongClickListener {
+                confirmDeleteTotp(entry)
+                true
+            }
+
             container.addView(row)
         }
         updateTotpCountdowns()
     }
 
-    /** 每秒更新所有 TOTP 行的倒计时环和剩余秒数（本地，不耗流量）。 */
+    /** 确认删除 TOTP */
+    private fun confirmDeleteTotp(entry: TotpEntry) {
+        AlertDialog.Builder(this)
+            .setTitle(R.string.delete_totp_title)
+            .setMessage(getString(R.string.delete_totp_message, entry.label))
+            .setPositiveButton(R.string.delete) { _, _ ->
+                TotpStore.remove(this, entry.label)
+                rebuildTotpList()
+                Toast.makeText(this, getString(R.string.totp_deleted, entry.label), Toast.LENGTH_SHORT).show()
+            }
+            .setNegativeButton(R.string.cancel, null)
+            .show()
+    }
+
+    /** 每秒更新所有 TOTP 行的倒计时环和剩余秒数（本地，支持动态周期）。 */
     private fun updateTotpCountdowns() {
-        val remaining = TotpUtil.getRemainingSeconds()
+        val entries = loadTotpEntries()
         val container = binding.totpList
+
         for (i in 0 until container.childCount) {
             val child = container.getChildAt(i)
             val progress = child.findViewById<ProgressBar>(R.id.totpProgress) ?: continue
             val text = child.findViewById<TextView>(R.id.totpRemaining) ?: continue
+            val codeView = child.findViewById<TextView>(R.id.totpCode) ?: continue
+
+            // 获取对应的 TOTP 条目（按索引匹配）
+            if (i >= entries.size) continue
+            val entry = entries[i]
+
+            val remaining = TotpUtil.getRemainingSeconds(entry.period)
+            progress.max = entry.period
             progress.progress = remaining
             text.text = remaining.toString()
+
             val color = ContextCompat.getColor(
                 this,
                 if (remaining <= 5) R.color.danger else R.color.accent_green
             )
             progress.progressTintList = ColorStateList.valueOf(color)
             text.setTextColor(color)
+
+            // 周期切换时重新生成验证码
+            val currentCounter = TotpUtil.getCurrentCounter(entry.period)
+            val tag = child.tag as? Long
+            if (tag == null || tag != currentCounter) {
+                child.tag = currentCounter
+                codeView.text = TotpUtil.generate(
+                    entry.secret,
+                    algorithm = entry.algorithm,
+                    digits = entry.digits,
+                    period = entry.period
+                )
+            }
         }
     }
 

@@ -16,41 +16,133 @@
     </div>
   </div>
 
-  <div id="pairing-section" class="section">
-    <div class="section-header">📱 扫码配对</div>
-    <div id="qr-container">
-      <img id="qr-image" src="" alt="配对二维码" />
-      <p class="hint">使用手机端 App 扫描二维码完成配对</p>
-      <p id="pairing-address" class="pairing-address"></p>
-    </div>
-    <button id="btn-refresh-qr" class="btn-secondary">🔄 重新生成</button>
+  <!-- 标签页导航 -->
+  <div id="tabs-nav">
+    <button class="tab-btn active" data-tab="sms">
+      <span class="tab-icon">📋</span>
+      <span class="tab-label">短信验证码</span>
+    </button>
+    <button class="tab-btn" data-tab="totp">
+      <span class="tab-icon">⏱️</span>
+      <span class="tab-label">动态验证码</span>
+    </button>
+    <button class="tab-btn" data-tab="phones">
+      <span class="tab-icon">📲</span>
+      <span class="tab-label">已授权手机</span>
+      <span id="phones-count" class="tab-badge"></span>
+    </button>
+    <button class="tab-btn" data-tab="pairing">
+      <span class="tab-icon">🔗</span>
+      <span class="tab-label">配对</span>
+    </button>
+    <button class="tab-btn" data-tab="settings">
+      <span class="tab-icon">⚙️</span>
+      <span class="tab-label">设置</span>
+    </button>
   </div>
 
-  <div id="phones-section" class="section">
-    <div class="section-header">📲 已授权手机 <span id="phones-count"></span></div>
-    <div id="phones-list">
-      <div class="empty-state">暂无已授权手机</div>
-    </div>
-  </div>
+  <!-- 标签页内容容器 -->
+  <div id="tabs-content">
 
-  <div id="codes-section" class="section">
-    <div class="section-header codes-header">
-      <span>📋 验证码列表</span>
-      <div class="display-mode-toggle" aria-label="短信显示模式">
-        <button id="btn-display-code" class="active" type="button">验证码</button>
-        <button id="btn-display-raw" type="button">原文</button>
+    <!-- 短信验证码标签页 -->
+    <div class="tab-panel active" data-panel="sms">
+      <div class="panel-header">
+        <h2 class="panel-title">短信验证码</h2>
+        <div class="display-mode-toggle" aria-label="短信显示模式">
+          <button id="btn-display-code" class="active" type="button">验证码</button>
+          <button id="btn-display-raw" type="button">原文</button>
+        </div>
+      </div>
+      <div class="panel-body scrollable">
+        <div id="codes-list">
+          <div class="empty-state">等待接收验证码...</div>
+        </div>
       </div>
     </div>
-    <div id="codes-list">
-      <div class="empty-state">等待手机端连接...</div>
-    </div>
-  </div>
 
-  <div id="totp-section" class="section">
-    <div class="section-header">⏱️ 动态验证码 (TOTP)</div>
-    <div id="totp-list">
-      <div class="empty-state">暂无 TOTP 验证码</div>
+    <!-- TOTP 动态验证码标签页 -->
+    <div class="tab-panel" data-panel="totp">
+      <div class="panel-header">
+        <h2 class="panel-title">TOTP 动态验证码</h2>
+      </div>
+      <div class="panel-body scrollable">
+        <div id="totp-list">
+          <div class="empty-state">暂无 TOTP 验证码</div>
+        </div>
+      </div>
     </div>
+
+    <!-- 已授权手机标签页 -->
+    <div class="tab-panel" data-panel="phones">
+      <div class="panel-header">
+        <h2 class="panel-title">已授权手机</h2>
+      </div>
+      <div class="panel-body scrollable">
+        <div id="phones-list">
+          <div class="empty-state">暂无已授权手机</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 配对标签页 -->
+    <div class="tab-panel" data-panel="pairing">
+      <div class="panel-header">
+        <h2 class="panel-title">扫码配对</h2>
+      </div>
+      <div class="panel-body scrollable center-content">
+        <div id="qr-container">
+          <img id="qr-image" src="" alt="配对二维码" />
+          <p class="hint">使用手机端 App 扫描二维码完成配对</p>
+          <p id="pairing-address" class="pairing-address"></p>
+        </div>
+        <button id="btn-refresh-qr" class="btn-secondary">🔄 重新生成配对码</button>
+      </div>
+    </div>
+
+    <!-- 设置标签页 -->
+    <div class="tab-panel" data-panel="settings">
+      <div class="panel-header">
+        <h2 class="panel-title">设置与诊断</h2>
+      </div>
+      <div class="panel-body scrollable">
+        <div class="settings-group">
+          <h3 class="settings-group-title">连接状态</h3>
+          <div class="settings-item">
+            <span class="settings-label">当前状态</span>
+            <span id="connection-status-detail" class="status-disconnected">● 未连接</span>
+          </div>
+        </div>
+
+        <div class="settings-group">
+          <h3 class="settings-group-title">统计信息</h3>
+          <div class="settings-item">
+            <span class="settings-label">已授权手机</span>
+            <span id="stats-phones" class="settings-value">0 台</span>
+          </div>
+          <div class="settings-item">
+            <span class="settings-label">短信验证码</span>
+            <span id="stats-sms" class="settings-value">0 条</span>
+          </div>
+          <div class="settings-item">
+            <span class="settings-label">TOTP 验证码</span>
+            <span id="stats-totp" class="settings-value">0 个</span>
+          </div>
+        </div>
+
+        <div class="settings-group">
+          <h3 class="settings-group-title">关于</h3>
+          <div class="settings-item">
+            <span class="settings-label">版本号</span>
+            <span class="settings-value">v1.0.7</span>
+          </div>
+          <div class="settings-item">
+            <span class="settings-label">项目地址</span>
+            <a href="#" id="link-github" class="settings-link">GitHub</a>
+          </div>
+        </div>
+      </div>
+    </div>
+
   </div>
 
   <div id="status-bar">

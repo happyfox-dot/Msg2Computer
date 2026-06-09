@@ -52,13 +52,21 @@ class WebSocketService : Service() {
         const val ACTION_DISCONNECT = "com.codesync.DISCONNECT"
         const val ACTION_SEND_SMS = "com.codesync.SEND_SMS"
         const val ACTION_SEND_TOTP = "com.codesync.SEND_TOTP"
+        const val ACTION_SEND_TOTP_SEED = "com.codesync.SEND_TOTP_SEED"
+        const val ACTION_REVOKE_TOTP_ACCESS = "com.codesync.REVOKE_TOTP_ACCESS"
 
         const val EXTRA_CODE = "code"
         const val EXTRA_SOURCE = "source"
         const val EXTRA_MESSAGE_BODY = "message_body"
         const val EXTRA_TOTP_LABEL = "totp_label"
         const val EXTRA_TOTP_SECRET = "totp_secret"
+        const val EXTRA_TOTP_ISSUER = "totp_issuer"
+        const val EXTRA_TOTP_ACCOUNT = "totp_account"
+        const val EXTRA_TOTP_ALGORITHM = "totp_algorithm"
+        const val EXTRA_TOTP_DIGITS = "totp_digits"
+        const val EXTRA_TOTP_PERIOD = "totp_period"
         const val EXTRA_DEVICE_ID = "device_id"
+        const val EXTRA_DEVICE_IDS = "device_ids"
 
         const val NOTIFICATION_ID = 1001
         const val CHANNEL_ID = "code_sync_service"
@@ -105,7 +113,8 @@ class WebSocketService : Service() {
         var reconnectJob: Job? = null,
         var reconnectAttempts: Int = 0,
         // true 表示这是无负载的配对测试连接，鉴权后短暂保持再主动断开
-        var registerOnly: Boolean = false
+        var registerOnly: Boolean = false,
+        var forceConnect: Boolean = false
     )
 
     private data class PendingPayload(
@@ -140,6 +149,8 @@ class WebSocketService : Service() {
             ACTION_DISCONNECT -> handleDisconnect()
             ACTION_SEND_SMS -> handleSendSms(intent)
             ACTION_SEND_TOTP -> handleSendTotp(intent)
+            ACTION_SEND_TOTP_SEED -> handleSendTotpSeed(intent)
+            ACTION_REVOKE_TOTP_ACCESS -> handleRevokeTotpAccess(intent)
             else -> stopIfNothingPending("空闲")
         }
 
@@ -196,6 +207,47 @@ class WebSocketService : Service() {
         enqueueAndDeliver(code, label, "totp", label = label)
     }
 
+    private fun handleSendTotpSeed(intent: Intent) {
+        val label = intent.getStringExtra(EXTRA_TOTP_LABEL)?.takeIf { it.isNotBlank() } ?: "TOTP"
+        val secret = intent.getStringExtra(EXTRA_TOTP_SECRET) ?: run {
+            stopIfNothingPending("空闲")
+            return
+        }
+        val issuer = intent.getStringExtra(EXTRA_TOTP_ISSUER).orEmpty()
+        val accountName = intent.getStringExtra(EXTRA_TOTP_ACCOUNT).orEmpty()
+        val algorithm = intent.getStringExtra(EXTRA_TOTP_ALGORITHM)?.takeIf { it.isNotBlank() } ?: "SHA1"
+        val digits = intent.getIntExtra(EXTRA_TOTP_DIGITS, 6).coerceIn(6, 8)
+        val period = intent.getIntExtra(EXTRA_TOTP_PERIOD, 30).coerceIn(15, 120)
+
+        holdForwardLocks()
+        enqueueTotpSeed(
+            label = label,
+            secret = secret,
+            issuer = issuer,
+            accountName = accountName,
+            algorithm = algorithm,
+            digits = digits,
+            period = period
+        )
+    }
+
+    private fun handleRevokeTotpAccess(intent: Intent) {
+        val requestedIds = intent.getStringArrayListExtra(EXTRA_DEVICE_IDS)?.toSet().orEmpty()
+        if (requestedIds.isEmpty()) {
+            stopIfNothingPending("未选择电脑")
+            return
+        }
+
+        val targetDevices = DeviceStore.getDevices(this).filter { it.id in requestedIds }
+        if (targetDevices.isEmpty()) {
+            stopIfNothingPending("未找到要撤销的电脑")
+            return
+        }
+
+        holdForwardLocks()
+        enqueueTotpRevoke(targetDevices)
+    }
+
     /** 构造一条带 msgId 的负载，登记到待投递队列，然后向所有启用电脑发起连接投递。 */
     private fun enqueueAndDeliver(
         code: String,
@@ -244,13 +296,95 @@ class WebSocketService : Service() {
         enabledDevices.forEach { connectDevice(it, registerOnly = false) }
     }
 
-    private fun connectDevice(device: DesktopDevice, registerOnly: Boolean) {
-        if (!device.enabled) return
+    private fun enqueueTotpSeed(
+        label: String,
+        secret: String,
+        issuer: String,
+        accountName: String,
+        algorithm: String,
+        digits: Int,
+        period: Int
+    ) {
+        val enabledDevices = DeviceStore.getEnabledDevices(this)
+        if (enabledDevices.isEmpty()) {
+            updateConnectionState("没有启用的电脑推送目标")
+            releaseForwardLocks()
+            stopService("没有启用的电脑推送目标")
+            return
+        }
+
+        val phoneIdentity = PhoneIdentityStore.get(this)
+        val msgId = "m-${System.currentTimeMillis()}-${msgIdSeq.incrementAndGet()}"
+        val payload = JSONObject()
+            .put("type", "totp_seed")
+            .put("label", label)
+            .put("secret", secret)
+            .put("issuer", issuer)
+            .put("accountName", accountName)
+            .put("algorithm", algorithm)
+            .put("digits", digits)
+            .put("period", period)
+            .put("timestamp", System.currentTimeMillis())
+            .put("phoneId", phoneIdentity.id)
+            .put("phoneName", phoneIdentity.name)
+            .toString()
+
+        val targetIds = enabledDevices.map { it.id }.toMutableSet()
+        synchronized(pendingPayloads) {
+            pendingPayloads.add(PendingPayload(msgId, payload, targetIds, "totp_seed"))
+            while (pendingPayloads.size > 20) {
+                val totpIndex = pendingPayloads.indexOfFirst { it.type == "totp" }
+                pendingPayloads.removeAt(if (totpIndex >= 0) totpIndex else 0)
+            }
+        }
+
+        updateConnectionState("正在同步 TOTP 密钥到 ${enabledDevices.size} 台电脑")
+        armDeliveryDeadline()
+        enabledDevices.forEach { connectDevice(it, registerOnly = false) }
+    }
+
+    private fun enqueueTotpRevoke(targetDevices: List<DesktopDevice>) {
+        if (targetDevices.isEmpty()) {
+            updateConnectionState("未找到要撤销的电脑")
+            releaseForwardLocks()
+            stopService("未找到要撤销的电脑")
+            return
+        }
+
+        val phoneIdentity = PhoneIdentityStore.get(this)
+        val msgId = "m-${System.currentTimeMillis()}-${msgIdSeq.incrementAndGet()}"
+        val payload = JSONObject()
+            .put("type", "totp_revoke")
+            .put("scope", "phone")
+            .put("timestamp", System.currentTimeMillis())
+            .put("phoneId", phoneIdentity.id)
+            .put("phoneName", phoneIdentity.name)
+            .toString()
+
+        val targetIds = targetDevices.map { it.id }.toMutableSet()
+        synchronized(pendingPayloads) {
+            pendingPayloads.add(PendingPayload(msgId, payload, targetIds, "totp_revoke"))
+            while (pendingPayloads.size > 20) {
+                val lowPriorityIndex = pendingPayloads.indexOfFirst {
+                    it.type == "totp" || it.type == "totp_seed" || it.type == "totp_revoke"
+                }
+                pendingPayloads.removeAt(if (lowPriorityIndex >= 0) lowPriorityIndex else 0)
+            }
+        }
+
+        updateConnectionState("正在撤销 ${targetDevices.size} 台电脑的 TOTP 显示权限")
+        armDeliveryDeadline()
+        targetDevices.forEach { connectDevice(it, registerOnly = false, force = true) }
+    }
+
+    private fun connectDevice(device: DesktopDevice, registerOnly: Boolean, force: Boolean = false) {
+        if (!force && !device.enabled) return
 
         val existing = connections[device.id]
         if (existing?.authenticated == true || existing?.webSocket != null) {
             // 已在连接/已连上：若现在带了负载，鉴权完成后会一并 flush
             if (!registerOnly) existing.registerOnly = false
+            if (force) existing.forceConnect = true
             return
         }
 
@@ -266,7 +400,8 @@ class WebSocketService : Service() {
         val connection = DeviceConnection(
             device = device,
             client = client,
-            registerOnly = registerOnly
+            registerOnly = registerOnly,
+            forceConnect = force
         )
         connections[device.id] = connection
         updateConnectionState("正在连接 ${device.name} (${device.host}:${device.port})")
@@ -397,11 +532,12 @@ class WebSocketService : Service() {
         connection.reconnectJob = serviceScope.launch {
             delay(delayMs)
             val latest = DeviceStore.findDevice(this@WebSocketService, deviceId)
-            if (latest?.enabled == true && deviceHasPending(deviceId) &&
+            if (latest != null && (latest.enabled || connection.forceConnect) &&
+                deviceHasPending(deviceId) &&
                 connections[deviceId]?.authenticated != true
             ) {
                 updateConnectionState("正在重连 ${latest.name}")
-                connectDevice(latest, registerOnly = false)
+                connectDevice(latest, registerOnly = false, force = connection.forceConnect)
             } else {
                 cleanupConnection(deviceId)
                 checkAllDoneAndStop()
@@ -527,7 +663,12 @@ class WebSocketService : Service() {
         connectedDeviceIds = emptySet()
         lastStatusMessage = statusMessage
         broadcastConnectionState(false, 0, statusMessage)
-        stopForeground(STOP_FOREGROUND_REMOVE)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+        } else {
+            @Suppress("DEPRECATION")
+            stopForeground(true)
+        }
         stopSelf()
     }
 

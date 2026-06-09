@@ -7,9 +7,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
   minimizeWindow: () => ipcRenderer.invoke('minimize-window'),
   regeneratePairing: () => ipcRenderer.invoke('regenerate-pairing'),
   getAuthorizedPhones: () => ipcRenderer.invoke('get-authorized-phones'),
+  getDesktopTotps: () => ipcRenderer.invoke('get-desktop-totps'),
+  isWindowVisible: () => ipcRenderer.invoke('is-window-visible'),
   setPhoneEnabled: (phoneId, enabled) => ipcRenderer.invoke('set-phone-enabled', phoneId, enabled),
   revokePhone: (phoneId) => ipcRenderer.invoke('revoke-phone', phoneId),
   restorePhone: (phoneId) => ipcRenderer.invoke('restore-phone', phoneId),
+  openExternal: (url) => ipcRenderer.invoke('open-external', url),
 
   onNewCode: (callback) => {
     ipcRenderer.on('new-code', (event, data) => callback(data))
@@ -28,5 +31,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   },
   onWindowVisibility: (callback) => {
     ipcRenderer.on('window-visibility', (event, visible) => callback(visible))
+  },
+  onDesktopTotpsChanged: (callback) => {
+    ipcRenderer.on('desktop-totps-changed', (event, data) => callback(data))
   }
 })
