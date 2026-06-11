@@ -24,7 +24,10 @@ data class DesktopDevice(
     val allowSmsMessages: Boolean = true,
     val allowNotifications: Boolean = true,
     val allowTotp: Boolean = true,
-    val allowClipboard: Boolean = false,
+    // v2 起默认允许：是否同步由全局总开关（默认关）决定，本位仅作为
+    // 针对个别设备的显式关闭（旧默认 false 导致全局开关打开后剪贴板
+    // 同步依然提示"没有启用的推送目标"）
+    val allowClipboard: Boolean = true,
     // 备用地址（如对端的 Tailscale 100.x IP）：主地址连不上时按序轮试，
     // 让设备跨网段（不在同一局域网）时仍可通过 Tailscale 虚拟网连接
     val altHosts: List<String> = emptyList()
@@ -33,8 +36,12 @@ data class DesktopDevice(
 object DeviceStore {
     private const val PREFS_NAME = "paired_desktop_devices"
     private const val KEY_DEVICES = "devices"
+    // 剪贴板策略 v2 一次性迁移标记：v1 存储里的 allowClipboard:false 是旧默认值
+    // 而非用户选择，首次读取时统一翻转为新默认 true（此后用户的显式关闭原样保留）
+    private const val KEY_CLIPBOARD_POLICY_V2 = "clipboard_policy_v2"
 
     fun getDevices(context: Context): List<DesktopDevice> {
+        ensureClipboardPolicyUpgrade(context)
         val raw = prefs(context).getString(KEY_DEVICES, "[]") ?: "[]"
         val devices = mutableListOf<DesktopDevice>()
 
@@ -66,7 +73,7 @@ object DeviceStore {
                         allowSmsMessages = item.optBoolean("allowSmsMessages", true),
                         allowNotifications = item.optBoolean("allowNotifications", true),
                         allowTotp = item.optBoolean("allowTotp", true),
-                        allowClipboard = item.optBoolean("allowClipboard", false),
+                        allowClipboard = item.optBoolean("allowClipboard", true),
                         altHosts = jsonArrayToList(item.optJSONArray("altHosts"))
                     )
                 )
@@ -161,7 +168,7 @@ object DeviceStore {
                 allowSmsMessages = true,
                 allowNotifications = true,
                 allowTotp = true,
-                allowClipboard = false,
+                allowClipboard = true,
                 altHosts = altHosts.filter { it.isNotBlank() && it != host }.distinct()
             )
         }
@@ -253,6 +260,25 @@ object DeviceStore {
         if (array == null) return emptyList()
         return (0 until array.length()).mapNotNull {
             array.optString(it).takeIf { value -> value.isNotBlank() }
+        }
+    }
+
+    /** v1→v2：把存量设备的 allowClipboard 统一翻转为 true（详见 KEY_CLIPBOARD_POLICY_V2）。 */
+    private fun ensureClipboardPolicyUpgrade(context: Context) {
+        val p = prefs(context)
+        if (p.getBoolean(KEY_CLIPBOARD_POLICY_V2, false)) return
+        val raw = p.getString(KEY_DEVICES, "[]") ?: "[]"
+        runCatching {
+            val array = JSONArray(raw)
+            for (i in 0 until array.length()) {
+                array.optJSONObject(i)?.put("allowClipboard", true)
+            }
+            p.edit()
+                .putString(KEY_DEVICES, array.toString())
+                .putBoolean(KEY_CLIPBOARD_POLICY_V2, true)
+                .apply()
+        }.onFailure {
+            p.edit().putBoolean(KEY_CLIPBOARD_POLICY_V2, true).apply()
         }
     }
 

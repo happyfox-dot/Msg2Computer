@@ -13,7 +13,10 @@ function normalizePushContentPolicy(policy = {}) {
     allowSmsMessages: policy.allowSmsMessages !== false,
     allowNotifications: policy.allowNotifications !== false,
     allowTotp: policy.allowTotp !== false,
-    allowClipboard: policy.allowClipboard === true
+    // v2 起默认允许：剪贴板是否同步由两端的全局总开关（默认关）决定，
+    // per-device 位仅作为针对个别设备的显式关闭。旧默认 false 导致
+    // 全局开关打开后剪贴板同步依然永远没有可推送目标（用户极难发现）。
+    allowClipboard: policy.allowClipboard !== false
   }
 }
 

@@ -830,6 +830,18 @@ function loadOrCreatePairingKey() {
   try {
     if (fs.existsSync(configPath)) {
       const saved = JSON.parse(fs.readFileSync(configPath, 'utf8'))
+      // 剪贴板策略 v2 迁移：v1 配置里的 allowClipboard:false 是旧默认值而非
+      // 用户选择（旧默认让剪贴板同步永远没有可推送目标），加载时清掉该键，
+      // 让新默认（true，受全局总开关约束）生效。落盘时写 policyVersion:2，
+      // 此后用户在 UI 里的显式关闭会被原样保留。
+      const savedPolicyVersion = Number(saved.policyVersion) || 1
+      const upgradeContentPolicy = entry => {
+        const source = (entry && (entry.contentPolicy || entry)) || {}
+        if (savedPolicyVersion >= 2) return source
+        const cleaned = { ...source }
+        delete cleaned.allowClipboard
+        return cleaned
+      }
       authorizedPhones = new Map((saved.authorizedPhones || []).map(phone => [
         phone.id,
         {
@@ -844,7 +856,7 @@ function loadOrCreatePairingKey() {
           relayPort: Number(phone.relayPort) || 19529,
           pairingKey: unprotectSecret(phone.pairingKey || phone.pk || ''),
           tsHost: String(phone.tsHost || '').trim(),
-          contentPolicy: normalizePushContentPolicy(phone.contentPolicy || phone),
+          contentPolicy: normalizePushContentPolicy(upgradeContentPolicy(phone)),
           connected: false
         }
       ]).filter(([id]) => !!id))
@@ -862,7 +874,7 @@ function loadOrCreatePairingKey() {
           firstSeen: peer.firstSeen || Date.now(),
           lastSeen: peer.lastSeen || 0,
           lastIP: peer.lastIP || peer.host || '',
-          contentPolicy: normalizePushContentPolicy(peer.contentPolicy || peer),
+          contentPolicy: normalizePushContentPolicy(upgradeContentPolicy(peer)),
           connected: false
         }
       ]).filter(([id, peer]) => !!id && !!peer.host && !!peer.pairingKey))
@@ -935,6 +947,8 @@ function flushPairingConfigToDisk() {
     fs.writeFileSync(
       tmpPath,
       JSON.stringify({
+        // 内容策略格式版本：v2 起 allowClipboard 默认 true（见 loadOrCreatePairingKey 迁移）
+        policyVersion: 2,
         // 配对密钥是信任体系的根，与 TOTP 种子同样用 safeStorage（DPAPI）加密落盘；
         // 旧版明文文件由 unprotectSecret 兼容读取，首次重新落盘即转为密文
         pairingKey: protectSecret(pairingKey),
@@ -4055,6 +4069,10 @@ function handleVerifyCode(codeData) {
   if (codeInfo.type === CODE_TYPES.SMS && codeInfo.code) {
     showCodeBubble(codeInfo)
     showNotification('📩 新验证码', `${codeInfo.code}\n来源: ${codeInfo.source}\n手机: ${codeInfo.phoneName}`)
+    // 验证码自动复制是本机便利功能：先同步轮询快照再写入，避免剪贴板同步
+    // 把它当成「本机新复制」广播出去——否则同一条验证码会以剪贴板同步的
+    // 身份在各节点二次弹出/写回源手机（短信推送本身已送达所有目标）
+    lastClipboardText = codeInfo.code
     clipboard.writeText(codeInfo.code)
   } else if (codeInfo.type === CODE_TYPES.SMS_MESSAGE) {
     const preview = codeInfo.rawMessage || codeInfo.source
