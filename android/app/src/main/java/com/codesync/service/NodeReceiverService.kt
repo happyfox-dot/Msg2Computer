@@ -418,22 +418,26 @@ class NodeReceiverService : Service() {
     }
 
     private fun writeHttpResponse(socket: Socket, code: Int) {
-        val text = if (code in 200..299) "OK" else "ERR"
-        val status = when (code) {
-            200 -> "200 OK"
-            202 -> "202 Accepted"
-            400 -> "400 Bad Request"
-            403 -> "403 Forbidden"
-            else -> "500 Internal Server Error"
+        try {
+            val text = if (code in 200..299) "OK" else "ERR"
+            val status = when (code) {
+                200 -> "200 OK"
+                202 -> "202 Accepted"
+                400 -> "400 Bad Request"
+                403 -> "403 Forbidden"
+                else -> "500 Internal Server Error"
+            }
+            val bytes = text.toByteArray(Charsets.UTF_8)
+            val response = "HTTP/1.1 $status\r\n" +
+                "Content-Type: text/plain; charset=utf-8\r\n" +
+                "Content-Length: ${bytes.size}\r\n" +
+                "Connection: close\r\n\r\n"
+            socket.getOutputStream().write(response.toByteArray(Charsets.UTF_8))
+            socket.getOutputStream().write(bytes)
+            socket.getOutputStream().flush()
+        } catch (e: Exception) {
+            Log.w(TAG, "Relay response write skipped: ${e.message}")
         }
-        val bytes = text.toByteArray(Charsets.UTF_8)
-        val response = "HTTP/1.1 $status\r\n" +
-            "Content-Type: text/plain; charset=utf-8\r\n" +
-            "Content-Length: ${bytes.size}\r\n" +
-            "Connection: close\r\n\r\n"
-        socket.getOutputStream().write(response.toByteArray(Charsets.UTF_8))
-        socket.getOutputStream().write(bytes)
-        socket.getOutputStream().flush()
     }
 
     private fun buildNotification(): Notification {

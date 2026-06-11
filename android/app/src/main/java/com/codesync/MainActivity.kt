@@ -370,6 +370,7 @@ class MainActivity : AppCompatActivity() {
             add(getString(R.string.device_address, device.host, device.port))
             if (hasTailscale) add("TS")
             if (viaOtherNode) add("经 ${device.routeNextHopName.ifBlank { "中继" }}")
+            add("内容: ${deviceContentPolicySummary(device)}")
             add(getString(R.string.last_sync_time, formatRelativeSyncTime(device.lastSyncAt)))
         }.joinToString(" · ")
         tintDot(dot, device.enabled)
@@ -422,10 +423,72 @@ class MainActivity : AppCompatActivity() {
             )
             if (device.routePath.size > 2) add("路径：${device.routePath.joinToString(" → ")}")
             add("状态：$state")
+            add("推送内容：${deviceContentPolicySummary(device)}")
             add("上次同步：${formatFullSyncTime(device.lastSyncAt)}")
             add("提示：长按列表项可移除该设备")
         }
-        showDetailSheet(getString(R.string.topology_device_detail), detail)
+        val (dialog, content) = createBottomSheet(getString(R.string.topology_device_detail))
+        content.addView(TextView(this).apply {
+            text = detail.joinToString("\n")
+            setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_secondary))
+            textSize = 13f
+            setPadding(0, 12.dp(), 0, 4.dp())
+        })
+        addSheetButton(content, getString(R.string.device_content_policy)) {
+            dialog.dismiss()
+            showDeviceContentPolicySheet(device)
+        }
+        addSheetButton(content, getString(android.R.string.ok), outlined = true) {
+            dialog.dismiss()
+        }
+        dialog.show()
+    }
+
+    private fun showDeviceContentPolicySheet(device: DesktopDevice) {
+        val items = listOf(
+            getString(R.string.policy_sms_codes),
+            getString(R.string.policy_all_sms),
+            getString(R.string.policy_notifications),
+            getString(R.string.policy_totp)
+        )
+        val selected = booleanArrayOf(
+            device.allowSmsCodes,
+            device.allowSmsMessages,
+            device.allowNotifications,
+            device.allowTotp
+        )
+
+        showMultiChoiceSheet(
+            title = getString(R.string.device_content_policy),
+            message = getString(R.string.device_content_policy_desc, device.name),
+            items = items,
+            selected = selected,
+            positiveText = getString(R.string.save),
+            onPositive = {
+                DeviceStore.setDeviceContentPolicy(
+                    context = this,
+                    id = device.id,
+                    allowSmsCodes = selected[0],
+                    allowSmsMessages = selected[1],
+                    allowNotifications = selected[2],
+                    allowTotp = selected[3]
+                )
+                refreshDeviceList()
+                rebuildTopologyList()
+                broadcastTopologyChange("device_content_policy_changed")
+                Toast.makeText(this, R.string.message_policy_saved, Toast.LENGTH_SHORT).show()
+            }
+        )
+    }
+
+    private fun deviceContentPolicySummary(device: DesktopDevice): String {
+        val items = buildList {
+            if (device.allowSmsCodes) add(getString(R.string.policy_sms_codes_short))
+            if (device.allowSmsMessages) add(getString(R.string.policy_all_sms_short))
+            if (device.allowNotifications) add(getString(R.string.policy_notifications_short))
+            if (device.allowTotp) add("TOTP")
+        }
+        return items.joinToString("、").ifBlank { getString(R.string.policy_none) }
     }
 
     private fun tintDot(dot: View, online: Boolean) {
@@ -586,7 +649,7 @@ class MainActivity : AppCompatActivity() {
                 .filter { LanDiscovery.isTailscaleAddress(it) }
             container.addView(
                 createTopologyRow(
-                    title = "${deviceIcon("ANDROID_PHONE")} ${phone.name}  →  ${deviceIcon(device.type)} ${device.name}",
+                    title = "${deviceIcon("ANDROID_PHONE")} ${phone.name}  --  ${deviceIcon(device.type)} ${device.name}",
                     meta = "${getString(R.string.topology_push_edge)} · $state · ${getString(R.string.status_last_sync, lastSync)}",
                     detail = buildList {
                         add("来源：${phone.name}")
@@ -603,6 +666,7 @@ class MainActivity : AppCompatActivity() {
                             add("路径：${device.routePath.joinToString(" → ")}")
                         }
                         add("状态：$state")
+                        add("推送内容：${deviceContentPolicySummary(device)}")
                         add("上次同步：${formatFullSyncTime(device.lastSyncAt)}")
                         add("权限：来源手机控制推送范围")
                     }
@@ -617,7 +681,7 @@ class MainActivity : AppCompatActivity() {
                 val sourceName = first.sourceDeviceName.ifBlank { "远端节点" }
                 container.addView(
                     createTopologyRow(
-                        title = "${deviceIcon(first.sourceDeviceType)} $sourceName  →  ${deviceIcon("ANDROID_PHONE")} ${phone.name}",
+                        title = "${deviceIcon(first.sourceDeviceType)} $sourceName  --  ${deviceIcon("ANDROID_PHONE")} ${phone.name}",
                         meta = "远端 TOTP 种子同步 · ${entries.size} 个验证码",
                         detail = listOf(
                             "来源：$sourceName",

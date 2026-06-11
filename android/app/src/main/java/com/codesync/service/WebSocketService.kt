@@ -407,16 +407,16 @@ class WebSocketService : Service() {
         appName: String? = null,
         packageName: String? = null
     ) {
-        val enabledDevices = DeviceStore.getEnabledDevices(this)
-        if (enabledDevices.isEmpty()) {
+        val targetDevices = targetDevicesForType(type)
+        if (targetDevices.isEmpty()) {
             updateConnectionState("没有启用的推送目标")
             releaseForwardLocks()
-            stopService("没有启用的推送目标")
+            stopService("没有允许接收该内容的推送目标")
             return
         }
 
         val phoneIdentity = PhoneIdentityStore.get(this)
-        val targetTopology = buildTargetTopology(enabledDevices)
+        val targetTopology = buildTargetTopology(targetDevices)
         val msgId = "m-${System.currentTimeMillis()}-${msgIdSeq.incrementAndGet()}"
         val relayMessageId = "relay-${phoneIdentity.id}-${System.currentTimeMillis()}-${msgIdSeq.incrementAndGet()}"
         val payload = JSONObject()
@@ -430,7 +430,7 @@ class WebSocketService : Service() {
             .put("sourceDeviceName", phoneIdentity.name)
             .put("sourceDeviceType", "ANDROID_PHONE")
             .put("targetDevices", targetTopology)
-            .put("targetDeviceIds", JSONArray(enabledDevices.map { it.id }))
+            .put("targetDeviceIds", JSONArray(targetDevices.map { it.id }))
             .put("pushAuthority", "source_device")
             .put("pushAuthorityDeviceId", phoneIdentity.id)
             .apply {
@@ -452,9 +452,9 @@ class WebSocketService : Service() {
 
         enqueuePayloadToDevices(
             payload = payload,
-            targetDevices = enabledDevices,
+            targetDevices = targetDevices,
             type = type,
-            statusMessage = deliveryStatusMessage(type, enabledDevices.size),
+            statusMessage = deliveryStatusMessage(type, targetDevices.size),
             msgId = msgId
         )
     }
@@ -486,7 +486,7 @@ class WebSocketService : Service() {
         val allowedTargetIds = jsonArrayToSet(payload.optJSONArray("targetDeviceIds"))
         val pathIds = jsonArrayToSet(nextPath)
         val originId = payload.optString("originDeviceId", payload.optString("sourceDeviceId"))
-        val nextTargets = DeviceStore.getEnabledDevices(this)
+        val nextTargets = targetDevicesForType(payloadType)
             .filter { device ->
                 device.id !in pathIds &&
                     device.id != originId &&
@@ -529,11 +529,11 @@ class WebSocketService : Service() {
         digits: Int,
         period: Int
     ) {
-        val enabledDevices = DeviceStore.getEnabledDevices(this)
+        val enabledDevices = targetDevicesForType("totp_seed")
         if (enabledDevices.isEmpty()) {
             updateConnectionState("没有启用的推送目标")
             releaseForwardLocks()
-            stopService("没有启用的推送目标")
+            stopService("没有允许接收 TOTP 的推送目标")
             return
         }
 
@@ -586,11 +586,11 @@ class WebSocketService : Service() {
         digits: Int,
         period: Int
     ) {
-        val enabledDevices = DeviceStore.getEnabledDevices(this)
+        val enabledDevices = targetDevicesForType("totp_revoke")
         if (enabledDevices.isEmpty()) {
             updateConnectionState("没有启用的推送目标")
             releaseForwardLocks()
-            stopService("没有启用的推送目标")
+            stopService("没有允许接收 TOTP 的推送目标")
             return
         }
 
@@ -733,6 +733,10 @@ class WebSocketService : Service() {
                     .put("routeNextHopName", device.routeNextHopName)
                     .put("routePath", JSONArray(device.routePath))
                     .put("routeUpdatedAt", device.routeUpdatedAt)
+                    .put("allowSmsCodes", device.allowSmsCodes)
+                    .put("allowSmsMessages", device.allowSmsMessages)
+                    .put("allowNotifications", device.allowNotifications)
+                    .put("allowTotp", device.allowTotp)
             )
         }
         return targets
@@ -874,6 +878,18 @@ class WebSocketService : Service() {
         return device.type.uppercase(Locale.ROOT).contains("PHONE")
     }
 
+    private fun targetDevicesForType(type: String): List<DesktopDevice> {
+        return DeviceStore.getEnabledDevices(this).filter { device ->
+            when (type) {
+                "sms" -> device.allowSmsCodes
+                "sms_message" -> device.allowSmsMessages
+                "app_notification" -> device.allowNotifications
+                "totp", "totp_seed", "totp_revoke" -> device.allowTotp
+                else -> true
+            }
+        }
+    }
+
     private fun isRelaySupportedType(type: String): Boolean {
         return isUserMessageType(type) ||
             type == "totp_seed" ||
@@ -954,6 +970,15 @@ class WebSocketService : Service() {
             if (!registerOnly) existing.registerOnly = false
             if (force) existing.forceConnect = true
             Log.d(TAG, "Reuse existing connection for ${device.name}, registerOnly=$registerOnly, force=$force")
+            if (existing.authenticated && existing.webSocket != null && !registerOnly) {
+                val delivered = flushPendingForDevice(device.id)
+                if (delivered) {
+                    updateConnectionState("已连接 ${device.name}，正在投递")
+                    checkAllDoneAndStop()
+                } else if (!deviceHasPending(device.id)) {
+                    scheduleCloseAfterIdle(device.id)
+                }
+            }
             return
         }
 

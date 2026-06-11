@@ -57,6 +57,16 @@
     <string name="receive_all_sms">接收普通短信</string>
     <string name="receive_notifications">接收 App 通知</string>
     <string name="message_policy_saved">消息同步策略已更新</string>
+    <string name="device_content_policy">推送内容策略</string>
+    <string name="device_content_policy_desc">选择本节点允许推送给「%1$s」的内容类型。关闭后该内容不会发往此节点，也不会出现在该消息的目标范围内。</string>
+    <string name="policy_sms_codes">验证码短信</string>
+    <string name="policy_all_sms">普通短信</string>
+    <string name="policy_notifications">App 通知</string>
+    <string name="policy_totp">TOTP 动态验证码</string>
+    <string name="policy_sms_codes_short">验证码</string>
+    <string name="policy_all_sms_short">短信</string>
+    <string name="policy_notifications_short">通知</string>
+    <string name="policy_none">不推送</string>
     <string name="totp_section">动态验证码 (TOTP)</string>
     <string name="topology_section">设备拓扑</string>
     <string name="topology_empty">尚未形成设备拓扑</string>

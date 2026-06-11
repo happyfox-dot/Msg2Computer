@@ -13,6 +13,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   setMessageSettings: (updates) => ipcRenderer.invoke('set-message-settings', updates),
   isWindowVisible: () => ipcRenderer.invoke('is-window-visible'),
   setPhoneEnabled: (phoneId, enabled) => ipcRenderer.invoke('set-phone-enabled', phoneId, enabled),
+  setPhoneContentPolicy: (phoneId, updates) => ipcRenderer.invoke('set-phone-content-policy', phoneId, updates),
   revokePhone: (phoneId) => ipcRenderer.invoke('revoke-phone', phoneId),
   restorePhone: (phoneId) => ipcRenderer.invoke('restore-phone', phoneId),
   openExternal: (url) => ipcRenderer.invoke('open-external', url),

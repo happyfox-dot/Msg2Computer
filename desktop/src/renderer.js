@@ -285,10 +285,28 @@ function setupPhoneList() {
 
   container.addEventListener('change', async (event) => {
     const target = event.target
-    if (!target.matches('[data-action="toggle-phone"]')) return
-
     const row = target.closest('.phone-row')
     if (!row) return
+
+    if (target.matches('[data-action="toggle-phone-totp"]')) {
+      target.disabled = true
+      try {
+        const phones = await window.electronAPI.setPhoneContentPolicy(row.dataset.phoneId, {
+          allowTotp: target.checked
+        })
+        authorizedPhones = Array.isArray(phones) ? phones : []
+        renderPhones()
+        renderTopology()
+      } catch (error) {
+        console.error('Failed to change phone content policy:', error)
+        target.checked = !target.checked
+      } finally {
+        target.disabled = false
+      }
+      return
+    }
+
+    if (!target.matches('[data-action="toggle-phone"]')) return
 
     target.disabled = true
     try {
@@ -565,6 +583,8 @@ function renderPhones() {
   container.innerHTML = authorizedPhones.map(phone => {
     const state = getPhoneState(phone)
     const checked = phone.enabled !== false && phone.revoked !== true
+    const contentPolicy = phone.contentPolicy || {}
+    const totpChecked = contentPolicy.allowTotp !== false
     const meta = [
       phone.lastSeen ? `上次 ${formatTime(phone.lastSeen)}` : '',
       phone.lastIP || ''
@@ -590,6 +610,10 @@ function renderPhones() {
         <label class="phone-toggle" title="启用或禁用这台手机">
           <input type="checkbox" data-action="toggle-phone" ${checked ? 'checked' : ''} ${phone.revoked ? 'disabled' : ''}>
           <span></span>
+        </label>
+        <label class="phone-policy-toggle" title="是否向该节点推送本机 TOTP">
+          <input type="checkbox" data-action="toggle-phone-totp" ${totpChecked ? 'checked' : ''} ${phone.revoked ? 'disabled' : ''}>
+          <span>TOTP</span>
         </label>
         ${actionButton}
       </div>
@@ -901,11 +925,6 @@ function renderDirectedTopologyGraph(view) {
     <div class="topology-directed" style="height:${height}px">
       ${laneTitles}
       <svg class="topology-directed-svg" viewBox="0 0 1000 ${height}" preserveAspectRatio="none">
-        <defs>
-          <marker id="topology-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth">
-            <path d="M0,0 L8,4 L0,8 Z"></path>
-          </marker>
-        </defs>
         ${paths}
       </svg>
       ${nodes}
@@ -934,6 +953,7 @@ function renderTopologyLegend() {
   return `
     <div class="topology-legend">
       ${items}
+      <span class="topology-legend-item"><i class="topology-legend-swatch legend-active"></i>无向连接</span>
       <span class="topology-legend-item"><i class="topology-legend-swatch legend-active"></i>实线 = 活跃</span>
       <span class="topology-legend-item"><i class="topology-legend-swatch legend-idle"></i>虚线 = 待连接 / 停用</span>
     </div>
@@ -969,7 +989,7 @@ function renderDirectedTopologyPath(edge, positions) {
   return `<path class="${className}"
     data-edge-from="${escapeHtml(String(edge.from))}"
     data-edge-to="${escapeHtml(String(edge.to))}"
-    d="${curve}" marker-end="url(#topology-arrow)"><title>${escapeHtml(tooltip)}</title></path>${metricLabel}`
+    d="${curve}"><title>${escapeHtml(tooltip)}</title></path>${metricLabel}`
 }
 
 function renderDirectedTopologyNode(node, pos) {
@@ -1075,7 +1095,8 @@ function mergeTopologyViewNode(nodeMap, node) {
     routeNextHopId: node.routeNextHopId || '',
     routeNextHopName: node.routeNextHopName || '',
     routePath: Array.isArray(node.routePath) ? node.routePath : [],
-    routePathLabels: Array.isArray(node.routePathLabels) ? node.routePathLabels : []
+    routePathLabels: Array.isArray(node.routePathLabels) ? node.routePathLabels : [],
+    contentPolicy: normalizeTopologyContentPolicy(node.contentPolicy || node)
   }
   const existing = nodeMap.get(normalized.id)
   if (!existing) {
@@ -1097,13 +1118,34 @@ function mergeTopologyViewNode(nodeMap, node) {
     routeNextHopId: normalized.routeNextHopId || existing.routeNextHopId || '',
     routeNextHopName: normalized.routeNextHopName || existing.routeNextHopName || '',
     routePath: normalized.routePath.length ? normalized.routePath : (existing.routePath || []),
-    routePathLabels: normalized.routePathLabels.length ? normalized.routePathLabels : (existing.routePathLabels || [])
+    routePathLabels: normalized.routePathLabels.length ? normalized.routePathLabels : (existing.routePathLabels || []),
+    contentPolicy: normalized.contentPolicy || existing.contentPolicy
   })
+}
+
+function normalizeTopologyContentPolicy(policy = {}) {
+  return {
+    allowSmsCodes: policy.allowSmsCodes !== false,
+    allowSmsMessages: policy.allowSmsMessages !== false,
+    allowNotifications: policy.allowNotifications !== false,
+    allowTotp: policy.allowTotp !== false
+  }
+}
+
+function formatTopologyContentPolicy(policy = {}) {
+  const normalized = normalizeTopologyContentPolicy(policy)
+  const items = []
+  if (normalized.allowSmsCodes) items.push('验证码')
+  if (normalized.allowSmsMessages) items.push('短信')
+  if (normalized.allowNotifications) items.push('通知')
+  if (normalized.allowTotp) items.push('TOTP')
+  return items.length ? items.join('、') : '不推送'
 }
 
 function addTopologyViewEdge(edgeMap, edge) {
   if (!edge || !edge.from || !edge.to) return
-  const key = edge.id || `${edge.from}->${edge.to}:${edge.type || 'sync'}`
+  const endpoints = [String(edge.from), String(edge.to)].sort()
+  const key = `${endpoints[0]}--${endpoints[1]}:${edge.type || 'sync'}`
   const existing = edgeMap.get(key)
   if (existing) {
     edgeMap.set(key, {
@@ -1111,6 +1153,7 @@ function addTopologyViewEdge(edgeMap, edge) {
       active: existing.active || edge.active === true,
       enabled: existing.enabled !== false && edge.enabled !== false,
       updatedAt: Math.max(existing.updatedAt || 0, edge.updatedAt || 0),
+      metric: Math.min(existing.metric || edge.metric || 0, edge.metric || existing.metric || 0),
       count: (existing.count || 1) + (edge.count || 1)
     })
     return
@@ -1190,12 +1233,11 @@ function renderTopologyNodeDetail(nodeId, options = {}) {
     ? relatedEdges.slice(0, 6).map(edge => {
       const fromNode = view.nodeMap.get(String(edge.from)) || { name: edge.from, type: 'ANDROID_PHONE' }
       const toNode = view.nodeMap.get(String(edge.to)) || { name: edge.to, type: 'WINDOWS_DESKTOP' }
-      const direction = String(edge.from) === String(node.id) ? '出站' : '入站'
       const state = edge.active ? '活跃' : (edge.enabled ? '待同步' : '已停用')
       return `
         <div class="topology-node-detail-edge">
-          <span>${escapeHtml(direction)}</span>
-          <strong>${escapeHtml(fromNode.name || edge.from)} → ${escapeHtml(toNode.name || edge.to)}</strong>
+          <span>连接</span>
+          <strong>${escapeHtml(fromNode.name || edge.from)} -- ${escapeHtml(toNode.name || edge.to)}</strong>
           <em>${escapeHtml(edge.label || '同步')} · ${escapeHtml(state)}</em>
         </div>
       `
@@ -1220,6 +1262,7 @@ function renderTopologyNodeDetail(nodeId, options = {}) {
       <div><span>SPF Metric</span><strong>${escapeHtml(node.routeMetric ? String(node.routeMetric) : '本机/未计算')}</strong></div>
       <div><span>下一跳</span><strong>${escapeHtml(node.routeNextHopName || '无')}</strong></div>
       <div><span>路由路径</span><strong>${escapeHtml(routePathText || '无')}</strong></div>
+      <div><span>推送策略</span><strong>${escapeHtml(formatTopologyContentPolicy(node.contentPolicy))}</strong></div>
     </div>
     <div class="topology-node-detail-section">
       <div class="topology-node-detail-section-title">相关链路</div>
@@ -1255,7 +1298,7 @@ function renderTopologyEdge(edge, nodeMap) {
     <div class="${className}">
       <div class="topology-edge-route">
         <span class="topology-edge-node">${getDeviceIcon(fromNode.type)} ${escapeHtml(fromNode.name || edge.from)}</span>
-        <span class="topology-edge-arrow">→</span>
+        <span class="topology-edge-arrow">--</span>
         <span class="topology-edge-node">${getDeviceIcon(toNode.type)} ${escapeHtml(toNode.name || edge.to)}</span>
       </div>
       <div class="topology-edge-detail">

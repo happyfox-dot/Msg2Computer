@@ -91,13 +91,27 @@ class TopologyGraphView @JvmOverloads constructor(
         color = COLOR_LABEL_BG
     }
     private val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
-    private val arrowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
-
     fun setGraph(newNodes: List<Node>, newEdges: List<Edge>) {
         nodes.clear()
         nodes.addAll(newNodes.distinctBy { it.id })
         edges.clear()
-        edges.addAll(newEdges)
+        val mergedEdges = linkedMapOf<String, Edge>()
+        newEdges.forEach { edge ->
+            val endpoints = listOf(edge.from, edge.to).sorted()
+            val key = "${endpoints[0]}--${endpoints[1]}:${edge.kind}:${edge.label}"
+            val existing = mergedEdges[key]
+            mergedEdges[key] = if (existing == null) {
+                edge
+            } else {
+                existing.copy(
+                    active = existing.active || edge.active,
+                    metric = listOf(existing.metric, edge.metric)
+                        .filter { it > 0 }
+                        .minOrNull() ?: max(existing.metric, edge.metric)
+                )
+            }
+        }
+        edges.addAll(mergedEdges.values)
         requestLayout()
         invalidate()
     }
@@ -186,7 +200,6 @@ class TopologyGraphView @JvmOverloads constructor(
             }
             canvas.drawPath(path, linePaint)
             linePaint.pathEffect = null
-            drawArrow(canvas, endX, endY, fromIsLeft, color, linePaint.alpha)
             drawEdgeLabel(canvas, path, edge, color)
         }
     }
@@ -215,20 +228,6 @@ class TopologyGraphView @JvmOverloads constructor(
         canvas.drawRoundRect(bg, dp(6f), dp(6f), edgeLabelBgPaint)
         edgeLabelPaint.color = color
         canvas.drawText(text, pos[0], pos[1] + sp(9f) * 0.32f, edgeLabelPaint)
-    }
-
-    private fun drawArrow(canvas: Canvas, tipX: Float, tipY: Float, pointRight: Boolean, color: Int, alpha: Int) {
-        val size = dp(7.5f)
-        val direction = if (pointRight) 1f else -1f
-        arrowPaint.color = color
-        arrowPaint.alpha = alpha
-        val arrow = Path().apply {
-            moveTo(tipX, tipY)
-            lineTo(tipX - direction * size, tipY - size * 0.55f)
-            lineTo(tipX - direction * size, tipY + size * 0.55f)
-            close()
-        }
-        canvas.drawPath(arrow, arrowPaint)
     }
 
     private fun statusColor(node: Node): Int = when (node.status) {

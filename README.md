@@ -166,6 +166,10 @@ CodeBridge1/
 └── README.md
 ```
 
+## 友链
+
+感谢 [LINUXDO](https://linux.do/) 社区提供的帮助与支持。
+
 ## 许可
 
 本项目采用 `PolyForm Noncommercial License 1.0.0`。

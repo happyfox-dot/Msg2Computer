@@ -380,7 +380,7 @@ body {
 /* ========== 手机列表 ========== */
 .phone-row {
   display: grid;
-  grid-template-columns: 1fr 34px 42px;
+  grid-template-columns: minmax(0, 1fr) 34px 52px 42px;
   gap: 8px;
   align-items: center;
   padding: 10px 12px;
@@ -462,6 +462,38 @@ body {
   background: #5cdb8b;
 }
 .phone-toggle input:disabled + span { opacity: 0.45; cursor: default; }
+
+.phone-policy-toggle {
+  height: 24px;
+  position: relative;
+  cursor: pointer;
+}
+.phone-policy-toggle input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+.phone-policy-toggle span {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 52px;
+  height: 24px;
+  border-radius: 5px;
+  border: 1px solid rgba(124,138,255,0.26);
+  background: rgba(124,138,255,0.12);
+  color: #aeb7ff;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+  transition: all 0.15s;
+}
+.phone-policy-toggle input:not(:checked) + span {
+  border-color: rgba(255,255,255,0.12);
+  background: rgba(255,255,255,0.06);
+  color: #777;
+}
+.phone-policy-toggle input:disabled + span { opacity: 0.45; cursor: default; }
 
 .phone-revoke {
   height: 26px;

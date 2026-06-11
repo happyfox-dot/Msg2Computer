@@ -527,6 +527,7 @@ function normalizeLsdbNode(raw = {}) {
       : [],
     enabled: raw.enabled !== false,
     revoked: raw.revoked === true,
+    contentPolicy: normalizePushContentPolicy(raw.contentPolicy || raw),
     connected: raw.connected === true,
     status: raw.status || (raw.connected ? 'online' : 'offline'),
     authority: raw.authority || 'topology_gossip',
@@ -556,6 +557,7 @@ function normalizeLsdbLink(raw = {}) {
     enabled: raw.enabled !== false,
     active: raw.active === true,
     routable: raw.routable === true,
+    contentPolicy: normalizePushContentPolicy(raw.contentPolicy || raw),
     authority: raw.authority || 'topology_gossip',
     metric: Number(raw.metric || 0) || undefined,
     description: raw.description || '',
@@ -645,6 +647,27 @@ function normalizeMessageSettings(settings = {}) {
   }
 }
 
+function normalizePushContentPolicy(policy = {}) {
+  return {
+    allowSmsCodes: policy.allowSmsCodes !== false,
+    allowSmsMessages: policy.allowSmsMessages !== false,
+    allowNotifications: policy.allowNotifications !== false,
+    allowTotp: policy.allowTotp !== false
+  }
+}
+
+function canPushContentToNode(target, type) {
+  if (!target) return false
+  const policy = normalizePushContentPolicy(target.contentPolicy || target)
+  if (type === CODE_TYPES.SMS) return policy.allowSmsCodes
+  if (type === CODE_TYPES.SMS_MESSAGE) return policy.allowSmsMessages
+  if (type === CODE_TYPES.APP_NOTIFICATION) return policy.allowNotifications
+  if (type === 'totp' || type === 'totp_sync' || type === 'totp_seed' || type === 'totp_revoke') {
+    return policy.allowTotp
+  }
+  return true
+}
+
 function canReceiveContentType(type) {
   const contentType = type || CODE_TYPES.SMS
   if (contentType === CODE_TYPES.SMS) return desktopMessageSettings.receiveSmsCodes !== false
@@ -672,6 +695,7 @@ function loadOrCreatePairingKey() {
           relayPort: Number(phone.relayPort) || 19529,
           pairingKey: unprotectSecret(phone.pairingKey || phone.pk || ''),
           tsHost: String(phone.tsHost || '').trim(),
+          contentPolicy: normalizePushContentPolicy(phone.contentPolicy || phone),
           connected: false
         }
       ]).filter(([id]) => !!id))
@@ -689,6 +713,7 @@ function loadOrCreatePairingKey() {
           firstSeen: peer.firstSeen || Date.now(),
           lastSeen: peer.lastSeen || 0,
           lastIP: peer.lastIP || peer.host || '',
+          contentPolicy: normalizePushContentPolicy(peer.contentPolicy || peer),
           connected: false
         }
       ]).filter(([id, peer]) => !!id && !!peer.host && !!peer.pairingKey))
@@ -774,6 +799,7 @@ function flushPairingConfigToDisk() {
           lastIP: phone.lastIP,
           relayPort: phone.relayPort,
           tsHost: phone.tsHost || '',
+          contentPolicy: normalizePushContentPolicy(phone.contentPolicy || phone),
           pairingKey: protectSecret(phone.pairingKey)
         })),
         desktopPeers: getPairedDesktopPeers().map(peer => ({
@@ -787,7 +813,8 @@ function flushPairingConfigToDisk() {
           enabled: peer.enabled,
           firstSeen: peer.firstSeen,
           lastSeen: peer.lastSeen,
-          lastIP: peer.lastIP
+          lastIP: peer.lastIP,
+          contentPolicy: normalizePushContentPolicy(peer.contentPolicy || peer)
         })),
         totpSeeds: getStoredTotpSeeds(),
         totpDeleteTombstones: getStoredTotpDeleteTombstones(),
@@ -982,6 +1009,7 @@ function upsertAuthorizedPhone({
     pairingKey: normalizedPairingKey,
     // 手机上报的 Tailscale IP：随路由表分发给其它手机节点做备用 relay 地址
     tsHost: String(tsHost || existing?.tsHost || '').trim(),
+    contentPolicy: normalizePushContentPolicy(existing?.contentPolicy || existing || {}),
     connected: existing?.connected === true
   }
   authorizedPhones.set(phoneId, phone)
@@ -1029,6 +1057,7 @@ function upsertPairedDesktopPeer(pairingData) {
     firstSeen: existing?.firstSeen || now,
     lastSeen: now,
     lastIP: normalized.host,
+    contentPolicy: normalizePushContentPolicy(existing?.contentPolicy || existing || {}),
     connected: existing?.connected === true
   }
   pairedDesktopPeers.set(peer.id, peer)
@@ -1255,6 +1284,7 @@ function syncLocalTopologyIntoLsdb(reason = 'local_state') {
       tsHost: phone.tsHost || '',
       enabled: phone.enabled !== false,
       revoked: phone.revoked === true,
+      contentPolicy: normalizePushContentPolicy(phone.contentPolicy || phone),
       connected: phone.connected === true,
       status: getPhoneTopologyStatus(phone),
       routable: phone.enabled !== false && phone.revoked !== true && !!phone.pairingKey && !!phone.lastIP,
@@ -1339,6 +1369,7 @@ function syncLocalTopologyIntoLsdb(reason = 'local_state') {
       pairingKey: peer.pairingKey,
       tsHost: peer.tsHost || '',
       enabled: peer.enabled !== false,
+      contentPolicy: normalizePushContentPolicy(peer.contentPolicy || peer),
       connected: peer.connected === true,
       status: peer.connected ? 'online' : (peer.enabled === false ? 'disabled' : 'offline'),
       routable: peerEnabled,
@@ -1746,6 +1777,21 @@ function setPhoneEnabled(phoneId, enabled) {
   }
   savePairingKey()
   notifyPhonesChanged()
+  return getAuthorizedPhones()
+}
+
+function setPhoneContentPolicy(phoneId, updates = {}) {
+  const phone = authorizedPhones.get(phoneId)
+  if (!phone) return getAuthorizedPhones()
+  if (phone.revoked) return getAuthorizedPhones()
+  phone.contentPolicy = normalizePushContentPolicy({
+    ...(phone.contentPolicy || {}),
+    ...updates
+  })
+  authorizedPhones.set(phoneId, phone)
+  savePairingKey()
+  notifyPhonesChanged()
+  scheduleTopologyBroadcast()
   return getAuthorizedPhones()
 }
 
@@ -2228,6 +2274,8 @@ function buildTotpSyncPayload(seed, action = 'add') {
 /** 鉴权成功时，把本机来源（desktop-local）的全部 TOTP 种子一次性下发给该手机。 */
 function sendLocalTotpSeedsToPhone(ws, sessionKey, phoneId) {
   if (!ws || !sessionKey) return
+  const phone = authorizedPhones.get(phoneId)
+  if (!canPushContentToNode(phone, 'totp')) return
   const localSeeds = Array.from(totpSeeds.values())
     .filter(seed => seed.phoneId === LOCAL_TOTP_SOURCE_ID && seed.secret)
   for (const seed of localSeeds) {
@@ -2267,7 +2315,9 @@ function sendTotpDeleteTombstonesToPhone(ws, sessionKey, phoneId) {
 function broadcastTotpSyncToPhones(seed, action = 'add') {
   if (!seed) return
   const payloadPlain = buildTotpSyncPayload(seed, action)
-  for (const connections of activePhoneConnections.values()) {
+  for (const [phoneId, connections] of activePhoneConnections.entries()) {
+    const phone = authorizedPhones.get(phoneId)
+    if (!canPushContentToNode(phone, 'totp')) continue
     for (const ws of connections) {
       // 每条连接有各自的会话密钥（基于 nonce 派生），必须按 ws 取
       const sessionKey = phoneSessionKeys.get(ws)
@@ -2286,7 +2336,9 @@ function broadcastTotpSyncToPhones(seed, action = 'add') {
 function broadcastTotpSyncToDesktopPeers(seed, action = 'add') {
   if (!seed) return
   const payloadPlain = buildTotpSyncPayload(seed, action)
-  for (const ws of activeDesktopPeerConnections.values()) {
+  for (const [peerId, ws] of activeDesktopPeerConnections.entries()) {
+    const peer = pairedDesktopPeers.get(peerId)
+    if (!canPushContentToNode(peer, 'totp')) continue
     if (!ws || ws.readyState !== WebSocket.OPEN) continue
     const sessionKey = ws.__codebridgeSessionKey
     if (!sessionKey) continue
@@ -2330,6 +2382,7 @@ function buildTotpSeedPushPayload(seed, targetPeer) {
 
 function sendLocalTotpSeedsToDesktopPeer(ws, sessionKey, peer) {
   if (!ws || !sessionKey || !peer || ws.readyState !== WebSocket.OPEN) return
+  if (!canPushContentToNode(peer, 'totp')) return
   const localSeeds = getLocalTotpSeeds()
   for (const seed of localSeeds) {
     const payload = buildTotpSeedPushPayload(seed, peer)
@@ -2690,6 +2743,7 @@ function normalizeTopologyDevice(device, fallback = {}) {
     role: fallback.role || 'remote',
     status: fallback.status || 'offline',
     authority: fallback.authority || '',
+    contentPolicy: normalizePushContentPolicy(device.contentPolicy || device || fallback),
     lastSeen: device.lastSeen || fallback.lastSeen || 0,
     lastIP: device.lastIP || device.host || fallback.lastIP || ''
   }
@@ -2771,7 +2825,7 @@ function buildLinkStateDatabase(nodes, edges) {
     const from = String(edge.from)
     const to = String(edge.to)
     if (!nodeMap.has(from) || !nodeMap.has(to)) return
-    adjacency.get(from).push({
+    const routeEdge = {
       to,
       metric: getRouteEdgeMetric(edge),
       edgeId: edge.id,
@@ -2779,6 +2833,11 @@ function buildLinkStateDatabase(nodes, edges) {
       label: edge.label || '链路',
       active: edge.active === true,
       updatedAt: edge.updatedAt || 0
+    }
+    adjacency.get(from).push(routeEdge)
+    adjacency.get(to).push({
+      ...routeEdge,
+      to: from
     })
   })
 
@@ -2928,6 +2987,7 @@ function getTopologySnapshot() {
       status,
       enabled: phone.enabled !== false,
       revoked: phone.revoked === true,
+      contentPolicy: normalizePushContentPolicy(phone.contentPolicy || phone),
       connected: phone.connected === true,
       lastSeen: phone.lastSeen || 0,
       lastIP: phone.lastIP || '',
@@ -2970,7 +3030,7 @@ function getTopologySnapshot() {
         type: 'totp_sync',
         label: `本机 TOTP 同步 (${localTotpSeeds.length})`,
         direction: 'outbound',
-        enabled: phone.enabled !== false && phone.revoked !== true,
+        enabled: phone.enabled !== false && phone.revoked !== true && canPushContentToNode(phone, 'totp'),
         active: phone.connected === true,
         authority: 'local_desktop',
         updatedAt: phone.lastSeen || 0,
@@ -3015,6 +3075,7 @@ function getTopologySnapshot() {
       role: 'desktop',
       status,
       enabled: peer.enabled !== false,
+      contentPolicy: normalizePushContentPolicy(peer.contentPolicy || peer),
       connected: peer.connected === true,
       lastSeen: peer.lastSeen || 0,
       lastIP: peer.lastIP || peer.host || '',
@@ -3028,7 +3089,7 @@ function getTopologySnapshot() {
       type: 'desktop_pair',
       label: '桌面端种子同步',
       direction: 'outbound',
-      enabled: peer.enabled !== false,
+      enabled: peer.enabled !== false && canPushContentToNode(peer, 'totp'),
       active: peer.connected === true,
       authority: 'desktop_owner',
       updatedAt: peer.lastSeen || 0,
@@ -3664,6 +3725,10 @@ ipcMain.handle('is-window-visible', () => {
 
 ipcMain.handle('set-phone-enabled', (event, phoneId, enabled) => {
   return setPhoneEnabled(phoneId, enabled)
+})
+
+ipcMain.handle('set-phone-content-policy', (event, phoneId, updates) => {
+  return setPhoneContentPolicy(phoneId, updates)
 })
 
 ipcMain.handle('revoke-phone', (event, phoneId) => {

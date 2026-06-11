@@ -20,6 +20,10 @@ data class DesktopDevice(
     val routeNextHopName: String,
     val routePath: List<String>,
     val routeUpdatedAt: Long,
+    val allowSmsCodes: Boolean = true,
+    val allowSmsMessages: Boolean = true,
+    val allowNotifications: Boolean = true,
+    val allowTotp: Boolean = true,
     // 备用地址（如对端的 Tailscale 100.x IP）：主地址连不上时按序轮试，
     // 让设备跨网段（不在同一局域网）时仍可通过 Tailscale 虚拟网连接
     val altHosts: List<String> = emptyList()
@@ -57,6 +61,10 @@ object DeviceStore {
                         routeNextHopName = item.optString("routeNextHopName"),
                         routePath = jsonArrayToList(item.optJSONArray("routePath")),
                         routeUpdatedAt = item.optLong("routeUpdatedAt", 0L),
+                        allowSmsCodes = item.optBoolean("allowSmsCodes", true),
+                        allowSmsMessages = item.optBoolean("allowSmsMessages", true),
+                        allowNotifications = item.optBoolean("allowNotifications", true),
+                        allowTotp = item.optBoolean("allowTotp", true),
                         altHosts = jsonArrayToList(item.optJSONArray("altHosts"))
                     )
                 )
@@ -119,6 +127,10 @@ object DeviceStore {
                 routeNextHopName = if (incomingRouteFresh) routeNextHopName else existing.routeNextHopName,
                 routePath = if (incomingRouteFresh) routePath else existing.routePath,
                 routeUpdatedAt = if (incomingRouteFresh) routeUpdatedAt else existing.routeUpdatedAt,
+                allowSmsCodes = existing.allowSmsCodes,
+                allowSmsMessages = existing.allowSmsMessages,
+                allowNotifications = existing.allowNotifications,
+                allowTotp = existing.allowTotp,
                 // 备用地址不参与新鲜度比较：本次没带就保留旧值（主地址变化时剔除重复）
                 altHosts = altHosts.ifEmpty { existing.altHosts }.filter { it.isNotBlank() && it != host }.distinct()
             )
@@ -138,6 +150,10 @@ object DeviceStore {
                 routeNextHopName = routeNextHopName,
                 routePath = routePath,
                 routeUpdatedAt = routeUpdatedAt,
+                allowSmsCodes = true,
+                allowSmsMessages = true,
+                allowNotifications = true,
+                allowTotp = true,
                 altHosts = altHosts.filter { it.isNotBlank() && it != host }.distinct()
             )
         }
@@ -154,6 +170,30 @@ object DeviceStore {
     fun setDeviceEnabled(context: Context, id: String, enabled: Boolean) {
         val devices = getDevices(context).map {
             if (it.id == id) it.copy(enabled = enabled, updatedAt = System.currentTimeMillis()) else it
+        }
+        saveDevices(context, devices)
+    }
+
+    fun setDeviceContentPolicy(
+        context: Context,
+        id: String,
+        allowSmsCodes: Boolean,
+        allowSmsMessages: Boolean,
+        allowNotifications: Boolean,
+        allowTotp: Boolean
+    ) {
+        val devices = getDevices(context).map {
+            if (it.id == id) {
+                it.copy(
+                    allowSmsCodes = allowSmsCodes,
+                    allowSmsMessages = allowSmsMessages,
+                    allowNotifications = allowNotifications,
+                    allowTotp = allowTotp,
+                    updatedAt = System.currentTimeMillis()
+                )
+            } else {
+                it
+            }
         }
         saveDevices(context, devices)
     }
@@ -188,6 +228,10 @@ object DeviceStore {
                     .put("routeNextHopName", device.routeNextHopName)
                     .put("routePath", JSONArray(device.routePath))
                     .put("routeUpdatedAt", device.routeUpdatedAt)
+                    .put("allowSmsCodes", device.allowSmsCodes)
+                    .put("allowSmsMessages", device.allowSmsMessages)
+                    .put("allowNotifications", device.allowNotifications)
+                    .put("allowTotp", device.allowTotp)
                     .put("altHosts", JSONArray(device.altHosts))
             )
         }
