@@ -197,7 +197,8 @@ class NodeReceiverService : Service() {
         val payloadType = payload.optString("type")
         if (!isSupportedPayload(payloadType)) return 202
 
-        val relayMessageId = payload.optString("relayMessageId")
+        val relayMessageId = payload.optString("originMessageId")
+            .ifBlank { payload.optString("relayMessageId") }
             .ifBlank { payload.optString("msgId") }
         if (relayMessageId.isBlank()) return 400
 
@@ -226,6 +227,10 @@ class NodeReceiverService : Service() {
         } else if (isUserMessagePayload(payloadType)) {
             val sourceName = payload.optString("sourceDeviceName", payload.optString("phoneName", "未知设备"))
             if (SettingsStore.shouldReceiveContent(this, payloadType)) {
+                // 剪贴板：写入本机系统剪贴板（写入不受 Android 10+ 后台限制）
+                if (payloadType == "clipboard") {
+                    writeClipboard(payload.optString("rawMessage"))
+                }
                 notifyUserMessageRelay(payload)
                 WebSocketService.reportExternalStatus(this, receivedStatusMessage(payloadType, sourceName))
             } else {
@@ -267,7 +272,8 @@ class NodeReceiverService : Service() {
     private fun isUserMessagePayload(type: String): Boolean {
         return type == "sms" ||
             type == "sms_message" ||
-            type == "app_notification"
+            type == "app_notification" ||
+            type == "clipboard"
     }
 
     private fun isTopologyPayload(type: String): Boolean {
@@ -381,18 +387,21 @@ class NodeReceiverService : Service() {
             "sms" -> "收到中继验证码"
             "sms_message" -> "收到中继短信"
             "app_notification" -> "收到中继通知"
+            "clipboard" -> "已同步剪贴板"
             else -> "收到中继消息"
         }
         val notificationText = when (type) {
             "sms" -> "$code · $sourceName"
             "sms_message" -> "$source · $sourceName"
             "app_notification" -> "$appName · $sourceName"
+            "clipboard" -> "${rawMessage.take(40)} · $sourceName"
             else -> sourceName
         }
         val bigText = when (type) {
             "sms" -> "验证码: $code\n来源节点: $sourceName\n短信来源: $source\n短信内容: ${rawMessage.ifBlank { source }}"
             "sms_message" -> "来源节点: $sourceName\n短信来源: $source\n短信内容: ${rawMessage.ifBlank { source }}"
             "app_notification" -> "来源节点: $sourceName\n应用: $appName\n标题: ${title.ifBlank { "无标题" }}\n内容: $rawMessage"
+            "clipboard" -> "来源节点: $sourceName\n已写入本机剪贴板:\n$rawMessage"
             else -> payload.toString()
         }
         val notification = NotificationCompat.Builder(this, CHANNEL_ID)
@@ -413,7 +422,19 @@ class NodeReceiverService : Service() {
             "sms" -> "收到中继验证码：$sourceName"
             "sms_message" -> "收到中继短信：$sourceName"
             "app_notification" -> "收到中继通知：$sourceName"
+            "clipboard" -> "已同步剪贴板：$sourceName"
             else -> "收到中继消息：$sourceName"
+        }
+    }
+
+    /** 把同步来的剪贴板内容写入本机系统剪贴板（写入不受后台限制）。 */
+    private fun writeClipboard(text: String) {
+        if (text.isBlank()) return
+        runCatching {
+            val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+            clipboard.setPrimaryClip(android.content.ClipData.newPlainText("codebridge_clipboard", text))
+        }.onFailure {
+            Log.w(TAG, "写入剪贴板失败: ${it.message}")
         }
     }
 

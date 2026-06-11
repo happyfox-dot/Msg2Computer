@@ -6,22 +6,22 @@
     android:orientation="horizontal"
     android:gravity="center_vertical"
     android:background="@drawable/bg_row"
-    android:paddingStart="14dp"
-    android:paddingEnd="14dp"
-    android:paddingTop="12dp"
-    android:paddingBottom="12dp"
-    android:layout_marginBottom="8dp">
+    android:paddingStart="10dp"
+    android:paddingEnd="10dp"
+    android:paddingTop="8dp"
+    android:paddingBottom="8dp"
+    android:layout_marginBottom="6dp">
 
     <FrameLayout
-        android:layout_width="40dp"
-        android:layout_height="40dp"
-        android:layout_marginEnd="14dp">
+        android:layout_width="34dp"
+        android:layout_height="34dp"
+        android:layout_marginEnd="10dp">
 
         <ProgressBar
             android:id="@+id/totpProgress"
             style="?android:attr/progressBarStyleHorizontal"
-            android:layout_width="40dp"
-            android:layout_height="40dp"
+            android:layout_width="34dp"
+            android:layout_height="34dp"
             android:indeterminate="false"
             android:max="30"
             android:progress="30"
@@ -33,7 +33,7 @@
             android:layout_height="match_parent"
             android:gravity="center"
             android:textColor="@color/text_secondary"
-            android:textSize="11sp"
+            android:textSize="10sp"
             android:text="30" />
 
     </FrameLayout>
@@ -50,7 +50,7 @@
             android:layout_height="wrap_content"
             android:text="TOTP"
             android:textColor="@color/text_secondary"
-            android:textSize="13sp"
+            android:textSize="12sp"
             android:maxLines="1"
             android:ellipsize="end" />
 
@@ -61,29 +61,29 @@
             android:layout_marginTop="2dp"
             android:text="000000"
             android:textColor="@color/text_primary"
-            android:textSize="26sp"
+            android:textSize="22sp"
             android:textStyle="bold"
             android:fontFamily="monospace"
-            android:letterSpacing="0.15" />
+            android:letterSpacing="0.08" />
 
     </LinearLayout>
 
     <TextView
         android:id="@+id/totpPin"
-        android:layout_width="32dp"
-        android:layout_height="32dp"
-        android:layout_marginStart="8dp"
+        android:layout_width="28dp"
+        android:layout_height="28dp"
+        android:layout_marginStart="6dp"
         android:gravity="center"
         android:text="☆"
         android:textColor="@color/warning"
-        android:textSize="22sp"
+        android:textSize="18sp"
         android:contentDescription="@string/totp_pin" />
 
     <ImageView
         android:id="@+id/totpCopy"
-        android:layout_width="24dp"
-        android:layout_height="24dp"
-        android:layout_marginStart="8dp"
+        android:layout_width="22dp"
+        android:layout_height="22dp"
+        android:layout_marginStart="6dp"
         android:src="@drawable/ic_copy"
         android:contentDescription="@string/copy"
         app:tint="@color/text_secondary" />

@@ -28,7 +28,9 @@ class SmsReceiver : BroadcastReceiver() {
         val body = messages.joinToString(separator = "") { it.messageBody.orEmpty() }.trim()
         if (body.isBlank()) return
 
-        Log.d(TAG, "收到短信来自 $sender: ${body.take(60)}...")
+        // 不记录短信正文/发件人：验证码短信通常 <60 字，写 logcat 等于把验证码
+        // 明文留给任何持 READ_LOGS 的应用、ADB 或厂商日志收集。只记录长度用于排障。
+        Log.d(TAG, "收到短信，正文长度=${body.length}")
 
         val code = CodeExtractor.extract(body)
         val sendSmsCode = code != null && SettingsStore.isForwardingEnabled(context)
@@ -39,10 +41,10 @@ class SmsReceiver : BroadcastReceiver() {
             else -> ""
         }
         val enabledDevices = DeviceStore.getEnabledDevices(context)
+        // 只记录决策结果与目标数量，不记录设备名/IP/端口（拓扑信息也属敏感面）
         Log.d(
             TAG,
-            "短信转发检查: smsCode=$sendSmsCode, allSms=$sendAllSms, type=$contentType, targets=${enabledDevices.size}, " +
-                enabledDevices.joinToString { "${it.name}/${it.type}/${it.host}:${it.port}" }
+            "短信转发检查: smsCode=$sendSmsCode, allSms=$sendAllSms, type=$contentType, targets=${enabledDevices.size}"
         )
 
         if (contentType.isBlank()) {

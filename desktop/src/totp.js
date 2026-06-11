@@ -1,54 +1,13 @@
+// 注意：TOTP 算码统一在主进程进行（src/main/totp-store.js 的 generateTotpCode，
+// 用 BigInt 计数器、支持 SHA1/256/512 与可配置位数/周期）。本模块只为渲染层
+// 提供周期常量和进度计算，不再做客户端算码。
+//
+// 旧版这里有一个 generate()，写死 SHA1/6位/30秒，且用 32 位 `c >>>= 8` 填 8 字节
+// 计数器——2038 年后 time/30 超出 2^32 会丢高位算出错码。该函数渲染层从未调用
+// （列表里的码都来自主进程下发的快照），已删除以防日后误用。
 const TOTP = (() => {
   const DIGITS = 6
   const PERIOD = 30
-
-  function base32ToBytes(base32) {
-    const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'
-    let bits = ''
-    for (let i = 0; i < base32.length; i++) {
-      const val = alphabet.indexOf(base32[i].toUpperCase())
-      if (val === -1) continue
-      bits += val.toString(2).padStart(5, '0')
-    }
-    const bytes = []
-    for (let i = 0; i + 8 <= bits.length; i += 8) {
-      bytes.push(parseInt(bits.substring(i, i + 8), 2))
-    }
-    return new Uint8Array(bytes)
-  }
-
-  async function hmacSha1(key, message) {
-    const cryptoKey = await crypto.subtle.importKey(
-      'raw', key, { name: 'HMAC', hash: 'SHA-1' }, false, ['sign']
-    )
-    const signature = await crypto.subtle.sign('HMAC', cryptoKey, message)
-    return new Uint8Array(signature)
-  }
-
-  function dynamicTruncation(hmacResult) {
-    const offset = hmacResult[hmacResult.length - 1] & 0x0f
-    const binary =
-      ((hmacResult[offset] & 0x7f) << 24) |
-      ((hmacResult[offset + 1] & 0xff) << 16) |
-      ((hmacResult[offset + 2] & 0xff) << 8) |
-      (hmacResult[offset + 3] & 0xff)
-    return binary % Math.pow(10, DIGITS)
-  }
-
-  async function generate(secretBase32, timestamp) {
-    const time = timestamp || Math.floor(Date.now() / 1000)
-    const counter = Math.floor(time / PERIOD)
-    const counterBytes = new Uint8Array(8)
-    let c = counter
-    for (let i = 7; i >= 0; i--) {
-      counterBytes[i] = c & 0xff
-      c >>>= 8
-    }
-    const keyBytes = base32ToBytes(secretBase32)
-    const hmac = await hmacSha1(keyBytes, counterBytes)
-    const otp = dynamicTruncation(hmac)
-    return otp.toString().padStart(DIGITS, '0')
-  }
 
   function getRemainingSeconds() {
     return PERIOD - (Math.floor(Date.now() / 1000) % PERIOD)
@@ -59,7 +18,7 @@ const TOTP = (() => {
     return (PERIOD - elapsed) / PERIOD
   }
 
-  return { generate, getRemainingSeconds, getPeriodProgress, DIGITS, PERIOD }
+  return { getRemainingSeconds, getPeriodProgress, DIGITS, PERIOD }
 })()
 
 if (typeof module !== 'undefined' && module.exports) {

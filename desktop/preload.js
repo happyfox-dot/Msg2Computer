@@ -17,6 +17,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
   revokePhone: (phoneId) => ipcRenderer.invoke('revoke-phone', phoneId),
   restorePhone: (phoneId) => ipcRenderer.invoke('restore-phone', phoneId),
   openExternal: (url) => ipcRenderer.invoke('open-external', url),
+  checkForUpdate: () => ipcRenderer.invoke('check-for-update'),
+  getUpdateState: () => ipcRenderer.invoke('get-update-state'),
+  onUpdateStatus: (callback) => {
+    ipcRenderer.on('update-status', (event, data) => callback(data))
+  },
   selectAndParseQr: () => ipcRenderer.invoke('qr-select-and-parse'),
   parseQrClipboard: () => ipcRenderer.invoke('qr-parse-clipboard'),
   parseQrFile: (filePath) => ipcRenderer.invoke('qr-parse-file', filePath),

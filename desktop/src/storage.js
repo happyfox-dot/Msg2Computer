@@ -55,22 +55,67 @@ class TotpStorage {
     }
 
     /**
-     * 加载或创建加密密钥
+     * 加载或创建加密密钥。
+     *
+     * 密钥本身用 Electron safeStorage（Windows 上即 DPAPI）加密后落盘，文件加
+     * `safe:` 前缀；这样即使 home 目录被其它进程读到，拿到的也是受 OS 用户态密钥
+     * 保护的密文。safeStorage 不可用（无 Electron / 个别 Linux 桌面）时退回明文存储，
+     * 但仍是每机随机密钥——绝不回退到全局已知常量（旧实现的 sha256('codebridge-default-key')
+     * 对所有安装都相同，等于未加密）。
+     *
+     * 兼容旧版:旧的明文 hex 密钥文件继续可读，读到后若 safeStorage 可用则就地重写为密文。
      */
     loadOrCreateKey() {
+        const safeStorage = this.getSafeStorage();
+
         try {
             if (fs.existsSync(this.keyFile)) {
-                return fs.readFileSync(this.keyFile, 'utf8');
-            } else {
-                const key = crypto.randomBytes(32).toString('hex');
-                fs.writeFileSync(this.keyFile, key, 'utf8');
-                console.log('[TotpStorage] Generated new encryption key');
-                return key;
+                const raw = fs.readFileSync(this.keyFile, 'utf8').trim();
+                if (raw.startsWith('safe:')) {
+                    if (!safeStorage) {
+                        throw new Error('密钥文件为 DPAPI 密文，但当前环境 safeStorage 不可用');
+                    }
+                    return safeStorage.decryptString(Buffer.from(raw.slice(5), 'base64'));
+                }
+                // 旧版明文 hex 密钥：仍可读；若现在能用 safeStorage 就升级为密文落盘
+                if (raw) {
+                    if (safeStorage) this.persistKey(raw, safeStorage);
+                    return raw;
+                }
             }
+
+            const key = crypto.randomBytes(32).toString('hex');
+            this.persistKey(key, safeStorage);
+            console.log('[TotpStorage] Generated new encryption key');
+            return key;
         } catch (error) {
-            console.warn('[TotpStorage] Using fallback key');
-            return crypto.createHash('sha256').update('codebridge-default-key').digest('hex');
+            // 读/写密钥失败：用一次性随机密钥兜底（本次会话内可用），不落地、不复用全局常量。
+            // 这会导致已有密文本次无法解密（loadData 会回退默认数据），但不引入“所有安装同一把密钥”的漏洞。
+            console.error('[TotpStorage] 密钥读写失败，使用一次性随机会话密钥:', error.message);
+            return crypto.randomBytes(32).toString('hex');
         }
+    }
+
+    /** 拿到 Electron safeStorage（仅在 Electron 主进程可用且已就绪时返回，否则 null）。 */
+    getSafeStorage() {
+        try {
+            const electron = require('electron');
+            const safeStorage = electron && electron.safeStorage;
+            if (safeStorage && safeStorage.isEncryptionAvailable()) return safeStorage;
+        } catch (_) {
+            // 非 Electron 环境（如测试脚本）：require 失败，退回明文
+        }
+        return null;
+    }
+
+    /** 落盘密钥:safeStorage 可用则写 DPAPI 密文（safe: 前缀），否则写明文。 */
+    persistKey(keyHex, safeStorage) {
+        const out = safeStorage
+            ? `safe:${safeStorage.encryptString(keyHex).toString('base64')}`
+            : keyHex;
+        fs.writeFileSync(this.keyFile, out, 'utf8');
+        // 尽力收紧文件权限（POSIX 上 0600；Windows 上 chmod 基本是 no-op，靠 DPAPI 保护）
+        try { fs.chmodSync(this.keyFile, 0o600); } catch (_) {}
     }
 
     /**

@@ -105,6 +105,7 @@ object TopologyStore {
                 .put("allowSmsMessages", device.allowSmsMessages)
                 .put("allowNotifications", device.allowNotifications)
                 .put("allowTotp", device.allowTotp)
+                .put("allowClipboard", device.allowClipboard)
                 .put("connected", false)
                 .put("status", if (device.enabled) "known" else "disabled")
                 .put("routable", device.enabled && device.host.isNotBlank() && device.pairingKey.isNotBlank())
@@ -127,6 +128,7 @@ object TopologyStore {
                 .put("allowSmsMessages", device.allowSmsMessages)
                 .put("allowNotifications", device.allowNotifications)
                 .put("allowTotp", device.allowTotp)
+                .put("allowClipboard", device.allowClipboard)
                 .put("active", false)
                 .put("routable", device.enabled && device.host.isNotBlank() && device.pairingKey.isNotBlank())
                 .put("authority", "device_store")
@@ -180,6 +182,7 @@ object TopologyStore {
             .put("allowSmsMessages", device.allowSmsMessages)
             .put("allowNotifications", device.allowNotifications)
             .put("allowTotp", device.allowTotp)
+            .put("allowClipboard", device.allowClipboard)
             .put("revoked", revoked)
             .put("connected", false)
             .put("status", when {
@@ -207,6 +210,7 @@ object TopologyStore {
             .put("allowSmsMessages", device.allowSmsMessages)
             .put("allowNotifications", device.allowNotifications)
             .put("allowTotp", device.allowTotp)
+            .put("allowClipboard", device.allowClipboard)
             .put("revoked", revoked)
             .put("active", false)
             .put("routable", routable)
@@ -290,6 +294,12 @@ object TopologyStore {
         val pairingKey = node.optString("pairingKey").trim()
         if (id.isBlank() || host.isBlank() || pairingKey.isBlank()) return
         if (!isDeviceType(type)) return
+        // gossip 视角的可用性只决定「是否值得为它新建条目」；对已存在的设备
+        // 不改写本地 enabled 开关（归本机用户所有，见 DeviceStore.upsertDevice）
+        val gossipUsable = node.optBoolean("enabled", true) &&
+            !node.optBoolean("revoked", false) &&
+            node.optBoolean("routable", true)
+        if (!gossipUsable && DeviceStore.findDevice(context, id) == null) return
         DeviceStore.upsertDevice(
             context = context,
             host = host,
@@ -300,16 +310,13 @@ object TopologyStore {
             deviceType = type,
             routeUpdatedAt = node.optLong("updatedAt", 0L),
             altHosts = jsonArrayToList(node.optJSONArray("altHosts")) +
-                listOfNotNull(node.optString("tsHost").takeIf { it.isNotBlank() }),
-            enabled = node.optBoolean("enabled", true) &&
-                !node.optBoolean("revoked", false) &&
-                node.optBoolean("routable", true)
+                listOfNotNull(node.optString("tsHost").takeIf { it.isNotBlank() })
         )
     }
 
     private fun isNewer(incoming: JSONObject, existing: JSONObject?): Boolean {
         if (existing == null) return true
-        return incoming.optLong("seq", incoming.optLong("updatedAt", 0L)) >=
+        return incoming.optLong("seq", incoming.optLong("updatedAt", 0L)) >
             existing.optLong("seq", existing.optLong("updatedAt", 0L))
     }
 

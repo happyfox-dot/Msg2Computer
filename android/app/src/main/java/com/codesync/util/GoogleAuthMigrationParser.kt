@@ -57,9 +57,7 @@ object GoogleAuthMigrationParser {
             when (fieldNumber) {
                 1 -> { // otp_parameters (repeated)
                     if (wireType == 2) { // Length-delimited
-                        val length = readVarint(buffer)
-                        val paramData = ByteArray(length)
-                        buffer.get(paramData)
+                        val paramData = readLengthDelimited(buffer)
                         parseOtpParameters(paramData)?.let { accounts.add(it) }
                     }
                 }
@@ -97,25 +95,17 @@ object GoogleAuthMigrationParser {
             when (fieldNumber) {
                 1 -> { // secret
                     if (wireType == 2) {
-                        val length = readVarint(buffer)
-                        secret = ByteArray(length)
-                        buffer.get(secret)
+                        secret = readLengthDelimited(buffer)
                     }
                 }
                 2 -> { // name
                     if (wireType == 2) {
-                        val length = readVarint(buffer)
-                        val bytes = ByteArray(length)
-                        buffer.get(bytes)
-                        name = String(bytes, Charsets.UTF_8)
+                        name = String(readLengthDelimited(buffer), Charsets.UTF_8)
                     }
                 }
                 3 -> { // issuer
                     if (wireType == 2) {
-                        val length = readVarint(buffer)
-                        val bytes = ByteArray(length)
-                        buffer.get(bytes)
-                        issuer = String(bytes, Charsets.UTF_8)
+                        issuer = String(readLengthDelimited(buffer), Charsets.UTF_8)
                     }
                 }
                 4 -> { // algorithm
@@ -198,19 +188,44 @@ object GoogleAuthMigrationParser {
     }
 
     /**
+     * 读取一段 length-delimited 字段并返回其字节。
+     *
+     * length 来自不可信的二维码内容：必须在分配前校验它非负且不超过缓冲区剩余字节。
+     * 否则一个巨大的 length 会让 `ByteArray(length)` 抛 OutOfMemoryError——而 Error
+     * 不被 parse() 的 catch(Exception) 拦截，恶意二维码即可让进程崩溃（DoS）。
+     */
+    private fun readLengthDelimited(buffer: ByteBuffer): ByteArray {
+        val length = readVarint(buffer)
+        if (length < 0 || length > buffer.remaining()) {
+            throw IllegalArgumentException("Length-delimited field out of range: $length")
+        }
+        val bytes = ByteArray(length)
+        buffer.get(bytes)
+        return bytes
+    }
+
+    /**
      * 跳过字段
      */
     private fun skipField(buffer: ByteBuffer, wireType: Int) {
         when (wireType) {
             0 -> readVarint(buffer) // Varint
-            1 -> buffer.position(buffer.position() + 8) // Fixed64
+            1 -> advancePosition(buffer, 8) // Fixed64
             2 -> { // Length-delimited
                 val length = readVarint(buffer)
-                buffer.position(buffer.position() + length)
+                advancePosition(buffer, length)
             }
-            5 -> buffer.position(buffer.position() + 4) // Fixed32
+            5 -> advancePosition(buffer, 4) // Fixed32
             else -> throw IllegalArgumentException("Unknown wire type: $wireType")
         }
+    }
+
+    /** 越界前先校验，避免 buffer.position() 因负数/溢出落到非法位置。 */
+    private fun advancePosition(buffer: ByteBuffer, count: Int) {
+        if (count < 0 || count > buffer.remaining()) {
+            throw IllegalArgumentException("Skip out of range: $count")
+        }
+        buffer.position(buffer.position() + count)
     }
 
     /**

@@ -91,7 +91,9 @@ class QRScannerActivity : AppCompatActivity() {
                 name = deviceName,
                 deviceId = deviceId,
                 deviceType = deviceType,
-                altHosts = if (tsHost.isNotEmpty()) listOf(tsHost) else emptyList()
+                altHosts = if (tsHost.isNotEmpty()) listOf(tsHost) else emptyList(),
+                // 用户显式扫码配对：明确表达启用意图（拓扑同步路径则不改写本地开关）
+                enabled = true
             )
             TopologyStore.markDeviceState(this, device, enabled = device.enabled)
 

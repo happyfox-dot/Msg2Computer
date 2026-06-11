@@ -19,9 +19,9 @@ import com.codesync.util.DesktopDevice
 import com.codesync.util.DeviceStore
 import com.codesync.util.LanDiscovery
 import com.codesync.util.PhoneIdentityStore
+import com.codesync.util.SettingsStore
 import com.codesync.util.TotpEntry
 import com.codesync.util.TotpStore
-import com.codesync.util.TotpUtil
 import com.codesync.util.TopologyStore
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -59,13 +59,13 @@ class WebSocketService : Service() {
         const val ACTION_CONNECT = "com.codesync.CONNECT"
         const val ACTION_DISCONNECT = "com.codesync.DISCONNECT"
         const val ACTION_SEND_SMS = "com.codesync.SEND_SMS"
-        const val ACTION_SEND_TOTP = "com.codesync.SEND_TOTP"
         const val ACTION_SEND_TOTP_SEED = "com.codesync.SEND_TOTP_SEED"
         const val ACTION_DELETE_TOTP_SEED = "com.codesync.DELETE_TOTP_SEED"
         const val ACTION_REVOKE_TOTP_ACCESS = "com.codesync.REVOKE_TOTP_ACCESS"
         const val ACTION_RELAY_SMS = "com.codesync.RELAY_SMS"
         const val ACTION_BROADCAST_TOPOLOGY = "com.codesync.BROADCAST_TOPOLOGY"
         const val ACTION_SEND_NOTIFICATION = "com.codesync.SEND_NOTIFICATION"
+        const val ACTION_SEND_CLIPBOARD = "com.codesync.SEND_CLIPBOARD"
 
         const val EXTRA_CODE = "code"
         const val EXTRA_SOURCE = "source"
@@ -193,7 +193,7 @@ class WebSocketService : Service() {
             ACTION_DISCONNECT -> handleDisconnect()
             ACTION_SEND_SMS -> handleSendSms(intent)
             ACTION_SEND_NOTIFICATION -> handleSendNotification(intent)
-            ACTION_SEND_TOTP -> handleSendTotp(intent)
+            ACTION_SEND_CLIPBOARD -> handleSendClipboard(intent)
             ACTION_SEND_TOTP_SEED -> handleSendTotpSeed(intent)
             ACTION_DELETE_TOTP_SEED -> handleDeleteTotpSeed(intent)
             ACTION_REVOKE_TOTP_ACCESS -> handleRevokeTotpAccess(intent)
@@ -273,6 +273,21 @@ class WebSocketService : Service() {
         )
     }
 
+    private fun handleSendClipboard(intent: Intent) {
+        val text = intent.getStringExtra(EXTRA_MESSAGE_BODY)?.takeIf { it.isNotBlank() } ?: run {
+            stopIfNothingPending("空闲")
+            return
+        }
+        holdForwardLocks()
+        enqueueAndDeliver(
+            code = "",
+            source = "剪贴板",
+            type = "clipboard",
+            label = "剪贴板",
+            rawMessage = text
+        )
+    }
+
     private fun handleRelaySms(intent: Intent) {
         val payload = intent.getStringExtra(EXTRA_RELAY_PAYLOAD)?.takeIf { it.isNotBlank() } ?: run {
             stopIfNothingPending("空闲")
@@ -280,20 +295,6 @@ class WebSocketService : Service() {
         }
         holdForwardLocks()
         enqueueRelayPayload(payload)
-    }
-
-    private fun handleSendTotp(intent: Intent) {
-        val label = intent.getStringExtra(EXTRA_TOTP_LABEL) ?: run {
-            stopIfNothingPending("空闲")
-            return
-        }
-        val secret = intent.getStringExtra(EXTRA_TOTP_SECRET) ?: run {
-            stopIfNothingPending("空闲")
-            return
-        }
-        val code = TotpUtil.generate(secret)
-        holdForwardLocks()
-        enqueueAndDeliver(code, label, "totp", label = label)
     }
 
     private fun handleSendTotpSeed(intent: Intent) {
@@ -417,8 +418,9 @@ class WebSocketService : Service() {
 
         val phoneIdentity = PhoneIdentityStore.get(this)
         val targetTopology = buildTargetTopology(targetDevices)
-        val msgId = "m-${System.currentTimeMillis()}-${msgIdSeq.incrementAndGet()}"
-        val relayMessageId = "relay-${phoneIdentity.id}-${System.currentTimeMillis()}-${msgIdSeq.incrementAndGet()}"
+        val msgId = "m-${phoneIdentity.id}-${System.currentTimeMillis()}-${msgIdSeq.incrementAndGet()}"
+        val originMessageId = msgId
+        val relayMessageId = originMessageId
         val payload = JSONObject()
             .put("code", code)
             .put("source", source)
@@ -437,6 +439,7 @@ class WebSocketService : Service() {
                 if (isUserMessageType(type)) {
                     put("originDeviceId", phoneIdentity.id)
                     put("originDeviceName", phoneIdentity.name)
+                    put("originMessageId", originMessageId)
                     put("relayMessageId", relayMessageId)
                     put("relayPath", JSONArray().put(phoneIdentity.id))
                     put("relayTtl", SMS_RELAY_TTL)
@@ -459,7 +462,7 @@ class WebSocketService : Service() {
         )
     }
 
-    private fun enqueueRelayPayload(plainPayload: String) {
+    private fun enqueueRelayPayload(plainPayload: String, excludeDeviceId: String = "") {
         val identity = PhoneIdentityStore.get(this)
         val payload = runCatching { JSONObject(plainPayload) }.getOrNull() ?: run {
             stopIfNothingPending("中继负载无效")
@@ -486,16 +489,16 @@ class WebSocketService : Service() {
         val allowedTargetIds = jsonArrayToSet(payload.optJSONArray("targetDeviceIds"))
         val pathIds = jsonArrayToSet(nextPath)
         val originId = payload.optString("originDeviceId", payload.optString("sourceDeviceId"))
-        val nextTargets = targetDevicesForType(payloadType)
-            .filter { device ->
-                device.id !in pathIds &&
-                    device.id != originId &&
-                    (allowedTargetIds.isEmpty() || device.id in allowedTargetIds)
-            }
-            .sortedWith(
-                compareBy<DesktopDevice> { if (it.routeMetric > 0) it.routeMetric else Int.MAX_VALUE / 2 }
-                    .thenByDescending { it.lastSyncAt }
-            )
+        val currentRelayTtl = payload.optInt("relayTtl", payload.optInt("ttl", 0))
+        val nextRelayTtl = (currentRelayTtl - 1).coerceAtLeast(0)
+        val stableMsgId = stablePayloadMessageId(payload)
+        val nextTargets = selectRelayNextTargets(
+            payloadType = payloadType,
+            allowedTargetIds = allowedTargetIds,
+            pathIds = pathIds,
+            excludeDeviceId = excludeDeviceId,
+            originId = originId
+        )
 
         if (nextTargets.isEmpty()) {
             updateConnectionState("已接收中继消息，无需继续转发")
@@ -504,19 +507,24 @@ class WebSocketService : Service() {
             return
         }
 
-        val nextPayload = JSONObject(payload.toString())
+        val nextPayloadJson = JSONObject(payload.toString())
+            .put("originMessageId", payload.optString("originMessageId").ifBlank { stableMsgId })
             .put("relayPath", nextPath)
-            .put("relayTtl", (payload.optInt("relayTtl", 0) - 1).coerceAtLeast(0))
+            .put("relayTtl", nextRelayTtl)
             .put("lastRelayDeviceId", identity.id)
             .put("lastRelayDeviceName", identity.name)
             .put("nextHopDevices", buildTargetTopology(nextTargets))
-            .toString()
+        if (isTopologyPayloadType(payloadType)) {
+            nextPayloadJson.put("ttl", nextRelayTtl)
+        }
+        val nextPayload = nextPayloadJson.toString()
 
         enqueuePayloadToDevices(
             payload = nextPayload,
             targetDevices = nextTargets,
             type = payloadType,
-            statusMessage = relayStatusMessage(payloadType, nextTargets.size)
+            statusMessage = relayStatusMessage(payloadType, nextTargets.size),
+            msgId = stableMsgId
         )
     }
 
@@ -737,6 +745,7 @@ class WebSocketService : Service() {
                     .put("allowSmsMessages", device.allowSmsMessages)
                     .put("allowNotifications", device.allowNotifications)
                     .put("allowTotp", device.allowTotp)
+                    .put("allowClipboard", device.allowClipboard)
             )
         }
         return targets
@@ -885,9 +894,59 @@ class WebSocketService : Service() {
                 "sms_message" -> device.allowSmsMessages
                 "app_notification" -> device.allowNotifications
                 "totp", "totp_seed", "totp_revoke" -> device.allowTotp
+                // 剪贴板不细分到每设备策略，仅受全局开关控制：所有启用设备都接收
+                "clipboard" -> device.allowClipboard && SettingsStore.isSyncClipboardEnabled(this)
                 else -> true
             }
         }
+    }
+
+    private fun selectRelayNextTargets(
+        payloadType: String,
+        allowedTargetIds: Set<String>,
+        pathIds: Set<String>,
+        excludeDeviceId: String,
+        originId: String
+    ): List<DesktopDevice> {
+        val candidates = targetDevicesForType(payloadType)
+        val byId = candidates.associateBy { it.id }
+        val selected = linkedMapOf<String, DesktopDevice>()
+
+        candidates.forEach { finalTarget ->
+            if (finalTarget.id in pathIds ||
+                finalTarget.id == excludeDeviceId ||
+                finalTarget.id == originId ||
+                (allowedTargetIds.isNotEmpty() && finalTarget.id !in allowedTargetIds)
+            ) {
+                return@forEach
+            }
+
+            val nextHopId = finalTarget.routeNextHopId.trim()
+            val routedNextHop = if (
+                nextHopId.isNotBlank() &&
+                nextHopId != finalTarget.id &&
+                nextHopId !in pathIds &&
+                nextHopId != excludeDeviceId &&
+                nextHopId != originId
+            ) {
+                byId[nextHopId]
+            } else {
+                null
+            }
+
+            val deliveryTarget = routedNextHop ?: finalTarget
+            if (deliveryTarget.id !in pathIds &&
+                deliveryTarget.id != excludeDeviceId &&
+                deliveryTarget.id != originId
+            ) {
+                selected[deliveryTarget.id] = deliveryTarget
+            }
+        }
+
+        return selected.values.sortedWith(
+            compareBy<DesktopDevice> { if (it.routeMetric > 0) it.routeMetric else Int.MAX_VALUE / 2 }
+                .thenByDescending { it.lastSyncAt }
+        )
     }
 
     private fun isRelaySupportedType(type: String): Boolean {
@@ -900,7 +959,8 @@ class WebSocketService : Service() {
     private fun isUserMessageType(type: String): Boolean {
         return type == "sms" ||
             type == "sms_message" ||
-            type == "app_notification"
+            type == "app_notification" ||
+            type == "clipboard"
     }
 
     private fun deliveryStatusMessage(type: String, targetCount: Int): String {
@@ -908,6 +968,7 @@ class WebSocketService : Service() {
             "sms" -> "正在投递验证码到 $targetCount 个设备节点"
             "sms_message" -> "正在投递短信到 $targetCount 个设备节点"
             "app_notification" -> "正在投递通知到 $targetCount 个设备节点"
+            "clipboard" -> "正在同步剪贴板到 $targetCount 个设备节点"
             else -> "正在同步 TOTP"
         }
     }
@@ -917,6 +978,7 @@ class WebSocketService : Service() {
             "sms" -> "正在中继验证码到 $targetCount 个设备节点"
             "sms_message" -> "正在中继短信到 $targetCount 个设备节点"
             "app_notification" -> "正在中继通知到 $targetCount 个设备节点"
+            "clipboard" -> "正在中继剪贴板到 $targetCount 个设备节点"
             else -> "正在中继 TOTP 到 $targetCount 个设备节点"
         }
     }
@@ -950,6 +1012,13 @@ class WebSocketService : Service() {
             array.optString(i).takeIf { it.isNotBlank() }?.let { values.add(it) }
         }
         return values
+    }
+
+    private fun stablePayloadMessageId(payload: JSONObject): String {
+        return payload.optString("originMessageId")
+            .ifBlank { payload.optString("relayMessageId") }
+            .ifBlank { payload.optString("msgId") }
+            .ifBlank { "m-${System.currentTimeMillis()}-${msgIdSeq.incrementAndGet()}" }
     }
 
     private fun connectDevice(device: DesktopDevice, registerOnly: Boolean, force: Boolean = false) {
@@ -1200,9 +1269,9 @@ class WebSocketService : Service() {
             if (changed) {
                 updateConnectionState("已更新拓扑：${connection.device.name}")
                 notifyTotpSynced()
-                val nextTtl = (delta.optInt("ttl", SMS_RELAY_TTL) - 1).coerceAtLeast(0)
-                if (nextTtl > 0 && DeviceStore.getEnabledDevices(this).any { it.id != connection.device.id }) {
-                    broadcastTopologyDelta("gossip", connection.device.id, nextTtl)
+                val ttl = delta.optInt("relayTtl", delta.optInt("ttl", SMS_RELAY_TTL))
+                if (ttl > 0 && DeviceStore.getEnabledDevices(this).any { it.id != connection.device.id }) {
+                    enqueueRelayPayload(delta.toString(), excludeDeviceId = connection.device.id)
                 }
             }
         } catch (e: Exception) {

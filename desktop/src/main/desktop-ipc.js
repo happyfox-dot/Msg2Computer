@@ -1,0 +1,52 @@
+function registerDesktopIpc(ipcMain, handlers) {
+  const handle = (channel, fn) => ipcMain.handle(channel, fn)
+
+  handle('get-pairing-info', () => handlers.getPairingInfo())
+  handle('copy-to-clipboard', (event, text) => handlers.copyToClipboard(text))
+  handle('hide-window', () => handlers.hideWindow())
+  handle('minimize-window', () => handlers.minimizeWindow())
+  handle('regenerate-pairing', () => handlers.regeneratePairing())
+  handle('get-authorized-phones', () => handlers.getAuthorizedPhones())
+  handle('get-desktop-totps', () => handlers.getDesktopTotps())
+  handle('get-topology', () => handlers.getTopology())
+  handle('get-message-settings', () => handlers.getMessageSettings())
+  handle('set-message-settings', (event, updates) => handlers.setMessageSettings(updates))
+  handle('scan-lan-devices', () => handlers.scanLanDevices())
+  handle('get-lan-devices', () => handlers.getLanDevices())
+  handle('pair-desktop-device', (event, pairingData) => handlers.pairDesktopDevice(pairingData))
+  handle('is-window-visible', () => handlers.isWindowVisible())
+  handle('set-phone-enabled', (event, phoneId, enabled) => handlers.setPhoneEnabled(phoneId, enabled))
+  handle('set-phone-content-policy', (event, phoneId, updates) => handlers.setPhoneContentPolicy(phoneId, updates))
+  handle('revoke-phone', (event, phoneId) => handlers.revokePhone(phoneId))
+  handle('restore-phone', (event, phoneId) => handlers.restorePhone(phoneId))
+  handle('open-external', (event, url) => handlers.openExternal(url))
+
+  handle('check-for-update', () => handlers.checkForUpdate())
+  handle('get-update-state', () => handlers.getUpdateState())
+
+  handle('storage-get-all-totps', () => handlers.storageGetAllTotps())
+  handle('storage-add-totp', (event, totp) => handlers.storageAddTotp(totp))
+  handle('storage-update-totp', (event, id, updates) => handlers.storageUpdateTotp(id, updates))
+  handle('storage-delete-totp', (event, id) => handlers.storageDeleteTotp(id))
+  handle('storage-get-totp-by-id', (event, id) => handlers.storageGetTotpById(id))
+  handle('storage-get-all-sms', () => handlers.storageGetAllSms())
+  handle('storage-add-sms', (event, sms) => handlers.storageAddSms(sms))
+  handle('storage-delete-sms', (event, id) => handlers.storageDeleteSms(id))
+  handle('storage-clear-all-sms', () => handlers.storageClearAllSms())
+  handle('storage-get-stats', () => handlers.storageGetStats())
+  handle('storage-get-device-id', () => handlers.storageGetDeviceId())
+  handle('storage-get-device-name', () => handlers.storageGetDeviceName())
+  handle('storage-set-device-name', (event, name) => handlers.storageSetDeviceName(name))
+  handle('storage-export-data', () => handlers.storageExportData())
+  handle('storage-import-data', (event, data) => handlers.storageImportData(data))
+
+  handle('qr-start-clipboard-watch', () => handlers.qrStartClipboardWatch())
+  handle('qr-stop-clipboard-watch', () => handlers.qrStopClipboardWatch())
+  handle('qr-parse-file', (event, filePath) => handlers.qrParseFile(filePath))
+  handle('qr-select-and-parse', () => handlers.qrSelectAndParse())
+  handle('qr-parse-clipboard', () => handlers.qrParseClipboard())
+}
+
+module.exports = {
+  registerDesktopIpc
+}

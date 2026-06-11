@@ -1,6 +1,7 @@
 package com.codesync
 
 import android.Manifest
+import android.app.DownloadManager
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -35,6 +36,7 @@ import com.codesync.service.NodeReceiverService
 import com.codesync.service.WebSocketService
 import com.codesync.util.DesktopDevice
 import com.codesync.util.DeviceStore
+import com.codesync.util.ApkUpdater
 import com.codesync.util.GoogleAuthMigrationParser
 import com.codesync.util.LanDiscoveredDevice
 import com.codesync.util.LanDiscovery
@@ -72,6 +74,12 @@ class MainActivity : AppCompatActivity() {
     private var updatingMessagePolicySwitches = false
     private var discoveredLanNodes: List<LanDiscoveredDevice> = emptyList()
 
+    // 应用内更新：DownloadManager 的下载 id 与待安装的版本号；下载完成由系统广播触发安装
+    private var pendingUpdateDownloadId: Long = -1L
+    private var pendingUpdateVersionName: String = ""
+    // 等待「安装未知应用」授权后继续下载的更新信息（去设置页授权 → onResume 续流程）
+    private var pendingUpdateInfo: ApkUpdater.UpdateInfo? = null
+
     private data class SheetAction(
         val title: String,
         val subtitle: String = "",
@@ -103,6 +111,16 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // DownloadManager 下载完成广播：匹配到本次更新的下载 id 时拉起系统安装器
+    private val downloadCompleteReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action != DownloadManager.ACTION_DOWNLOAD_COMPLETE) return
+            val id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L)
+            if (id == -1L || id != pendingUpdateDownloadId) return
+            handleUpdateDownloadComplete(id)
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
@@ -116,6 +134,19 @@ class MainActivity : AppCompatActivity() {
         // 按需模型：启动时不再建立常驻连接，仅展示当前空闲状态
         refreshConnectionSnapshot()
         startTotpUpdates()
+
+        // 下载完成广播跟随 Activity 生命周期注册（下载期间退到后台仍可收到，
+        // 进程被杀则由用户重新点「检查更新」续流程）。
+        // ACTION_DOWNLOAD_COMPLETE 由系统 DownloadProvider 发出（受保护广播），
+        // Android 13+ 需显式 RECEIVER_EXPORTED 才能收到跨应用广播。
+        ContextCompat.registerReceiver(
+            this,
+            downloadCompleteReceiver,
+            IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE),
+            ContextCompat.RECEIVER_EXPORTED
+        )
+        // 启动后静默检查一次更新（已被用户忽略的版本不再打扰）
+        autoCheckUpdateSilently()
     }
 
     override fun onResume() {
@@ -125,6 +156,14 @@ class MainActivity : AppCompatActivity() {
         syncForwardSwitch()
         syncMessagePolicySwitches()
         refreshConnectionSnapshot()
+
+        // 从「安装未知应用」设置页返回：已授权则继续下载，未授权则放弃（可重新手动检查）
+        pendingUpdateInfo?.let { info ->
+            pendingUpdateInfo = null
+            if (ApkUpdater.canInstallPackages(this)) {
+                startUpdateDownload(info)
+            }
+        }
     }
 
     override fun onStart() {
@@ -237,6 +276,12 @@ class MainActivity : AppCompatActivity() {
             showRevokeTotpAccessDialog()
         }
 
+        binding.txtCurrentVersion.text =
+            getString(R.string.update_current_version, ApkUpdater.currentVersionName(this))
+        binding.btnCheckUpdate.setOnClickListener {
+            checkForAppUpdate(manual = true)
+        }
+
         syncForwardSwitch()
         binding.switchAutoSync.setOnCheckedChangeListener { _, isChecked ->
             if (updatingForwardSwitch) return@setOnCheckedChangeListener
@@ -247,6 +292,118 @@ class MainActivity : AppCompatActivity() {
         }
 
         setupMessagePolicyControls()
+    }
+
+    // ====== 应用内更新（GitHub Releases 侧载更新）======
+
+    private val updatePrefs by lazy { getSharedPreferences("app_update", MODE_PRIVATE) }
+
+    /** 启动后延迟静默检查：有新版且未被用户忽略时弹更新框，其余情况完全无感。 */
+    private fun autoCheckUpdateSilently() {
+        lifecycleScope.launch {
+            delay(3000)
+            val info = ApkUpdater.checkLatest() ?: return@launch
+            if (!ApkUpdater.hasUpdate(this@MainActivity, info)) return@launch
+            if (info.versionName == updatePrefs.getString("skipped_version", null)) return@launch
+            if (isFinishing || !lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) return@launch
+            showUpdateFoundDialog(info, manual = false)
+        }
+    }
+
+    /** 手动检查更新：按钮置忙，最新/失败/有新版都有明确反馈。 */
+    private fun checkForAppUpdate(manual: Boolean) {
+        binding.btnCheckUpdate.isEnabled = false
+        binding.btnCheckUpdate.setText(R.string.update_checking)
+        lifecycleScope.launch {
+            val info = ApkUpdater.checkLatest()
+            binding.btnCheckUpdate.isEnabled = true
+            binding.btnCheckUpdate.setText(R.string.check_update)
+            when {
+                info == null ->
+                    Toast.makeText(this@MainActivity, R.string.update_check_failed, Toast.LENGTH_SHORT).show()
+                !ApkUpdater.hasUpdate(this@MainActivity, info) ->
+                    Toast.makeText(this@MainActivity, R.string.update_already_latest, Toast.LENGTH_SHORT).show()
+                else -> showUpdateFoundDialog(info, manual)
+            }
+        }
+    }
+
+    private fun showUpdateFoundDialog(info: ApkUpdater.UpdateInfo, manual: Boolean) {
+        val message = info.notes.ifBlank { getString(R.string.update_found_message_default) }
+        val builder = androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle(getString(R.string.update_found_title, info.versionName))
+            .setMessage(message)
+            .setPositiveButton(R.string.update_download) { _, _ ->
+                if (info.apkUrl == null) {
+                    // 该 release 没上传 APK 资产：兜底跳浏览器手动下载
+                    Toast.makeText(this, R.string.update_no_apk, Toast.LENGTH_LONG).show()
+                    runCatching { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(info.pageUrl))) }
+                } else {
+                    startUpdateDownload(info)
+                }
+            }
+            .setNegativeButton(R.string.cancel, null)
+        if (!manual) {
+            // 自动弹出的提示允许「忽略此版本」，之后启动不再打扰（手动检查仍会提示）
+            builder.setNeutralButton(R.string.update_skip_version) { _, _ ->
+                updatePrefs.edit().putString("skipped_version", info.versionName).apply()
+            }
+        }
+        builder.show()
+    }
+
+    /** 发起 APK 下载；Android 8+ 先确保「安装未知应用」权限，授权后经 onResume 续流程。 */
+    private fun startUpdateDownload(info: ApkUpdater.UpdateInfo) {
+        val apkUrl = info.apkUrl ?: return
+        if (!ApkUpdater.canInstallPackages(this)) {
+            androidx.appcompat.app.AlertDialog.Builder(this)
+                .setTitle(R.string.update_install_permission_title)
+                .setMessage(R.string.update_install_permission_message)
+                .setPositiveButton(R.string.update_install_permission_go) { _, _ ->
+                    pendingUpdateInfo = info
+                    runCatching {
+                        startActivity(
+                            Intent(
+                                Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                                Uri.parse("package:$packageName")
+                            )
+                        )
+                    }
+                }
+                .setNegativeButton(R.string.cancel, null)
+                .show()
+            return
+        }
+        val downloadId = ApkUpdater.downloadApk(
+            this, apkUrl, info.versionName,
+            getString(R.string.app_name) + " " + info.versionName
+        )
+        if (downloadId == -1L) {
+            Toast.makeText(this, R.string.update_download_failed, Toast.LENGTH_SHORT).show()
+            return
+        }
+        pendingUpdateDownloadId = downloadId
+        pendingUpdateVersionName = info.versionName
+        Toast.makeText(this, R.string.update_downloading, Toast.LENGTH_SHORT).show()
+    }
+
+    /** 下载完成：校验 DownloadManager 状态后拉起系统安装器。 */
+    private fun handleUpdateDownloadComplete(downloadId: Long) {
+        pendingUpdateDownloadId = -1L
+        val versionName = pendingUpdateVersionName
+        pendingUpdateVersionName = ""
+        if (versionName.isEmpty()) return
+
+        val dm = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+        val successful = dm.query(DownloadManager.Query().setFilterById(downloadId))?.use { cursor ->
+            cursor.moveToFirst() &&
+                cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS)) ==
+                DownloadManager.STATUS_SUCCESSFUL
+        } ?: false
+
+        if (!successful || !ApkUpdater.installApk(this, ApkUpdater.apkFile(this, versionName))) {
+            Toast.makeText(this, R.string.update_download_failed, Toast.LENGTH_LONG).show()
+        }
     }
 
     /** 把开关状态同步为「短信自动转发」偏好，而非常驻连接开关。 */
@@ -284,9 +441,43 @@ class MainActivity : AppCompatActivity() {
             SettingsStore.setReceiveNotificationsEnabled(this, isChecked)
             showMessagePolicySaved()
         }
+        binding.switchSyncClipboard.setOnCheckedChangeListener { _, isChecked ->
+            if (updatingMessagePolicySwitches) return@setOnCheckedChangeListener
+            SettingsStore.setSyncClipboardEnabled(this, isChecked)
+            showMessagePolicySaved()
+        }
         binding.btnNotificationAccess.setOnClickListener {
             startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
         }
+        // 受 Android 10+ 后台读剪贴板限制，手机→其它节点只能在前台主动触发：
+        // 点击按钮时（App 处于前台，读剪贴板合法）读取当前剪贴板并投递。
+        binding.btnSyncClipboard.setOnClickListener {
+            sendCurrentClipboard()
+        }
+    }
+
+    /** 读取当前剪贴板内容并投递到启用的设备节点（仅前台可读，符合系统限制）。 */
+    private fun sendCurrentClipboard() {
+        if (!SettingsStore.isSyncClipboardEnabled(this)) {
+            Toast.makeText(this, R.string.clipboard_sync_disabled, Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (DeviceStore.getEnabledDevices(this).none { it.allowClipboard }) {
+            Toast.makeText(this, R.string.clipboard_no_target, Toast.LENGTH_SHORT).show()
+            return
+        }
+        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+        val text = clipboard.primaryClip?.takeIf { it.itemCount > 0 }
+            ?.getItemAt(0)?.coerceToText(this)?.toString()?.trim().orEmpty()
+        if (text.isBlank()) {
+            Toast.makeText(this, R.string.clipboard_empty, Toast.LENGTH_SHORT).show()
+            return
+        }
+        startServiceForAction(WebSocketService.ACTION_SEND_CLIPBOARD) {
+            putExtra(WebSocketService.EXTRA_MESSAGE_BODY, text)
+        }
+        Toast.makeText(this, R.string.clipboard_sent, Toast.LENGTH_SHORT).show()
+        refreshConnectionSnapshot()
     }
 
     private fun syncMessagePolicySwitches() {
@@ -296,6 +487,7 @@ class MainActivity : AppCompatActivity() {
         binding.switchReceiveSmsCodes.isChecked = SettingsStore.isReceiveSmsCodesEnabled(this)
         binding.switchReceiveAllSms.isChecked = SettingsStore.isReceiveAllSmsEnabled(this)
         binding.switchReceiveNotifications.isChecked = SettingsStore.isReceiveNotificationsEnabled(this)
+        binding.switchSyncClipboard.isChecked = SettingsStore.isSyncClipboardEnabled(this)
         updatingMessagePolicySwitches = false
     }
 
@@ -449,13 +641,15 @@ class MainActivity : AppCompatActivity() {
             getString(R.string.policy_sms_codes),
             getString(R.string.policy_all_sms),
             getString(R.string.policy_notifications),
-            getString(R.string.policy_totp)
+            getString(R.string.policy_totp),
+            getString(R.string.policy_clipboard)
         )
         val selected = booleanArrayOf(
             device.allowSmsCodes,
             device.allowSmsMessages,
             device.allowNotifications,
-            device.allowTotp
+            device.allowTotp,
+            device.allowClipboard
         )
 
         showMultiChoiceSheet(
@@ -471,7 +665,8 @@ class MainActivity : AppCompatActivity() {
                     allowSmsCodes = selected[0],
                     allowSmsMessages = selected[1],
                     allowNotifications = selected[2],
-                    allowTotp = selected[3]
+                    allowTotp = selected[3],
+                    allowClipboard = selected[4]
                 )
                 refreshDeviceList()
                 rebuildTopologyList()
@@ -487,6 +682,7 @@ class MainActivity : AppCompatActivity() {
             if (device.allowSmsMessages) add(getString(R.string.policy_all_sms_short))
             if (device.allowNotifications) add(getString(R.string.policy_notifications_short))
             if (device.allowTotp) add("TOTP")
+            if (device.allowClipboard) add(getString(R.string.policy_clipboard_short))
         }
         return items.joinToString("、").ifBlank { getString(R.string.policy_none) }
     }
@@ -1031,7 +1227,9 @@ class MainActivity : AppCompatActivity() {
             pairingKey = device.pairingKey,
             name = device.name,
             deviceId = device.id,
-            deviceType = device.type
+            deviceType = device.type,
+            // 用户显式配对：明确表达启用意图（拓扑同步路径则不改写本地开关）
+            enabled = true
         )
         TopologyStore.markDeviceState(this, paired, enabled = paired.enabled)
 
@@ -1697,8 +1895,16 @@ class MainActivity : AppCompatActivity() {
 
     private fun copyToClipboard(text: String) {
         val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
-        clipboard.setPrimaryClip(android.content.ClipData.newPlainText("code", text))
-        Toast.makeText(this, "$text 已复制", Toast.LENGTH_SHORT).show()
+        val clip = android.content.ClipData.newPlainText("code", text)
+        // Android 13+ 剪贴板预览会明文显示内容；标记为敏感后系统改为遮蔽显示。
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            clip.description.extras = android.os.PersistableBundle().apply {
+                putBoolean("android.content.extra.IS_SENSITIVE", true)
+            }
+        }
+        clipboard.setPrimaryClip(clip)
+        // 不在 Toast 里回显验证码：Toast 可被无障碍服务/截屏读取。
+        Toast.makeText(this, "已复制", Toast.LENGTH_SHORT).show()
     }
 
     private fun getLastSyncAt(): Long {
@@ -1768,6 +1974,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         totpUpdateJob?.cancel()
+        runCatching { unregisterReceiver(downloadCompleteReceiver) }
         super.onDestroy()
     }
 }

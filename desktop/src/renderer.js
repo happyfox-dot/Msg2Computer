@@ -14,7 +14,9 @@ let lanDevices = []
 let messageSettings = {
   receiveSmsCodes: true,
   receiveAllSms: true,
-  receiveNotifications: true
+  receiveNotifications: true,
+  // 剪贴板同步默认关闭，需用户显式开启
+  syncClipboard: false
 }
 
 document.addEventListener('DOMContentLoaded', async () => {
@@ -241,14 +243,66 @@ function setupSettings() {
     })
   }
   setupMessageSettings()
+  setupUpdateControl()
   updateSettingsStats()
+}
+
+// 更新状态文案映射：把主进程 updater 的 status 翻译成用户可读的提示
+function describeUpdateState(state) {
+  if (!state) return ''
+  switch (state.status) {
+    case 'checking':
+      return '正在检查更新…'
+    case 'available':
+      return `发现新版本 ${state.version || ''}，正在下载…`
+    case 'downloading':
+      return `正在下载更新… ${state.percent || 0}%`
+    case 'downloaded':
+      return `新版本 ${state.version || ''} 已就绪`
+    case 'not-available':
+      return '当前已是最新版本'
+    case 'error':
+      return '检查更新失败，请稍后重试'
+    default:
+      return ''
+  }
+}
+
+function setupUpdateControl() {
+  const btn = document.getElementById('btn-check-update')
+  const statusText = document.getElementById('update-status-text')
+  if (!btn || !window.electronAPI.checkForUpdate) return
+
+  const applyState = (state) => {
+    if (statusText) statusText.textContent = describeUpdateState(state)
+    // 检查/下载进行中禁用按钮，避免重复触发
+    const busy = state && (state.status === 'checking' || state.status === 'downloading')
+    btn.disabled = !!busy
+  }
+
+  // 订阅主进程推送的实时更新状态（下载进度、下载完成等）
+  window.electronAPI.onUpdateStatus?.((state) => applyState(state))
+
+  // 进入设置页时同步一次当前状态（可能开机静默检查已经跑过了）
+  window.electronAPI.getUpdateState?.().then(applyState).catch(() => {})
+
+  btn.addEventListener('click', async () => {
+    applyState({ status: 'checking' })
+    try {
+      await window.electronAPI.checkForUpdate()
+    } catch (error) {
+      console.error('检查更新失败:', error)
+      applyState({ status: 'error' })
+    }
+  })
 }
 
 async function setupMessageSettings() {
   const fields = {
     receiveSmsCodes: document.getElementById('chk-receive-sms-codes'),
     receiveAllSms: document.getElementById('chk-receive-all-sms'),
-    receiveNotifications: document.getElementById('chk-receive-notifications')
+    receiveNotifications: document.getElementById('chk-receive-notifications'),
+    syncClipboard: document.getElementById('chk-sync-clipboard')
   }
   if (!fields.receiveSmsCodes || !window.electronAPI.getMessageSettings) return
 
@@ -288,11 +342,11 @@ function setupPhoneList() {
     const row = target.closest('.phone-row')
     if (!row) return
 
-    if (target.matches('[data-action="toggle-phone-totp"]')) {
+    if (target.matches('[data-action="toggle-phone-totp"], [data-action="toggle-phone-clipboard"]')) {
       target.disabled = true
       try {
         const phones = await window.electronAPI.setPhoneContentPolicy(row.dataset.phoneId, {
-          allowTotp: target.checked
+          [target.dataset.action === 'toggle-phone-clipboard' ? 'allowClipboard' : 'allowTotp']: target.checked
         })
         authorizedPhones = Array.isArray(phones) ? phones : []
         renderPhones()
@@ -585,6 +639,7 @@ function renderPhones() {
     const checked = phone.enabled !== false && phone.revoked !== true
     const contentPolicy = phone.contentPolicy || {}
     const totpChecked = contentPolicy.allowTotp !== false
+    const clipboardChecked = contentPolicy.allowClipboard === true
     const meta = [
       phone.lastSeen ? `上次 ${formatTime(phone.lastSeen)}` : '',
       phone.lastIP || ''
@@ -614,6 +669,10 @@ function renderPhones() {
         <label class="phone-policy-toggle" title="是否向该节点推送本机 TOTP">
           <input type="checkbox" data-action="toggle-phone-totp" ${totpChecked ? 'checked' : ''} ${phone.revoked ? 'disabled' : ''}>
           <span>TOTP</span>
+        </label>
+        <label class="phone-policy-toggle" title="是否向该节点同步本机剪贴板">
+          <input type="checkbox" data-action="toggle-phone-clipboard" ${clipboardChecked ? 'checked' : ''} ${phone.revoked ? 'disabled' : ''}>
+          <span>剪贴板</span>
         </label>
         ${actionButton}
       </div>
@@ -874,6 +933,10 @@ function buildTopologyViewModel() {
 }
 
 function getMessageDuplicateKey(codeInfo) {
+  const originMessageId = codeInfo.originMessageId || codeInfo.relayMessageId || codeInfo.msgId
+  if (originMessageId) {
+    return `${codeInfo.originDeviceId || codeInfo.sourceDeviceId || codeInfo.phoneId || ''}|${originMessageId}`
+  }
   const contentType = codeInfo.contentType || codeInfo.type || 'sms'
   if (contentType === 'sms') return codeInfo.code || getRawMessage(codeInfo)
   return [
@@ -1128,7 +1191,8 @@ function normalizeTopologyContentPolicy(policy = {}) {
     allowSmsCodes: policy.allowSmsCodes !== false,
     allowSmsMessages: policy.allowSmsMessages !== false,
     allowNotifications: policy.allowNotifications !== false,
-    allowTotp: policy.allowTotp !== false
+    allowTotp: policy.allowTotp !== false,
+    allowClipboard: policy.allowClipboard === true
   }
 }
 
@@ -1139,6 +1203,7 @@ function formatTopologyContentPolicy(policy = {}) {
   if (normalized.allowSmsMessages) items.push('短信')
   if (normalized.allowNotifications) items.push('通知')
   if (normalized.allowTotp) items.push('TOTP')
+  if (normalized.allowClipboard) items.push('剪贴板')
   return items.length ? items.join('、') : '不推送'
 }
 

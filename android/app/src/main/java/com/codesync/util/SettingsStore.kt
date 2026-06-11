@@ -14,6 +14,10 @@ object SettingsStore {
     private const val KEY_RECEIVE_SMS_CODES = "receive_sms_codes_enabled"
     private const val KEY_RECEIVE_ALL_SMS = "receive_all_sms_enabled"
     private const val KEY_RECEIVE_NOTIFICATIONS = "receive_notifications_enabled"
+    // 剪贴板同步：单一开关同时控制收与发，默认关闭（剪贴板常含密码等敏感内容）。
+    // 受 Android 10+ 后台读剪贴板限制，发送侧只能由用户在前台主动触发；
+    // 接收侧（把其它节点同步来的剪贴板写入本机）不受限，可自动完成。
+    private const val KEY_SYNC_CLIPBOARD = "sync_clipboard_enabled"
 
     fun isForwardingEnabled(context: Context): Boolean =
         prefs(context).getBoolean(KEY_FORWARD_SMS, true)
@@ -57,11 +61,19 @@ object SettingsStore {
         prefs(context).edit().putBoolean(KEY_RECEIVE_NOTIFICATIONS, enabled).apply()
     }
 
+    fun isSyncClipboardEnabled(context: Context): Boolean =
+        prefs(context).getBoolean(KEY_SYNC_CLIPBOARD, false)
+
+    fun setSyncClipboardEnabled(context: Context, enabled: Boolean) {
+        prefs(context).edit().putBoolean(KEY_SYNC_CLIPBOARD, enabled).apply()
+    }
+
     fun shouldReceiveContent(context: Context, type: String): Boolean {
         return when (type) {
             "sms" -> isReceiveSmsCodesEnabled(context)
             "sms_message" -> isReceiveAllSmsEnabled(context)
             "app_notification" -> isReceiveNotificationsEnabled(context)
+            "clipboard" -> isSyncClipboardEnabled(context)
             else -> true
         }
     }

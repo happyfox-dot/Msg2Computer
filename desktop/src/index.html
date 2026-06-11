@@ -198,10 +198,28 @@
         </div>
 
         <div class="settings-group">
+          <h3 class="settings-group-title">剪贴板同步</h3>
+          <label class="settings-item settings-checkbox">
+            <span class="settings-label">同步剪贴板</span>
+            <input type="checkbox" id="chk-sync-clipboard">
+          </label>
+          <div class="settings-item">
+            <span class="settings-label settings-hint">开启后本机复制的内容会自动同步到已连接的节点，并接收其它节点同步过来的剪贴板。剪贴板可能含密码等敏感信息，请按需启用。</span>
+          </div>
+        </div>
+
+        <div class="settings-group">
           <h3 class="settings-group-title">关于</h3>
           <div class="settings-item">
             <span class="settings-label">版本号</span>
-            <span class="settings-value">v1.0.24</span>
+            <span id="app-version" class="settings-value">v1.0.27</span>
+          </div>
+          <div class="settings-item">
+            <span class="settings-label">软件更新</span>
+            <div class="update-control">
+              <button id="btn-check-update" class="btn-action" type="button">检查更新</button>
+              <span id="update-status-text" class="settings-hint"></span>
+            </div>
           </div>
           <div class="settings-item">
             <span class="settings-label">项目地址</span>

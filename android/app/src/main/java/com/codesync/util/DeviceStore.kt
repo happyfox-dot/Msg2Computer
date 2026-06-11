@@ -24,6 +24,7 @@ data class DesktopDevice(
     val allowSmsMessages: Boolean = true,
     val allowNotifications: Boolean = true,
     val allowTotp: Boolean = true,
+    val allowClipboard: Boolean = false,
     // 备用地址（如对端的 Tailscale 100.x IP）：主地址连不上时按序轮试，
     // 让设备跨网段（不在同一局域网）时仍可通过 Tailscale 虚拟网连接
     val altHosts: List<String> = emptyList()
@@ -65,6 +66,7 @@ object DeviceStore {
                         allowSmsMessages = item.optBoolean("allowSmsMessages", true),
                         allowNotifications = item.optBoolean("allowNotifications", true),
                         allowTotp = item.optBoolean("allowTotp", true),
+                        allowClipboard = item.optBoolean("allowClipboard", false),
                         altHosts = jsonArrayToList(item.optJSONArray("altHosts"))
                     )
                 )
@@ -96,7 +98,11 @@ object DeviceStore {
         routePath: List<String> = emptyList(),
         routeUpdatedAt: Long = 0L,
         altHosts: List<String> = emptyList(),
-        enabled: Boolean = true
+        // 「启用」开关归本机用户所有：null（默认）表示本次调用不改写已存值，
+        // 仅新建条目时取 true。拓扑同步（topology_sync/gossip）必须用默认值，
+        // 否则用户在本机禁用的推送目标会被任何一次同步悄悄重新启用；
+        // 只有用户显式配对（扫码/局域网配对）才传 true 表达重新启用意图。
+        enabled: Boolean? = null
     ): DesktopDevice {
         val devices = getDevices(context).toMutableList()
         val now = System.currentTimeMillis()
@@ -119,7 +125,7 @@ object DeviceStore {
                 host = host,
                 port = port,
                 pairingKey = pairingKey,
-                enabled = enabled,
+                enabled = enabled ?: existing.enabled,
                 lastSyncAt = existing.lastSyncAt,
                 updatedAt = now,
                 routeMetric = if (incomingRouteFresh) routeMetric else existing.routeMetric,
@@ -131,6 +137,7 @@ object DeviceStore {
                 allowSmsMessages = existing.allowSmsMessages,
                 allowNotifications = existing.allowNotifications,
                 allowTotp = existing.allowTotp,
+                allowClipboard = existing.allowClipboard,
                 // 备用地址不参与新鲜度比较：本次没带就保留旧值（主地址变化时剔除重复）
                 altHosts = altHosts.ifEmpty { existing.altHosts }.filter { it.isNotBlank() && it != host }.distinct()
             )
@@ -142,7 +149,7 @@ object DeviceStore {
                 host = host,
                 port = port,
                 pairingKey = pairingKey,
-                enabled = enabled,
+                enabled = enabled ?: true,
                 lastSyncAt = 0L,
                 updatedAt = now,
                 routeMetric = routeMetric,
@@ -154,6 +161,7 @@ object DeviceStore {
                 allowSmsMessages = true,
                 allowNotifications = true,
                 allowTotp = true,
+                allowClipboard = false,
                 altHosts = altHosts.filter { it.isNotBlank() && it != host }.distinct()
             )
         }
@@ -180,7 +188,8 @@ object DeviceStore {
         allowSmsCodes: Boolean,
         allowSmsMessages: Boolean,
         allowNotifications: Boolean,
-        allowTotp: Boolean
+        allowTotp: Boolean,
+        allowClipboard: Boolean
     ) {
         val devices = getDevices(context).map {
             if (it.id == id) {
@@ -189,6 +198,7 @@ object DeviceStore {
                     allowSmsMessages = allowSmsMessages,
                     allowNotifications = allowNotifications,
                     allowTotp = allowTotp,
+                    allowClipboard = allowClipboard,
                     updatedAt = System.currentTimeMillis()
                 )
             } else {
@@ -200,7 +210,7 @@ object DeviceStore {
 
     fun markDeviceSynced(context: Context, id: String, timestamp: Long = System.currentTimeMillis()) {
         val devices = getDevices(context).map {
-            if (it.id == id) it.copy(lastSyncAt = timestamp, updatedAt = System.currentTimeMillis()) else it
+            if (it.id == id) it.copy(lastSyncAt = timestamp) else it
         }
         saveDevices(context, devices)
     }
@@ -232,6 +242,7 @@ object DeviceStore {
                     .put("allowSmsMessages", device.allowSmsMessages)
                     .put("allowNotifications", device.allowNotifications)
                     .put("allowTotp", device.allowTotp)
+                    .put("allowClipboard", device.allowClipboard)
                     .put("altHosts", JSONArray(device.altHosts))
             )
         }

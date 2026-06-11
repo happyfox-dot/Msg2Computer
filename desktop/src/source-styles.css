@@ -46,31 +46,31 @@
 .totp-source-badge {
   display: inline-flex;
   align-items: center;
-  flex-wrap: wrap;
-  gap: 4px;
+  flex-wrap: nowrap;
+  gap: 3px;
   min-width: 0;
   max-width: 100%;
-  padding: 3px 7px;
-  border-radius: 8px;
+  padding: 2px 6px;
+  border-radius: 7px;
   background: rgba(100, 120, 255, 0.12);
   color: #a8b8ff;
   font-size: 10px;
-  line-height: 14px;
+  line-height: 13px;
 }
 
 .totp-source-name {
   min-width: 0;
-  overflow: visible;
-  white-space: normal;
-  word-break: break-word;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .totp-actions-inline {
   grid-area: actions;
   display: flex;
   align-items: center;
-  justify-content: flex-start;
-  gap: 8px;
+  justify-content: flex-end;
+  gap: 6px;
   min-width: 0;
   flex-wrap: wrap;
 }
@@ -86,22 +86,22 @@
   flex-shrink: 0;
   background: rgba(255, 255, 255, 0.08);
   color: #888;
-  padding: 2px 6px;
-  border-radius: 6px;
-  font-size: 10px;
-  margin-left: 4px;
+  padding: 1px 5px;
+  border-radius: 5px;
+  font-size: 9px;
+  margin-left: 2px;
 }
 
 /* TOTP 删除按钮（仅本机条目显示） */
 .totp-pin-btn,
 .totp-edit-btn,
 .totp-delete-btn {
-  width: 34px;
-  height: 34px;
+  width: 28px;
+  height: 28px;
   border: none;
-  border-radius: 6px;
+  border-radius: 5px;
   padding: 0;
-  font-size: 13px;
+  font-size: 12px;
   cursor: pointer;
   margin-left: 0;
   transition: background 0.2s;
@@ -145,7 +145,7 @@
   background: rgba(92, 219, 139, 0.2);
   color: #5cdb8b;
   padding: 1px 5px;
-  border-radius: 6px;
+  border-radius: 5px;
   font-size: 9px;
   margin-left: 2px;
 }

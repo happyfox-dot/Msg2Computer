@@ -1,6 +1,6 @@
 {
   "name": "code-sync-desktop",
-  "version": "1.0.26",
+  "version": "1.0.27",
   "description": "跨设备验证码同步工具 - 桌面端",
   "main": "main.js",
   "scripts": {
@@ -12,6 +12,13 @@
   "build": {
     "appId": "com.codesync.desktop",
     "productName": "验证码同步",
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "happyfox-dot",
+        "repo": "Msg2Computer"
+      }
+    ],
     "electronLanguages": [
       "zh-CN",
       "en-US"
@@ -19,6 +26,7 @@
     "win": {
       "target": "nsis",
       "icon": "assets/icon.ico",
+      "artifactName": "Msg2Computer-Setup-${version}.${ext}",
       "signAndEditExecutable": false
     },
     "mac": {
@@ -32,6 +40,7 @@
   },
   "dependencies": {
     "canvas": "^3.2.3",
+    "electron-updater": "^6.8.9",
     "jsqr": "^1.4.0",
     "qrcode": "^1.5.3",
     "qrcode-decoder": "^0.3.4",

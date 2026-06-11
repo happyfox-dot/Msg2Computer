@@ -4,15 +4,24 @@ const fs = require('fs')
 const crypto = require('crypto')
 const os = require('os')
 const dgram = require('dgram')
-const http = require('http')
+const { execFile } = require('child_process')
 const { WebSocketServer, WebSocket } = require('ws')
 const QRCode = require('qrcode')
 const storage = require('./src/storage')
 const qrCodeParser = require('./src/qrCodeParser')
+const messageRouter = require('./src/main/message-router')
+const topologyManager = require('./src/main/topology-manager')
+const totpStore = require('./src/main/totp-store')
+const relayClient = require('./src/main/relay-client')
+const { registerDesktopIpc } = require('./src/main/desktop-ipc')
+const updater = require('./src/main/updater')
 
 let mainWindow = null
 let bubbleWindow = null
 let bubbleTimer = null
+// 气泡堆叠队列：短时间内到达的多条消息共用一个气泡窗口，新消息插到顶部，
+// 超过 BUBBLE_MAX_ITEMS 时丢弃最旧一条。每次有新消息都重置统一的隐藏计时器。
+let bubbleQueue = []
 let tray = null
 let wss = null
 let wsHeartbeatTimer = null
@@ -23,6 +32,7 @@ let activePhoneConnections = new Map()
 let pairedDesktopPeers = new Map()
 let activeDesktopPeerConnections = new Map()
 let desktopPeerHostAttempts = new Map()
+let desktopPeerReconnectTimer = null
 let discoverySocket = null
 let discoveredLanDevices = new Map()
 let topologyLsdb = {
@@ -30,6 +40,7 @@ let topologyLsdb = {
   links: new Map(),
   seenSeq: new Map()
 }
+let topologyBroadcastSuppressionDepth = 0
 // 每条活跃连接对应的会话密钥（ws -> sessionKey base64），用于反向加密下发 TOTP 种子同步
 let phoneSessionKeys = new WeakMap()
 let totpSeeds = new Map()
@@ -37,7 +48,10 @@ let totpDeleteTombstones = []
 let desktopMessageSettings = {
   receiveSmsCodes: true,
   receiveAllSms: true,
-  receiveNotifications: true
+  receiveNotifications: true,
+  // 剪贴板同步：默认关闭（剪贴板常含密码等敏感内容，需用户显式开启）。
+  // 开启后桌面自动把本机剪贴板变化推送给已配对节点，并接受其它节点同步过来的剪贴板。
+  syncClipboard: false
 }
 
 const WS_PORT = 19527
@@ -47,12 +61,15 @@ const CODE_TYPES = {
   SMS: 'sms',
   SMS_MESSAGE: 'sms_message',
   APP_NOTIFICATION: 'app_notification',
+  CLIPBOARD: 'clipboard',
   TOTP: 'totp'
 }
 const DEFAULT_MESSAGE_SETTINGS = {
   receiveSmsCodes: true,
   receiveAllSms: true,
-  receiveNotifications: true
+  receiveNotifications: true,
+  // 剪贴板同步默认关闭：剪贴板常含密码等敏感内容，需用户显式启用
+  syncClipboard: false
 }
 const PAIRING_CONFIG_FILE = 'pairing.json'
 const gotSingleInstanceLock = app.requestSingleInstanceLock()
@@ -65,10 +82,17 @@ const TOTP_DELETE_TOMBSTONE_LIMIT = 300
 const ROUTING_PROTOCOL_VERSION = 2
 const ROUTE_STALE_MS = 10 * 60 * 1000
 const TOPOLOGY_DELTA_TTL = 4
+// 用户消息（短信/通知/剪贴板/TOTP 种子）的多跳续传 TTL，与安卓端 SMS_RELAY_TTL 一致。
+// 源设备直投所有目标的同时，收到消息的节点会把它续传给目标列表里
+// 自己可达而尚未在中继路径中的节点（去重由 originMessageId 保证）。
+const USER_MESSAGE_RELAY_TTL = 4
 const TOPOLOGY_ENTRY_TTL_MS = 24 * 60 * 60 * 1000
 // BFD 式存活检测周期：一个周期未回 pong 即判定链路死亡并 terminate，
 // 触发 close → 拓扑重收敛，不再依赖 TCP 自身超时（静默断链可能挂数分钟）
 const WS_HEARTBEAT_INTERVAL_MS = 30 * 1000
+// 桌面对端断线后的自动重连扫描周期：出站 WS 连接 close 后不会自行恢复，
+// 周期性补连已配对且未连接的对端（失败时按 desktopPeerHostAttempts 轮换候选地址）
+const DESKTOP_PEER_RECONNECT_INTERVAL_MS = 45 * 1000
 // LSDB 序列号（OSPF LSA seq 的简化版）：每次下发路由表自增，手机端按
 // 来源设备记录已接受的最大序列号，旧序列号的 topology_sync 直接丢弃。
 // 用 Date.now() 做初值保证进程重启后序列号仍然单调递增，无需落盘。
@@ -153,6 +177,7 @@ function hideCodeBubble() {
     bubbleWindow.close()
   }
   bubbleWindow = null
+  bubbleQueue = []
 }
 
 function escapeHtml(value) {
@@ -165,15 +190,88 @@ function escapeHtml(value) {
   }[char]))
 }
 
-function buildCodeBubbleHtml(codeInfo) {
-  const code = escapeHtml(codeInfo.code)
-  const source = escapeHtml(codeInfo.source || '未知来源')
-  const phoneName = escapeHtml(codeInfo.sourceDeviceName || codeInfo.phoneName || '未知设备')
-  const time = escapeHtml(new Date(codeInfo.timestamp || Date.now()).toLocaleTimeString('zh-CN', {
+// 气泡视觉规格：窗口宽度、单条/多条高度上限、最多堆叠条数、停留时长。
+const BUBBLE_WIDTH = 360
+const BUBBLE_MARGIN = 18
+const BUBBLE_MAX_ITEMS = 5
+const BUBBLE_HIDE_DELAY_MS = 8000
+// 单条行的估算高度（含内边距与分隔）；窗口总高 = 表头 + 行数×行高，封顶后内部滚动。
+const BUBBLE_ITEM_HEIGHT = 88
+const BUBBLE_HEADER_HEIGHT = 16
+const BUBBLE_MAX_HEIGHT = 470
+
+// 每种消息类型的强调色与角标文案/图标，决定气泡左侧色条与标记块的样式。
+function bubbleTheme(type) {
+  switch (type) {
+    case 'sms_message':
+      return { accent: '#4aa3ff', mark: '短信', tag: '新短信' }
+    case 'app_notification':
+      return { accent: '#ffb454', mark: '通知', tag: '新通知' }
+    case 'clipboard':
+      return { accent: '#b48cff', mark: '剪贴', tag: '剪贴板同步' }
+    case 'sms':
+    default:
+      return { accent: '#5cdb8b', mark: 'OTP', tag: '新验证码' }
+  }
+}
+
+// 把一条消息归一化为气泡渲染所需的字段（标题行、主体、来源、是否已复制等）。
+function toBubbleItem(codeInfo) {
+  const type = codeInfo.contentType || codeInfo.type || 'sms'
+  const theme = bubbleTheme(type)
+  const time = new Date(codeInfo.timestamp || Date.now()).toLocaleTimeString('zh-CN', {
     hour: '2-digit',
     minute: '2-digit'
-  }))
+  })
+  const deviceName = codeInfo.sourceDeviceName || codeInfo.phoneName || '未知设备'
 
+  let primary = ''
+  let secondary = ''
+  let copied = false
+  let big = false
+  if (type === 'sms') {
+    primary = codeInfo.code || codeInfo.rawMessage || ''
+    secondary = `来源 ${codeInfo.source || '未知'} · ${deviceName}`
+    copied = !!codeInfo.code
+    big = true
+  } else if (type === 'sms_message') {
+    primary = codeInfo.rawMessage || codeInfo.source || ''
+    secondary = `来源 ${codeInfo.source || '短信'} · ${deviceName}`
+  } else if (type === 'app_notification') {
+    const appName = codeInfo.appName || codeInfo.source || '通知'
+    const title = codeInfo.title ? `${codeInfo.title} · ` : ''
+    primary = `${title}${codeInfo.rawMessage || ''}`.trim() || appName
+    secondary = `${appName} · ${deviceName}`
+  } else if (type === 'clipboard') {
+    primary = codeInfo.rawMessage || codeInfo.code || ''
+    secondary = `剪贴板 · ${deviceName}`
+    copied = true
+  } else {
+    primary = codeInfo.rawMessage || codeInfo.code || ''
+    secondary = deviceName
+  }
+
+  return { type, theme, time, primary, secondary, copied, big }
+}
+
+function buildBubbleRowHtml(item) {
+  const tag = escapeHtml(item.theme.tag)
+  const copied = item.copied ? '<span class="copied">已复制</span>' : ''
+  const primaryClass = item.big ? 'primary big' : 'primary'
+  return `
+    <div class="row" style="--accent: ${item.theme.accent}">
+      <div class="accent"></div>
+      <div class="mark">${escapeHtml(item.theme.mark)}</div>
+      <div class="content">
+        <div class="title"><span class="tag">${tag}</span><span class="time">${escapeHtml(item.time)}</span>${copied}</div>
+        <div class="${primaryClass}">${escapeHtml(item.primary)}</div>
+        <div class="secondary">${escapeHtml(item.secondary)}</div>
+      </div>
+    </div>`
+}
+
+function buildBubbleStackHtml(items) {
+  const rows = items.map(buildBubbleRowHtml).join('')
   return `<!doctype html>
 <html>
 <head>
@@ -187,161 +285,179 @@ function buildCodeBubbleHtml(codeInfo) {
       background: transparent;
       font-family: "Microsoft YaHei UI", "Segoe UI", sans-serif;
     }
-    .bubble {
+    .stack {
       box-sizing: border-box;
       height: calc(100% - 12px);
       margin: 6px;
-      padding: 14px 16px 14px 18px;
+      padding: 6px;
       color: #f7f9fc;
       background: rgba(20, 22, 30, 0.98);
       border: 1px solid rgba(255, 255, 255, 0.14);
-      border-radius: 8px;
+      border-radius: 10px;
       box-shadow: 0 16px 42px rgba(0, 0, 0, 0.34);
-      display: grid;
-      grid-template-columns: 4px 42px minmax(0, 1fr);
-      align-items: center;
-      gap: 12px;
-      animation: enter 180ms ease-out;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
     }
+    .row {
+      box-sizing: border-box;
+      padding: 9px 12px 9px 12px;
+      border-radius: 7px;
+      background: rgba(255, 255, 255, 0.04);
+      display: grid;
+      grid-template-columns: 4px 38px minmax(0, 1fr);
+      align-items: center;
+      gap: 10px;
+      animation: enter 160ms ease-out;
+    }
+    .row + .row { margin-top: 0; }
     .accent {
       width: 4px;
-      height: 92px;
+      height: 54px;
       border-radius: 999px;
-      background: #5cdb8b;
-      box-shadow: 0 0 18px rgba(92, 219, 139, 0.34);
+      background: var(--accent);
+      box-shadow: 0 0 16px color-mix(in srgb, var(--accent) 40%, transparent);
     }
     .mark {
-      width: 42px;
-      height: 42px;
-      flex: 0 0 auto;
+      width: 38px;
+      height: 38px;
       border-radius: 8px;
-      background: rgba(92, 219, 139, 0.14);
-      border: 1px solid rgba(92, 219, 139, 0.22);
+      background: color-mix(in srgb, var(--accent) 16%, transparent);
+      border: 1px solid color-mix(in srgb, var(--accent) 26%, transparent);
       display: flex;
       align-items: center;
       justify-content: center;
-      color: #5cdb8b;
-      font-size: 18px;
+      color: var(--accent);
+      font-size: 13px;
       font-weight: 700;
     }
-    .content {
-      min-width: 0;
-      flex: 1;
-    }
+    .content { min-width: 0; }
     .title {
       display: flex;
-      justify-content: space-between;
-      gap: 10px;
-      font-size: 12px;
-      line-height: 18px;
+      align-items: center;
+      gap: 8px;
+      font-size: 11px;
+      line-height: 16px;
       color: rgba(247, 249, 252, 0.72);
-      white-space: nowrap;
+    }
+    .tag { color: var(--accent); font-weight: 600; }
+    .time { margin-left: auto; color: rgba(247, 249, 252, 0.5); }
+    .copied {
+      padding: 1px 6px;
+      border-radius: 999px;
+      color: var(--accent);
+      background: color-mix(in srgb, var(--accent) 14%, transparent);
+      font-size: 10px;
+    }
+    .primary {
+      margin-top: 3px;
+      font-size: 14px;
+      line-height: 19px;
+      color: #f7f9fc;
       overflow: hidden;
       text-overflow: ellipsis;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      word-break: break-all;
     }
-    .copied {
-      flex: 0 0 auto;
-      padding: 1px 7px;
-      border-radius: 999px;
-      color: #5cdb8b;
-      background: rgba(92, 219, 139, 0.12);
-      font-size: 11px;
-    }
-    .code {
-      margin-top: 4px;
-      font-size: 34px;
-      line-height: 38px;
+    .primary.big {
+      font-size: 28px;
+      line-height: 32px;
       font-weight: 700;
       letter-spacing: 2px;
-      color: #5cdb8b;
-      word-break: break-all;
+      color: var(--accent);
+      -webkit-line-clamp: 1;
       font-family: "Cascadia Code", "Consolas", monospace;
     }
-    .meta {
-      margin-top: 7px;
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-      gap: 6px;
+    .secondary {
+      margin-top: 4px;
       font-size: 11px;
       line-height: 15px;
-      color: rgba(247, 249, 252, 0.62);
-    }
-    .chip {
-      min-width: 0;
-      padding: 4px 7px;
-      border-radius: 6px;
-      background: rgba(255, 255, 255, 0.06);
+      color: rgba(247, 249, 252, 0.58);
+      white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
-      white-space: nowrap;
     }
     @keyframes enter {
-      from { opacity: 0; transform: translateY(10px); }
+      from { opacity: 0; transform: translateY(8px); }
       to { opacity: 1; transform: translateY(0); }
     }
   </style>
 </head>
 <body>
-  <div class="bubble">
-    <div class="accent"></div>
-    <div class="mark">OTP</div>
-    <div class="content">
-      <div class="title"><span>新验证码</span><span class="copied">已复制</span></div>
-      <div class="code">${code}</div>
-      <div class="meta">
-        <div class="chip">来源 ${source}</div>
-        <div class="chip">设备 ${phoneName} · ${time}</div>
-      </div>
-    </div>
-  </div>
+  <div class="stack">${rows}</div>
 </body>
 </html>`
 }
 
-function showCodeBubble(codeInfo) {
+function bubbleHeightForCount(count) {
+  const height = BUBBLE_HEADER_HEIGHT + count * BUBBLE_ITEM_HEIGHT
+  return Math.min(BUBBLE_MAX_HEIGHT, height)
+}
+
+// 把一条消息压入气泡队列并刷新窗口：窗口不存在则创建，存在则重建内容并按条数调高。
+function pushBubble(codeInfo) {
   if (!app.isReady()) return
 
-  hideCodeBubble()
+  bubbleQueue.unshift(toBubbleItem(codeInfo))
+  if (bubbleQueue.length > BUBBLE_MAX_ITEMS) {
+    bubbleQueue = bubbleQueue.slice(0, BUBBLE_MAX_ITEMS)
+  }
 
-  const bubbleWidth = 360
-  const bubbleHeight = 154
-  const margin = 18
+  const height = bubbleHeightForCount(bubbleQueue.length)
   const workArea = screen.getPrimaryDisplay().workArea
+  const x = workArea.x + workArea.width - BUBBLE_WIDTH - BUBBLE_MARGIN
+  const y = workArea.y + workArea.height - height - BUBBLE_MARGIN
+  const html = `data:text/html;charset=utf-8,${encodeURIComponent(buildBubbleStackHtml(bubbleQueue))}`
 
-  bubbleWindow = new BrowserWindow({
-    width: bubbleWidth,
-    height: bubbleHeight,
-    x: workArea.x + workArea.width - bubbleWidth - margin,
-    y: workArea.y + workArea.height - bubbleHeight - margin,
-    frame: false,
-    transparent: true,
-    alwaysOnTop: true,
-    skipTaskbar: true,
-    resizable: false,
-    movable: false,
-    focusable: false,
-    show: false,
-    hasShadow: false,
-    icon: ICON_PATH,
-    webPreferences: {
-      nodeIntegration: false,
-      contextIsolation: true,
-      sandbox: true
-    }
-  })
+  if (!bubbleWindow || bubbleWindow.isDestroyed()) {
+    bubbleWindow = new BrowserWindow({
+      width: BUBBLE_WIDTH,
+      height,
+      x,
+      y,
+      frame: false,
+      transparent: true,
+      alwaysOnTop: true,
+      skipTaskbar: true,
+      resizable: false,
+      movable: false,
+      focusable: false,
+      show: false,
+      hasShadow: false,
+      icon: ICON_PATH,
+      webPreferences: {
+        nodeIntegration: false,
+        contextIsolation: true,
+        sandbox: true
+      }
+    })
 
-  bubbleWindow.setAlwaysOnTop(true, 'screen-saver')
-  bubbleWindow.setIgnoreMouseEvents(true, { forward: true })
-  bubbleWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(buildCodeBubbleHtml(codeInfo))}`)
-  bubbleWindow.once('ready-to-show', () => {
-    if (!bubbleWindow || bubbleWindow.isDestroyed()) return
-    bubbleWindow.showInactive()
-  })
-  bubbleWindow.on('closed', () => {
-    bubbleWindow = null
-  })
+    bubbleWindow.setAlwaysOnTop(true, 'screen-saver')
+    bubbleWindow.setIgnoreMouseEvents(true, { forward: true })
+    bubbleWindow.loadURL(html)
+    bubbleWindow.once('ready-to-show', () => {
+      if (!bubbleWindow || bubbleWindow.isDestroyed()) return
+      bubbleWindow.showInactive()
+    })
+    bubbleWindow.on('closed', () => {
+      bubbleWindow = null
+    })
+  } else {
+    // 已有窗口：重设位置/高度（随条数增长向上扩展）并重载堆叠内容
+    bubbleWindow.setBounds({ x, y, width: BUBBLE_WIDTH, height })
+    bubbleWindow.loadURL(html)
+  }
 
-  bubbleTimer = setTimeout(hideCodeBubble, 8000)
+  if (bubbleTimer) clearTimeout(bubbleTimer)
+  bubbleTimer = setTimeout(hideCodeBubble, BUBBLE_HIDE_DELAY_MS)
+}
+
+// 兼容旧调用名：验证码等单条消息仍可调用 showCodeBubble，内部走统一的堆叠队列。
+function showCodeBubble(codeInfo) {
+  pushBubble(codeInfo)
 }
 
 function createWindow(options = {}) {
@@ -427,12 +543,33 @@ const RECENT_DELIVERY_LIMIT = 300
 const recentDeliveryKeys = new Set()
 const recentDeliveryQueue = []
 
-function hasRecentDelivery(phoneId, msgId) {
-  return recentDeliveryKeys.has(`${phoneId}|${msgId}`)
+function deliveryDedupKey(phoneId, msgId, payload = null) {
+  const sourceId = String(
+    payload?.originDeviceId ||
+    payload?.sourceDeviceId ||
+    payload?.phoneId ||
+    phoneId ||
+    ''
+  ).trim()
+  const messageId = String(
+    payload?.originMessageId ||
+    payload?.relayMessageId ||
+    payload?.msgId ||
+    msgId ||
+    ''
+  ).trim()
+  if (!sourceId || !messageId) return ''
+  return `${sourceId}|${messageId}`
 }
 
-function rememberDelivery(phoneId, msgId) {
-  const key = `${phoneId}|${msgId}`
+function hasRecentDelivery(phoneId, msgId, payload = null) {
+  const key = deliveryDedupKey(phoneId, msgId, payload)
+  return key ? recentDeliveryKeys.has(key) : false
+}
+
+function rememberDelivery(phoneId, msgId, payload = null) {
+  const key = deliveryDedupKey(phoneId, msgId, payload)
+  if (!key) return
   if (recentDeliveryKeys.has(key)) return
   recentDeliveryKeys.add(key)
   recentDeliveryQueue.push(key)
@@ -485,6 +622,39 @@ function isValidAuthToken(phoneId, phoneNonce, authToken) {
     console.error('Failed to verify auth token:', e)
     return false
   }
+}
+
+// 防重放：手机每次连接在 onOpen 生成全新的随机 phoneNonce 并参与 authToken 计算。
+// 明文 ws:// 上抓到的一帧 auth 可被原样重放，从而把该手机的 lastIP 改写成攻击者 IP，
+// 使后续 relay 投递重定向。这里按手机记录近期已用过的 nonce，重复出现即拒绝。
+// 纯服务端逻辑，不改协议，旧版手机端无需升级即可兼容。
+const AUTH_NONCE_TTL_MS = 5 * 60 * 1000
+const AUTH_NONCE_LIMIT_PER_PHONE = 200
+const recentAuthNonces = new Map() // phoneId -> Map<nonce, firstSeenAt>
+
+// 返回 true 表示该 (phoneId, phoneNonce) 在窗口期内已出现过（即重放），应拒绝。
+// 校验通过的新 nonce 会被记录下来；调用方应仅在 authToken 校验成功后调用，
+// 避免攻击者用无效帧刷爆记录表。
+function isReplayedAuthNonce(phoneId, phoneNonce) {
+  if (!phoneId || !phoneNonce) return true
+  const now = Date.now()
+  let seen = recentAuthNonces.get(phoneId)
+  if (!seen) {
+    seen = new Map()
+    recentAuthNonces.set(phoneId, seen)
+  }
+  // 过期清理：滚出 TTL 的 nonce 删除，避免无限增长
+  for (const [nonce, firstSeen] of seen) {
+    if (now - firstSeen > AUTH_NONCE_TTL_MS) seen.delete(nonce)
+  }
+  if (seen.has(phoneNonce)) return true
+  seen.set(phoneNonce, now)
+  // 容量上限（LRU 语义，超限淘汰最旧）：限制单台手机的内存占用
+  while (seen.size > AUTH_NONCE_LIMIT_PER_PHONE) {
+    const oldest = seen.keys().next().value
+    seen.delete(oldest)
+  }
+  return false
 }
 
 function normalizeNetworkHost(value) {
@@ -571,7 +741,7 @@ function upsertTopologyLsdbNode(rawNode) {
   const node = normalizeLsdbNode(rawNode)
   if (!node) return false
   const existing = topologyLsdb.nodes.get(node.id)
-  if (existing && normalizeLsdbSeq(existing.seq, 0) > node.seq) return false
+  if (existing && normalizeLsdbSeq(existing.seq, 0) >= node.seq) return false
   const merged = existing ? { ...existing, ...node, pairingKey: node.pairingKey || existing.pairingKey } : node
   topologyLsdb.nodes.set(node.id, merged)
   return JSON.stringify(existing || {}) !== JSON.stringify(merged)
@@ -581,7 +751,7 @@ function upsertTopologyLsdbLink(rawLink) {
   const link = normalizeLsdbLink(rawLink)
   if (!link) return false
   const existing = topologyLsdb.links.get(link.id)
-  if (existing && normalizeLsdbSeq(existing.seq, 0) > link.seq) return false
+  if (existing && normalizeLsdbSeq(existing.seq, 0) >= link.seq) return false
   const merged = existing ? { ...existing, ...link } : link
   topologyLsdb.links.set(link.id, merged)
   return JSON.stringify(existing || {}) !== JSON.stringify(merged)
@@ -640,40 +810,19 @@ function getPairingConfigPath() {
 }
 
 function normalizeMessageSettings(settings = {}) {
-  return {
-    receiveSmsCodes: settings.receiveSmsCodes !== false,
-    receiveAllSms: settings.receiveAllSms !== false,
-    receiveNotifications: settings.receiveNotifications !== false
-  }
+  return messageRouter.normalizeMessageSettings(settings)
 }
 
 function normalizePushContentPolicy(policy = {}) {
-  return {
-    allowSmsCodes: policy.allowSmsCodes !== false,
-    allowSmsMessages: policy.allowSmsMessages !== false,
-    allowNotifications: policy.allowNotifications !== false,
-    allowTotp: policy.allowTotp !== false
-  }
+  return messageRouter.normalizePushContentPolicy(policy)
 }
 
 function canPushContentToNode(target, type) {
-  if (!target) return false
-  const policy = normalizePushContentPolicy(target.contentPolicy || target)
-  if (type === CODE_TYPES.SMS) return policy.allowSmsCodes
-  if (type === CODE_TYPES.SMS_MESSAGE) return policy.allowSmsMessages
-  if (type === CODE_TYPES.APP_NOTIFICATION) return policy.allowNotifications
-  if (type === 'totp' || type === 'totp_sync' || type === 'totp_seed' || type === 'totp_revoke') {
-    return policy.allowTotp
-  }
-  return true
+  return messageRouter.canPushContentToNode(target, type, CODE_TYPES)
 }
 
 function canReceiveContentType(type) {
-  const contentType = type || CODE_TYPES.SMS
-  if (contentType === CODE_TYPES.SMS) return desktopMessageSettings.receiveSmsCodes !== false
-  if (contentType === CODE_TYPES.SMS_MESSAGE) return desktopMessageSettings.receiveAllSms !== false
-  if (contentType === CODE_TYPES.APP_NOTIFICATION) return desktopMessageSettings.receiveNotifications !== false
-  return true
+  return messageRouter.canReceiveContentType(type, desktopMessageSettings, CODE_TYPES)
 }
 
 function loadOrCreatePairingKey() {
@@ -1176,6 +1325,77 @@ function broadcastDiscoveryProbe() {
   for (const address of getBroadcastAddresses()) {
     sendDiscoveryPacket(payload, address, DISCOVERY_PORT)
   }
+  // Tailscale 不转发 UDP 广播：纯 Tailscale 场景（两台设备从未同网段）下
+  // 广播探测完全到不了对端，这里另行枚举 tailnet 对端逐个单播（异步补发，
+  // 响应与广播响应走同一收包路径）
+  probeTailnetPeers()
+}
+
+// ==================== Tailnet 单播发现 ====================
+
+const TAILSCALE_STATUS_TIMEOUT_MS = 4000
+let tailnetProbeInFlight = false
+
+function execTailscaleStatus(binPath) {
+  return new Promise((resolve, reject) => {
+    execFile(binPath, ['status', '--json'], {
+      timeout: TAILSCALE_STATUS_TIMEOUT_MS,
+      maxBuffer: 4 * 1024 * 1024,
+      windowsHide: true
+    }, (error, stdout) => {
+      if (error) return reject(error)
+      resolve(stdout)
+    })
+  })
+}
+
+// 通过 tailscale CLI 枚举 tailnet 内在线对端的 IPv4（100.64.0.0/10）。
+// 未安装 / 未登录 / CLI 不在候选路径时静默返回空数组，发现功能退化为纯广播。
+async function listTailnetPeerIPv4s() {
+  const binCandidates = process.platform === 'win32'
+    ? ['tailscale', 'C:\\Program Files\\Tailscale\\tailscale.exe']
+    : ['tailscale', '/usr/local/bin/tailscale', '/Applications/Tailscale.app/Contents/MacOS/Tailscale']
+  for (const bin of binCandidates) {
+    let stdout
+    try {
+      stdout = await execTailscaleStatus(bin)
+    } catch (_) {
+      continue
+    }
+    try {
+      const status = JSON.parse(stdout)
+      return Object.values(status.Peer || {})
+        .filter(peer => peer && peer.Online === true)
+        .flatMap(peer => peer.TailscaleIPs || [])
+        .filter(isTailscaleAddress)
+    } catch (e) {
+      console.error('解析 tailscale status 输出失败:', e.message)
+      return []
+    }
+  }
+  return []
+}
+
+async function probeTailnetPeers() {
+  if (tailnetProbeInFlight || !discoverySocket) return
+  tailnetProbeInFlight = true
+  try {
+    const peerIPs = await listTailnetPeerIPv4s()
+    if (peerIPs.length === 0) return
+    const payload = buildDiscoveryPayload('codebridge_discovery_probe')
+    // 对端回包与后续连接都要走隧道，探测包里携带本机 Tailscale IP
+    // 而不是局域网 IP（后者对 tailnet 对端不可达）
+    const tsHost = getTailscaleIPv4()
+    if (tsHost) payload.host = tsHost
+    for (const ip of peerIPs) {
+      sendDiscoveryPacket(payload, ip, DISCOVERY_PORT)
+    }
+    console.log(`已向 ${peerIPs.length} 个 tailnet 在线节点单播发现探测`)
+  } catch (e) {
+    console.error('Tailnet 发现探测失败:', e.message)
+  } finally {
+    tailnetProbeInFlight = false
+  }
 }
 
 function startLanDiscoveryService() {
@@ -1198,7 +1418,10 @@ function startLanDiscoveryService() {
 
       if (payload.type === 'codebridge_discovery_probe') {
         const response = buildDiscoveryPayload('codebridge_discovery_response')
-        response.host = getLocalIP()
+        // 探测来自 tailnet 对端时，回报本机 Tailscale IP（局域网 IP 对其不可达）
+        response.host = isTailscaleAddress(rinfo.address)
+          ? (getTailscaleIPv4() || getLocalIP())
+          : getLocalIP()
         sendDiscoveryPacket(response, rinfo.address, rinfo.port)
       }
     } catch (e) {
@@ -1215,7 +1438,9 @@ function startLanDiscoveryService() {
   })
 }
 
-function scanLanDevices(timeoutMs = 2500) {
+// 扫描窗口：局域网广播响应通常 <1s；tailnet 单播多出一次 CLI 调用 + 隧道往返，
+// 窗口放宽到 3.5s。窗口结束后迟到的响应仍会进入发现列表并推送给界面。
+function scanLanDevices(timeoutMs = 3500) {
   startLanDiscoveryService()
   discoveredLanDevices.clear()
   broadcastDiscoveryProbe()
@@ -1468,37 +1693,43 @@ function applyTopologyDeltaPayload(rawPayload, options = {}) {
   let changed = false
   const nodes = Array.isArray(normalizedDelta.nodes) ? normalizedDelta.nodes : []
   const links = Array.isArray(normalizedDelta.links) ? normalizedDelta.links : []
-  for (const rawNode of nodes) {
-    const node = normalizeLsdbNode(rawNode)
-    if (!node || node.id === identity.id) continue
-    changed = upsertTopologyLsdbNode(node) || changed
-    if (node.routable && node.pairingKey && node.host) {
-      if (String(node.type || '').includes('PHONE')) {
-        upsertAuthorizedPhone({
-          phoneId: node.id,
-          phoneName: node.name,
-          clientIP: node.host,
-          deviceType: node.type,
-          pairingKey: node.pairingKey,
-          relayPort: node.port || 19529,
-          relayHost: node.host,
-          tsHost: node.tsHost
-        })
-      } else if (String(node.type || '').includes('DESKTOP')) {
-        upsertPairedDesktopPeer({
-          id: node.id,
-          name: node.name,
-          deviceType: node.type,
-          host: node.host,
-          port: node.port || WS_PORT,
-          pairingKey: node.pairingKey,
-          tsHost: node.tsHost
-        })
+  topologyBroadcastSuppressionDepth += 1
+  try {
+    for (const rawNode of nodes) {
+      const node = normalizeLsdbNode(rawNode)
+      if (!node || node.id === identity.id) continue
+      const nodeChanged = upsertTopologyLsdbNode(node)
+      changed = nodeChanged || changed
+      if (nodeChanged && node.routable && node.pairingKey && node.host) {
+        if (String(node.type || '').includes('PHONE')) {
+          upsertAuthorizedPhone({
+            phoneId: node.id,
+            phoneName: node.name,
+            clientIP: node.host,
+            deviceType: node.type,
+            pairingKey: node.pairingKey,
+            relayPort: node.port || 19529,
+            relayHost: node.host,
+            tsHost: node.tsHost
+          })
+        } else if (String(node.type || '').includes('DESKTOP')) {
+          upsertPairedDesktopPeer({
+            id: node.id,
+            name: node.name,
+            deviceType: node.type,
+            host: node.host,
+            port: node.port || WS_PORT,
+            pairingKey: node.pairingKey,
+            tsHost: node.tsHost
+          })
+        }
       }
     }
-  }
-  for (const rawLink of links) {
-    changed = upsertTopologyLsdbLink(rawLink) || changed
+    for (const rawLink of links) {
+      changed = upsertTopologyLsdbLink(rawLink) || changed
+    }
+  } finally {
+    topologyBroadcastSuppressionDepth = Math.max(0, topologyBroadcastSuppressionDepth - 1)
   }
 
   if (changed) {
@@ -1509,7 +1740,15 @@ function applyTopologyDeltaPayload(rawPayload, options = {}) {
     if (options.flood !== false && (normalizedDelta.ttl || 0) > 0) {
       const nextTtl = Math.max(0, Number(normalizedDelta.ttl || 0) - 1)
       broadcastTopologyToAllPeers('gossip', {
-        baseDelta: buildTopologyDelta('gossip', { ttl: nextTtl }),
+        baseDelta: {
+          ...normalizedDelta,
+          ttl: nextTtl,
+          relayTtl: nextTtl,
+          relayPath: Array.isArray(normalizedDelta.relayPath)
+            ? Array.from(new Set([...normalizedDelta.relayPath, identity.id]))
+            : Array.from(new Set([sourceId, identity.id].filter(Boolean)))
+        },
+        preserveSource: true,
         excludeNodeId: options.excludeNodeId || sourceId
       })
     }
@@ -1615,6 +1854,7 @@ let topologyBroadcastTimer = null
 // 拓扑连环变化，合并 250ms 内的触发为一次「全量计算 + 广播」。
 // 配合下面广播内快照复用，把一次风暴的开销从 变化数×手机数 次 SPF 降到 1 次。
 function scheduleTopologyBroadcast() {
+  if (topologyBroadcastSuppressionDepth > 0) return
   if (topologyBroadcastTimer) return
   topologyBroadcastTimer = setTimeout(() => {
     topologyBroadcastTimer = null
@@ -1648,29 +1888,9 @@ function sendEncryptedControlMessage(ws, sessionKey, messageType, payload) {
 }
 
 function postJsonToNode(host, port, body, timeoutMs = 3500) {
-  return new Promise(resolve => {
-    const data = Buffer.from(JSON.stringify(body), 'utf8')
-    const req = http.request({
-      hostname: normalizeNetworkHost(host),
-      port,
-      path: '/relay',
-      method: 'POST',
-      timeout: timeoutMs,
-      headers: {
-        'Content-Type': 'application/json; charset=utf-8',
-        'Content-Length': data.length
-      }
-    }, res => {
-      res.resume()
-      res.on('end', () => resolve(res.statusCode >= 200 && res.statusCode < 300))
-    })
-    req.on('timeout', () => {
-      req.destroy()
-      resolve(false)
-    })
-    req.on('error', () => resolve(false))
-    req.write(data)
-    req.end()
+  return relayClient.postJsonToNode(host, port, body, {
+    timeoutMs,
+    normalizeHost: normalizeNetworkHost
   })
 }
 
@@ -1712,11 +1932,15 @@ function broadcastTopologyToAllPeers(reason = 'broadcast', options = {}) {
   const baseDelta = options.baseDelta || buildTopologyDelta(reason)
   const excludeNodeId = String(options.excludeNodeId || '').trim()
   const identity = getDesktopIdentity()
+  const preserveSource = options.preserveSource === true
   const delta = {
     ...baseDelta,
-    sourceDeviceId: identity.id,
-    sourceDeviceName: identity.name,
-    sourceDeviceType: identity.type,
+    ...(preserveSource ? {} : {
+      sourceDeviceId: identity.id,
+      sourceDeviceName: identity.name,
+      sourceDeviceType: identity.type,
+      originDeviceId: baseDelta.originDeviceId || identity.id
+    }),
     ttl: Number.isFinite(baseDelta.ttl) ? baseDelta.ttl : TOPOLOGY_DELTA_TTL
   }
 
@@ -2352,6 +2576,164 @@ function broadcastTotpSyncToDesktopPeers(seed, action = 'add') {
   }
 }
 
+// ==================== 剪贴板同步 ====================
+
+// 剪贴板轮询周期：略高于 QR 监听，兼顾及时性与 CPU 占用。
+const CLIPBOARD_POLL_INTERVAL_MS = 900
+// 单条同步的剪贴板上限，超长内容（如整段文件）不同步，避免气泡/传输膨胀。
+const CLIPBOARD_MAX_LENGTH = 20000
+let clipboardWatchTimer = null
+// 上一次本机剪贴板内容快照：用于检测变化。
+let lastClipboardText = ''
+// 回环抑制：收到远端剪贴板写入本地后记下该文本，轮询检测到「变化成这个值」时
+// 跳过推送，避免 A→B→A 无限同步。只记最近一次即可（剪贴板只有一个当前值）。
+let suppressClipboardText = null
+
+function startClipboardSyncWatcher() {
+  if (clipboardWatchTimer) return
+  try {
+    lastClipboardText = clipboard.readText() || ''
+  } catch (_) {
+    lastClipboardText = ''
+  }
+  clipboardWatchTimer = setInterval(pollClipboardForSync, CLIPBOARD_POLL_INTERVAL_MS)
+}
+
+function stopClipboardSyncWatcher() {
+  if (clipboardWatchTimer) {
+    clearInterval(clipboardWatchTimer)
+    clipboardWatchTimer = null
+  }
+}
+
+function pollClipboardForSync() {
+  if (desktopMessageSettings.syncClipboard !== true) return
+  let text = ''
+  try {
+    text = clipboard.readText() || ''
+  } catch (_) {
+    return
+  }
+  if (text === lastClipboardText) return
+  lastClipboardText = text
+  // 这次变化是远端同步写入造成的，吞掉一次，不再回推
+  if (suppressClipboardText !== null && text === suppressClipboardText) {
+    suppressClipboardText = null
+    return
+  }
+  if (!text || text.length > CLIPBOARD_MAX_LENGTH) return
+  broadcastClipboardToNodes(text)
+}
+
+// 把本机剪贴板内容推送给已配对节点。
+// 投递通道按对端类型分流：
+//   - 手机节点：走 relay HTTP（端口 19529 的 NodeReceiverService）。手机的 WS 客户端
+//     不处理入站 verify_code，且按需模型下平时不连桌面，relay HTTP 才是手机的收件入口。
+//   - 桌面对端：走已建立的 WS 连接发 verify_code（对端 WS 服务器会交给 handleVerifyCode）。
+function broadcastClipboardToNodes(text) {
+  const identity = getDesktopIdentity()
+  const targetPhones = getAuthorizedPhones().filter(phone =>
+    phone.enabled !== false &&
+    phone.revoked !== true &&
+    canPushContentToNode(phone, CODE_TYPES.CLIPBOARD) &&
+    phone.pairingKey &&
+    (phone.lastIP || phone.host)
+  )
+  const targetDesktopPeerIds = new Set(
+    Array.from(activeDesktopPeerConnections.keys())
+      .filter(peerId => canPushContentToNode(pairedDesktopPeers.get(peerId), CODE_TYPES.CLIPBOARD))
+  )
+  const targetDeviceIds = [
+    ...targetPhones.map(phone => phone.id),
+    ...Array.from(targetDesktopPeerIds)
+  ]
+  const originMessageId = `clipboard-${identity.id}-${Date.now()}`
+  const basePayload = {
+    type: CODE_TYPES.CLIPBOARD,
+    code: '',
+    source: '剪贴板',
+    rawMessage: text,
+    timestamp: Date.now(),
+    phoneId: identity.id,
+    phoneName: identity.name,
+    sourceDeviceId: identity.id,
+    sourceDeviceName: identity.name,
+    sourceDeviceType: identity.type,
+    originDeviceId: identity.id,
+    originDeviceName: identity.name,
+    originMessageId,
+    relayMessageId: originMessageId,
+    relayPath: [identity.id],
+    // 开启多跳续传：收到的节点（手机/桌面）会把剪贴板续传给目标列表里
+    // 本机直投不到的节点，originMessageId 去重保证每个节点只消费一次
+    relayTtl: USER_MESSAGE_RELAY_TTL,
+    targetDeviceIds
+  }
+
+  // 桌面对端：WS verify_code（payload 用各连接的会话密钥加密）
+  const peerPayloadPlain = JSON.stringify(basePayload)
+  let delivered = 0
+  for (const [peerId, ws] of activeDesktopPeerConnections.entries()) {
+    if (!targetDesktopPeerIds.has(peerId)) continue
+    if (!ws || ws.readyState !== WebSocket.OPEN) continue
+    const sessionKey = ws.__codebridgeSessionKey
+    if (!sessionKey) continue
+    const encrypted = encryptMessage(peerPayloadPlain, sessionKey)
+    if (!encrypted) continue
+    try {
+      ws.send(JSON.stringify({ type: 'verify_code', msgId: basePayload.relayMessageId, payload: encrypted }))
+      delivered += 1
+    } catch (e) {
+      console.error('剪贴板同步到桌面对端失败:', e)
+    }
+  }
+
+  // 手机节点：relay HTTP（每台用其 relay 配对密钥加密，独立打时间戳）
+  for (const phone of targetPhones) {
+    sendRelayEnvelopeToPhone(phone, basePayload).then(ok => {
+      if (!ok) console.warn(`剪贴板 relay 到手机失败: ${phone.name}`)
+    }).catch(error => {
+      console.error(`剪贴板 relay 异常 ${phone.name}:`, error.message)
+    })
+  }
+
+  if (delivered > 0 || targetPhones.length > 0) {
+    console.log(`剪贴板已同步：桌面对端 ${delivered}，手机 ${targetPhones.length}`)
+  }
+}
+
+// 通过 relay HTTP 把一条用户消息负载发给单台手机（拓扑 relay 的同款信封格式）。
+// 剪贴板推送与桌面续传共用：每次发送独立打 relaySentAt 时间戳供对端做重放窗口校验。
+async function sendRelayEnvelopeToPhone(phone, basePayload) {
+  if (!phone || !phone.pairingKey || !(phone.lastIP || phone.host)) return false
+  const identity = getDesktopIdentity()
+  const stampedPayload = {
+    ...basePayload,
+    relaySentAt: Date.now()
+  }
+  const encryptedPayload = encryptMessage(JSON.stringify(stampedPayload), phone.pairingKey)
+  if (!encryptedPayload) return false
+  const nonce = generateNonce()
+  const authToken = hmacBase64(phone.pairingKey, `${identity.id}|${nonce}|${encryptedPayload}`)
+  const envelope = {
+    type: 'codebridge_relay',
+    version: 1,
+    senderId: identity.id,
+    nonce,
+    payload: encryptedPayload,
+    authToken
+  }
+  const hosts = [phone.lastIP || phone.host, phone.tsHost]
+    .map(normalizeNetworkHost)
+    .filter(Boolean)
+    .filter((host, index, arr) => arr.indexOf(host) === index)
+  for (const host of hosts) {
+    const ok = await postJsonToNode(host, Number(phone.relayPort || phone.port) || 19529, envelope)
+    if (ok) return true
+  }
+  return false
+}
+
 function buildTotpSeedPushPayload(seed, targetPeer) {
   const identity = getDesktopIdentity()
   return JSON.stringify({
@@ -2451,7 +2833,10 @@ function handleDesktopPeerTotpSync(peer, encryptedPayload, sessionKey) {
 function connectDesktopPeer(peer, options = {}) {
   if (!peer || peer.enabled === false) return false
   const existing = activeDesktopPeerConnections.get(peer.id)
-  if (existing && existing.readyState === WebSocket.OPEN) return true
+  // OPEN 复用；CONNECTING 也直接返回，避免重连扫描期间叠出重复连接
+  if (existing && (existing.readyState === WebSocket.OPEN || existing.readyState === WebSocket.CONNECTING)) {
+    return true
+  }
 
   const identity = getDesktopIdentity()
   const phoneNonce = generateNonce()
@@ -2514,6 +2899,32 @@ function connectDesktopPeer(peer, options = {}) {
           if (msgId) {
             ws.send(JSON.stringify({ type: 'code_ack', msgId }))
           }
+        }
+        return
+      }
+
+      // 对端（作为 WS 服务器一侧）经这条出站连接反向投递/续传的用户消息。
+      // 旧实现里客户端一侧不处理 verify_code，对端只能等本机反向连它才能送达。
+      if (message.type === 'verify_code') {
+        const msgId = typeof message.msgId === 'string' ? message.msgId : ''
+        if (msgId && hasRecentDelivery(peer.id, msgId)) {
+          ws.send(JSON.stringify({ type: 'code_ack', msgId }))
+          return
+        }
+        const plain = decryptMessage(message.payload, ws.__codebridgeSessionKey)
+        if (!plain) return
+        const codeData = JSON.parse(plain)
+        codeData.msgId = codeData.msgId || msgId
+        codeData.lastHopDeviceId = peer.id
+        codeData.lastHopDeviceName = peer.name
+        if (msgId && hasRecentDelivery(peer.id, msgId, codeData)) {
+          ws.send(JSON.stringify({ type: 'code_ack', msgId }))
+          return
+        }
+        dispatchInboundCodeData(codeData, peer.id)
+        if (msgId) {
+          rememberDelivery(peer.id, msgId, codeData)
+          ws.send(JSON.stringify({ type: 'code_ack', msgId }))
         }
         return
       }
@@ -2598,6 +3009,16 @@ function connectAllDesktopPeers() {
       connectDesktopPeer(peer, { showNotification: false })
     }
   }
+}
+
+// 桌面对端自动重连：对端重启或网络闪断后，出站连接的 close 只清理状态，
+// 不会自动恢复（手机方向有 relay HTTP 兜底，桌面对端没有）。这里周期性
+// 重新发起连接，已是 OPEN/CONNECTING 的对端由 connectDesktopPeer 自行跳过。
+function startDesktopPeerReconnectLoop() {
+  if (desktopPeerReconnectTimer) return
+  desktopPeerReconnectTimer = setInterval(() => {
+    connectAllDesktopPeers()
+  }, DESKTOP_PEER_RECONNECT_INTERVAL_MS)
 }
 
 function revokeTotpSeeds(revokeData) {
@@ -2799,144 +3220,33 @@ function addTopologyEdge(edges, edge) {
 }
 
 function isRoutingTransportEdge(edge) {
-  if (!edge || edge.enabled === false || edge.routable !== true) return false
-  const type = String(edge.type || '')
-  return Object.prototype.hasOwnProperty.call(ROUTE_TYPE_COST, type)
+  return topologyManager.isRoutingTransportEdge(edge, ROUTE_TYPE_COST)
 }
 
 function getRouteEdgeMetric(edge) {
-  const base = ROUTE_TYPE_COST[edge.type] || 50
-  const stalePenalty = edge.updatedAt && Date.now() - edge.updatedAt > ROUTE_STALE_MS ? 20 : 0
-  const inactivePenalty = edge.active ? 0 : 15
-  const disabledPenalty = edge.enabled === false ? 9999 : 0
-  return Math.max(1, Math.round(Number(edge.metric || 0) || base) + stalePenalty + inactivePenalty + disabledPenalty)
+  return topologyManager.getRouteEdgeMetric(edge, {
+    routeTypeCost: ROUTE_TYPE_COST,
+    routeStaleMs: ROUTE_STALE_MS
+  })
 }
 
 function buildLinkStateDatabase(nodes, edges) {
-  const nodeMap = new Map()
-  nodes.forEach(node => {
-    if (node?.id) nodeMap.set(String(node.id), node)
+  return topologyManager.buildLinkStateDatabase(nodes, edges, {
+    routeTypeCost: ROUTE_TYPE_COST,
+    routeStaleMs: ROUTE_STALE_MS
   })
-
-  const adjacency = new Map()
-  nodeMap.forEach((_node, id) => adjacency.set(id, []))
-
-  edges.filter(isRoutingTransportEdge).forEach(edge => {
-    const from = String(edge.from)
-    const to = String(edge.to)
-    if (!nodeMap.has(from) || !nodeMap.has(to)) return
-    const routeEdge = {
-      to,
-      metric: getRouteEdgeMetric(edge),
-      edgeId: edge.id,
-      edgeType: edge.type,
-      label: edge.label || '链路',
-      active: edge.active === true,
-      updatedAt: edge.updatedAt || 0
-    }
-    adjacency.get(from).push(routeEdge)
-    adjacency.get(to).push({
-      ...routeEdge,
-      to: from
-    })
-  })
-
-  return { nodeMap, adjacency }
 }
 
 function computeShortestRoutesFrom(sourceId, lsdb) {
-  const { nodeMap, adjacency } = lsdb
-  const source = String(sourceId || '')
-  if (!source || !nodeMap.has(source)) return []
-
-  const distance = new Map()
-  const previous = new Map()
-  const previousEdge = new Map()
-  const visited = new Set()
-  nodeMap.forEach((_node, id) => distance.set(id, Infinity))
-  distance.set(source, 0)
-
-  while (visited.size < nodeMap.size) {
-    let current = ''
-    let best = Infinity
-    for (const [id, metric] of distance.entries()) {
-      if (!visited.has(id) && metric < best) {
-        current = id
-        best = metric
-      }
-    }
-    if (!current) break
-    visited.add(current)
-
-    for (const edge of adjacency.get(current) || []) {
-      if (visited.has(edge.to)) continue
-      const nextMetric = best + edge.metric
-      if (nextMetric < (distance.get(edge.to) || Infinity)) {
-        distance.set(edge.to, nextMetric)
-        previous.set(edge.to, current)
-        previousEdge.set(edge.to, edge)
-      }
-    }
-  }
-
-  const routes = []
-  for (const [destination, metric] of distance.entries()) {
-    if (destination === source || !Number.isFinite(metric)) continue
-    const path = [destination]
-    const edgePath = []
-    let cursor = destination
-    while (previous.has(cursor)) {
-      const edge = previousEdge.get(cursor)
-      if (edge) edgePath.unshift(edge)
-      cursor = previous.get(cursor)
-      path.unshift(cursor)
-      if (cursor === source) break
-    }
-    if (path[0] !== source || path.length < 2) continue
-    const nextHopId = path[1]
-    const destinationNode = nodeMap.get(destination) || {}
-    routes.push({
-      id: `${source}->${destination}:spf`,
-      from: source,
-      to: destination,
-      destinationId: destination,
-      destinationName: destinationNode.name || destination,
-      destinationType: destinationNode.type || '',
-      nextHopId,
-      nextHopName: nodeMap.get(nextHopId)?.name || nextHopId,
-      metric,
-      hopCount: path.length - 1,
-      path,
-      pathLabels: edgePath.map(edge => edge.label),
-      via: nextHopId,
-      type: 'spf_route',
-      label: `SPF 路由 metric ${metric}`,
-      enabled: true,
-      active: edgePath.some(edge => edge.active),
-      authority: 'link_state',
-      updatedAt: Math.max(0, ...edgePath.map(edge => edge.updatedAt || 0))
-    })
-  }
-
-  return routes.sort((a, b) => a.metric - b.metric || a.hopCount - b.hopCount || a.destinationName.localeCompare(b.destinationName))
+  return topologyManager.computeShortestRoutesFrom(sourceId, lsdb)
 }
 
 function computeLinkStateRoutes(nodes, edges) {
-  const lsdb = buildLinkStateDatabase(nodes, edges)
-  const routeTables = {}
-  const routes = []
-  for (const nodeId of lsdb.nodeMap.keys()) {
-    const table = computeShortestRoutesFrom(nodeId, lsdb)
-    routeTables[nodeId] = table
-    routes.push(...table)
-  }
-  return {
-    protocol: 'link-state-spf',
-    version: ROUTING_PROTOCOL_VERSION,
-    routeTables,
-    routes,
-    updatedAt: Date.now()
-  }
+  return topologyManager.computeLinkStateRoutes(nodes, edges, {
+    routeTypeCost: ROUTE_TYPE_COST,
+    routeStaleMs: ROUTE_STALE_MS,
+    protocolVersion: ROUTING_PROTOCOL_VERSION
+  })
 }
 
 function getLocalTotpSeeds() {
@@ -3255,50 +3565,11 @@ function getTopologySnapshot() {
 }
 
 function generateTotpCode(seed, timestampSeconds = Math.floor(Date.now() / 1000)) {
-  const key = base32ToBuffer(seed.secret)
-  if (key.length === 0) return ''.padStart(seed.digits, '0')
-
-  const counter = BigInt(Math.floor(timestampSeconds / seed.period))
-  const counterBuffer = Buffer.alloc(8)
-  let value = counter
-  for (let i = 7; i >= 0; i -= 1) {
-    counterBuffer[i] = Number(value & 0xffn)
-    value >>= 8n
-  }
-
-  const hmacAlgorithm = seed.algorithm === 'SHA512'
-    ? 'sha512'
-    : seed.algorithm === 'SHA256'
-      ? 'sha256'
-      : 'sha1'
-  const digest = crypto.createHmac(hmacAlgorithm, key).update(counterBuffer).digest()
-  const offset = digest[digest.length - 1] & 0x0f
-  const binary = ((digest[offset] & 0x7f) << 24) |
-    ((digest[offset + 1] & 0xff) << 16) |
-    ((digest[offset + 2] & 0xff) << 8) |
-    (digest[offset + 3] & 0xff)
-  const otp = binary % (10 ** seed.digits)
-  return String(otp).padStart(seed.digits, '0')
+  return totpStore.generateTotpCode(seed, timestampSeconds)
 }
 
 function base32ToBuffer(base32) {
-  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'
-  let bits = 0
-  let value = 0
-  const bytes = []
-
-  for (const char of String(base32 || '').toUpperCase().replace(/[\s-=]/g, '')) {
-    const index = alphabet.indexOf(char)
-    if (index < 0) continue
-    value = (value << 5) | index
-    bits += 5
-    if (bits >= 8) {
-      bits -= 8
-      bytes.push((value >> bits) & 0xff)
-    }
-  }
-
-  return Buffer.from(bytes)
+  return totpStore.base32ToBuffer(base32)
 }
 
 // 周期 ping 所有 WebSocket 连接（入站手机 + 出站桌面对端）。
@@ -3367,6 +3638,17 @@ function startWebSocketServer() {
           // 旧 v1 路径（明文比对 pairingKey、明文下发 sessionKey）在 ws:// 上等于把会话密钥
           // 直接交给同网段抓包者，已移除；旧版手机端需升级后才能连接。
           if (message.authVersion === 2 && isValidAuthToken(phoneId, phoneNonce, message.authToken)) {
+            // 防重放：手机每次连接都用新随机 phoneNonce 计算 authToken，
+            // 因此同一 (phoneId, phoneNonce) 在窗口期内只允许成功鉴权一次。
+            // ws:// 是明文，抓到一帧合法 auth 原样重放即可把该手机 lastIP
+            // 改成攻击者 IP，使后续 relay 投递重定向——这里堵住该口子。
+            // 只在 token 校验通过后才消费 nonce，避免被无效帧刷爆记录表。
+            if (isReplayedAuthNonce(phoneId, phoneNonce)) {
+              console.warn(`Rejected replayed auth from ${phoneId}@${clientIP}`)
+              ws.send(JSON.stringify({ type: 'auth_fail' }))
+              ws.close()
+              return
+            }
             const phone = upsertAuthorizedPhone({
               phoneId,
               phoneName,
@@ -3456,19 +3738,18 @@ function startWebSocketServer() {
           const decrypted = decryptMessage(message.payload, connectionSessionKey)
           if (decrypted) {
             const codeData = JSON.parse(decrypted)
-            codeData.phoneId = connectionPhoneId
-            codeData.phoneName = connectionPhoneName || codeData.phoneName
-            if (codeData.type === 'totp_seed') {
-              handleTotpSeed(codeData)
-            } else if (codeData.type === 'totp_revoke') {
-              handleTotpRevoke(codeData)
-            } else if (codeData.type === 'topology_delta' || codeData.type === 'node_advertisement' || codeData.type === 'link_advertisement') {
-              applyTopologyDeltaPayload(codeData, { excludeNodeId: connectionPhoneId })
-            } else {
-              handleVerifyCode(codeData)
+            codeData.msgId = codeData.msgId || msgId
+            codeData.lastHopDeviceId = connectionPhoneId
+            codeData.lastHopDeviceName = connectionPhoneName
+            codeData.phoneId = codeData.phoneId || codeData.sourceDeviceId || connectionPhoneId
+            codeData.phoneName = codeData.phoneName || codeData.sourceDeviceName || connectionPhoneName
+            if (msgId && hasRecentDelivery(connectionPhoneId, msgId, codeData)) {
+              ws.send(JSON.stringify({ type: 'code_ack', msgId }))
+              return
             }
+            dispatchInboundCodeData(codeData, connectionPhoneId)
             if (msgId) {
-              rememberDelivery(connectionPhoneId, msgId)
+              rememberDelivery(connectionPhoneId, msgId, codeData)
             }
             // 回 ACK：按需连接模型下手机收到 ACK 才安全断开，确保消息已落地
             ws.send(JSON.stringify({ type: 'code_ack', msgId }))
@@ -3547,7 +3828,14 @@ function handleVerifyCode(codeData) {
     targetDevices,
     targetDeviceIds,
     pushAuthority,
-    pushAuthorityDeviceId
+    pushAuthorityDeviceId,
+    originMessageId,
+    relayMessageId,
+    originDeviceId,
+    originDeviceName,
+    lastHopDeviceId,
+    lastHopDeviceName,
+    msgId
   } = codeData
   const desktopIdentity = getDesktopIdentity()
   const normalizedTargets = Array.isArray(targetDevices)
@@ -3580,6 +3868,12 @@ function handleVerifyCode(codeData) {
     targetDevices: normalizedTargets,
     pushAuthority: pushAuthority || 'source_device',
     pushAuthorityDeviceId: pushAuthorityDeviceId || sourceDeviceId || phoneId || '',
+    originMessageId: originMessageId || relayMessageId || msgId || '',
+    relayMessageId: relayMessageId || '',
+    originDeviceId: originDeviceId || sourceDeviceId || phoneId || '',
+    originDeviceName: originDeviceName || sourceDeviceName || phoneName || '',
+    lastHopDeviceId: lastHopDeviceId || '',
+    lastHopDeviceName: lastHopDeviceName || '',
     topology: {
       source: {
         id: sourceDeviceId || phoneId || '',
@@ -3596,17 +3890,31 @@ function handleVerifyCode(codeData) {
     mainWindow.webContents.send('new-code', codeInfo)
   }
 
+  // 三种用户消息都走气泡堆叠展示；系统通知（Windows 通知中心）同时保留。
   if (codeInfo.type === CODE_TYPES.SMS && codeInfo.code) {
     showCodeBubble(codeInfo)
     showNotification('📩 新验证码', `${codeInfo.code}\n来源: ${codeInfo.source}\n手机: ${codeInfo.phoneName}`)
     clipboard.writeText(codeInfo.code)
   } else if (codeInfo.type === CODE_TYPES.SMS_MESSAGE) {
     const preview = codeInfo.rawMessage || codeInfo.source
+    showCodeBubble(codeInfo)
     showNotification('📨 新短信', `${preview}\n来源设备: ${codeInfo.sourceDeviceName}`)
   } else if (codeInfo.type === CODE_TYPES.APP_NOTIFICATION) {
     const titleText = codeInfo.title || codeInfo.appName || codeInfo.source
     const bodyText = codeInfo.rawMessage || ''
+    showCodeBubble(codeInfo)
     showNotification(`🔔 ${codeInfo.appName || '新通知'}`, `${titleText}\n${bodyText}\n来源设备: ${codeInfo.sourceDeviceName}`)
+  } else if (codeInfo.type === CODE_TYPES.CLIPBOARD) {
+    const text = codeInfo.rawMessage || ''
+    if (text) {
+      // 回环抑制：先记下即将写入的文本，轮询检测到剪贴板变成这个值时跳过回推，
+      // 同步更新 lastClipboardText 以防轮询把它当成本机新变化二次广播
+      suppressClipboardText = text
+      lastClipboardText = text
+      clipboard.writeText(text)
+      showCodeBubble(codeInfo)
+      showNotification('📋 剪贴板同步', `${text.slice(0, 80)}\n来源设备: ${codeInfo.sourceDeviceName}`)
+    }
   }
 }
 
@@ -3640,6 +3948,203 @@ function showNotification(title, body) {
   }
 }
 
+// ==================== 用户消息多跳续传（桌面节点作为中转站） ====================
+// 旧实现里桌面是"终点站"：收到 verify_code 只本地消费，relayTtl/relayPath/
+// targetDeviceIds 全被忽略，导致 A→桌面B→C 的传递链在 B 断掉。
+// 这里补齐与安卓端 NodeReceiverService/enqueueRelayPayload 对等的续传语义：
+// 防环（relayPath）、TTL 递减、originMessageId 去重（接收方已有）、
+// 范围约束（source_selected_targets：只续传给源设备指定的目标）。
+
+// 与安卓端 isRelaySupportedType 对齐；拓扑类消息走 applyTopologyDeltaPayload
+// 自己的 gossip 洪泛，不经这里
+const RELAY_FORWARD_TYPES = new Set([
+  'sms', 'sms_message', 'app_notification', 'clipboard', 'totp_seed', 'totp_revoke'
+])
+
+function payloadTargetIds(codeData) {
+  if (Array.isArray(codeData.targetDeviceIds)) {
+    return codeData.targetDeviceIds.map(id => String(id || '').trim()).filter(Boolean)
+  }
+  if (Array.isArray(codeData.targetDevices)) {
+    return codeData.targetDevices.map(t => String(t?.id || '').trim()).filter(Boolean)
+  }
+  return []
+}
+
+// 本机是否该本地消费这条消息。
+// 源设备直投（无 lastRelayDeviceId）一律消费，与旧行为完全一致（兼容旧版
+// 配对条目 id 不一致的情况）；中转副本（续传而来）只有本机在目标列表内才消费，
+// 否则只续传不展示——避免「下一跳路由经过的桌面把过路消息当自己的弹出来」。
+function isLocalTargetOfPayload(codeData) {
+  const relayed = !!String(codeData.lastRelayDeviceId || '').trim()
+  if (!relayed) return true
+  const ids = payloadTargetIds(codeData)
+  if (ids.length === 0) return true
+  return ids.includes(getDesktopIdentity().id)
+}
+
+// 在已知节点表里解析续传目标：桌面对端 → 已授权手机 → 拓扑 LSDB（gossip 学到的）
+function resolveForwardTarget(targetId) {
+  const peer = pairedDesktopPeers.get(targetId)
+  if (peer) return { kind: 'desktop', node: peer }
+  const phone = authorizedPhones.get(targetId)
+  if (phone) {
+    return String(phone.deviceType || '').includes('DESKTOP')
+      ? { kind: 'desktop', node: phone }
+      : { kind: 'phone', node: phone }
+  }
+  const lsdbNode = topologyLsdb.nodes.get(targetId)
+  if (lsdbNode) {
+    if (String(lsdbNode.type || '').includes('PHONE')) {
+      return {
+        kind: 'phone',
+        node: {
+          id: lsdbNode.id,
+          name: lsdbNode.name,
+          pairingKey: lsdbNode.pairingKey,
+          lastIP: lsdbNode.host || lsdbNode.lastIP,
+          tsHost: lsdbNode.tsHost || '',
+          relayPort: Number(lsdbNode.port) || 19529,
+          enabled: lsdbNode.enabled !== false,
+          revoked: lsdbNode.revoked === true
+        }
+      }
+    }
+    return { kind: 'desktop', node: lsdbNode }
+  }
+  return null
+}
+
+// 经任一可用的加密 WS 通道把 verify_code 发给目标桌面节点：
+// 优先本机发起的出站对端连接，其次对端发起的入站连接（对端客户端已支持
+// 处理 verify_code，见 connectDesktopPeer 的消息分支）。都没有则尝试唤起
+// 对端连接（本条消息放弃，后续消息可用）。
+function sendVerifyCodeToDesktopNode(targetId, payloadPlain, msgId) {
+  const outbound = activeDesktopPeerConnections.get(targetId)
+  if (outbound && outbound.readyState === WebSocket.OPEN && outbound.__codebridgeSessionKey) {
+    const encrypted = encryptMessage(payloadPlain, outbound.__codebridgeSessionKey)
+    if (encrypted) {
+      try {
+        outbound.send(JSON.stringify({ type: 'verify_code', msgId, payload: encrypted }))
+        return true
+      } catch (e) {
+        console.error('续传到桌面对端失败:', e)
+      }
+    }
+  }
+  const inboundConnections = activePhoneConnections.get(targetId)
+  if (inboundConnections) {
+    for (const ws of inboundConnections) {
+      if (ws.readyState !== WebSocket.OPEN) continue
+      const sessionKey = phoneSessionKeys.get(ws)
+      if (!sessionKey) continue
+      const encrypted = encryptMessage(payloadPlain, sessionKey)
+      if (!encrypted) continue
+      try {
+        ws.send(JSON.stringify({ type: 'verify_code', msgId, payload: encrypted }))
+        return true
+      } catch (e) {
+        console.error('续传到入站桌面连接失败:', e)
+      }
+    }
+  }
+  const peer = pairedDesktopPeers.get(targetId)
+  if (peer && peer.enabled !== false) {
+    connectDesktopPeer(peer, { showNotification: false })
+  }
+  return false
+}
+
+function forwardMessageToNode(targetId, payload, messageKey) {
+  const target = resolveForwardTarget(targetId)
+  if (!target || target.node.enabled === false || target.node.revoked === true) return false
+  if (target.kind === 'phone') {
+    const phone = target.node
+    if (!phone.pairingKey || !(phone.lastIP || phone.host)) return false
+    sendRelayEnvelopeToPhone(phone, payload).then(ok => {
+      if (!ok) console.warn(`续传到手机失败: ${phone.name || targetId}`)
+    }).catch(error => {
+      console.error(`续传到手机异常 ${phone.name || targetId}:`, error.message)
+    })
+    return true
+  }
+  return sendVerifyCodeToDesktopNode(targetId, JSON.stringify(payload), messageKey)
+}
+
+// 把一条入站用户消息续传给源设备目标列表里的其余节点（本机可达的部分）。
+// 与手机端 enqueueRelayPayload 的防环/范围规则一致。
+function forwardRelayedMessage(codeData, lastHopDeviceId = '') {
+  try {
+    const identity = getDesktopIdentity()
+    const type = String(codeData.contentType || codeData.type || '').trim()
+    if (!RELAY_FORWARD_TYPES.has(type)) return
+    const ttl = Number(codeData.relayTtl ?? codeData.ttl ?? 0)
+    if (!Number.isFinite(ttl) || ttl <= 0) return
+
+    const relayPath = Array.isArray(codeData.relayPath)
+      ? codeData.relayPath.map(id => String(id || '').trim()).filter(Boolean)
+      : []
+    if (relayPath.includes(identity.id)) return
+
+    // source_selected_targets：续传范围严格限于源设备指定的目标；
+    // 没有目标列表的（旧版负载）不续传，保持旧行为
+    const targetIds = payloadTargetIds(codeData)
+    if (targetIds.length === 0) return
+
+    const messageKey = String(
+      codeData.originMessageId || codeData.relayMessageId || codeData.msgId || ''
+    ).trim()
+    if (!messageKey) return
+
+    const originId = String(
+      codeData.originDeviceId || codeData.sourceDeviceId || codeData.phoneId || ''
+    ).trim()
+    const excluded = new Set([...relayPath, identity.id, originId, String(lastHopDeviceId || '')].filter(Boolean))
+    const pendingTargets = targetIds.filter(id => !excluded.has(id))
+    if (pendingTargets.length === 0) return
+
+    const nextPayload = {
+      ...codeData,
+      relayPath: Array.from(new Set([...relayPath, identity.id])),
+      relayTtl: ttl - 1,
+      lastRelayDeviceId: identity.id,
+      lastRelayDeviceName: identity.name
+    }
+
+    let forwarded = 0
+    for (const targetId of pendingTargets) {
+      if (forwardMessageToNode(targetId, nextPayload, messageKey)) forwarded += 1
+    }
+    if (forwarded > 0) {
+      console.log(`已续传 ${type} 消息到 ${forwarded}/${pendingTargets.length} 个节点 (ttl=${ttl - 1})`)
+    }
+  } catch (e) {
+    console.error('消息续传失败:', e)
+  }
+}
+
+// 统一分发一条已解密的入站业务消息（手机入站 / 桌面对端两个方向共用）：
+// 本机在目标列表内才本地消费；带 relayTtl 的消息续传给其余目标。
+function dispatchInboundCodeData(codeData, lastHopDeviceId = '') {
+  if (
+    codeData.type === 'topology_delta' ||
+    codeData.type === 'node_advertisement' ||
+    codeData.type === 'link_advertisement'
+  ) {
+    applyTopologyDeltaPayload(codeData, { excludeNodeId: lastHopDeviceId })
+    return
+  }
+  const isLocalTarget = isLocalTargetOfPayload(codeData)
+  if (codeData.type === 'totp_seed') {
+    if (isLocalTarget) handleTotpSeed(codeData)
+  } else if (codeData.type === 'totp_revoke') {
+    if (isLocalTarget) handleTotpRevoke(codeData)
+  } else if (isLocalTarget) {
+    handleVerifyCode(codeData)
+  }
+  forwardRelayedMessage(codeData, lastHopDeviceId)
+}
+
 function normalizeExternalUrl(url) {
   try {
     const parsed = new URL(String(url || ''))
@@ -3656,250 +4161,166 @@ function isSupportedImagePath(filePath) {
   return ['.png', '.jpg', '.jpeg', '.gif', '.bmp'].includes(ext) && fs.existsSync(normalized)
 }
 
-ipcMain.handle('get-pairing-info', async () => {
-  if (!pairingKey) {
-    loadOrCreatePairingKey()
-  }
-  const qrDataURL = await refreshPairingQR()
-  return {
-    host: getLocalIP(),
-    port: WS_PORT,
-    tsHost: getTailscaleIPv4(),
-    qrDataURL,
-    hasPairingKey: !!pairingKey,
-    authorizedPhones: getAuthorizedPhones()
-  }
-})
-
-ipcMain.handle('copy-to-clipboard', (event, text) => {
-  clipboard.writeText(text)
-
-  if (mainWindow) {
-    mainWindow.webContents.send('copy-feedback')
-  }
-})
-
-ipcMain.handle('hide-window', () => {
-  if (mainWindow) mainWindow.hide()
-})
-
-ipcMain.handle('minimize-window', () => {
-  if (mainWindow) mainWindow.hide()
-})
-
-ipcMain.handle('regenerate-pairing', async () => {
-  await regeneratePairingKey()
-  return true
-})
-
-ipcMain.handle('get-authorized-phones', () => getAuthorizedPhones())
-
-ipcMain.handle('get-desktop-totps', () => getDesktopTotps())
-
-ipcMain.handle('get-topology', () => getTopologySnapshot())
-
-ipcMain.handle('get-message-settings', () => normalizeMessageSettings(desktopMessageSettings))
-
-ipcMain.handle('set-message-settings', (event, updates) => {
-  desktopMessageSettings = normalizeMessageSettings({
-    ...desktopMessageSettings,
-    ...(updates || {})
-  })
-  savePairingKey()
-  return normalizeMessageSettings(desktopMessageSettings)
-})
-
-ipcMain.handle('scan-lan-devices', async () => {
-  return scanLanDevices()
-})
-
-ipcMain.handle('get-lan-devices', () => getDiscoveredLanDevices())
-
-ipcMain.handle('pair-desktop-device', (event, pairingData) => {
-  return pairDesktopPeer(pairingData)
-})
-
-ipcMain.handle('is-window-visible', () => {
-  return mainWindow ? mainWindow.isVisible() : false
-})
-
-ipcMain.handle('set-phone-enabled', (event, phoneId, enabled) => {
-  return setPhoneEnabled(phoneId, enabled)
-})
-
-ipcMain.handle('set-phone-content-policy', (event, phoneId, updates) => {
-  return setPhoneContentPolicy(phoneId, updates)
-})
-
-ipcMain.handle('revoke-phone', (event, phoneId) => {
-  return revokePhone(phoneId)
-})
-
-ipcMain.handle('restore-phone', (event, phoneId) => {
-  return restorePhone(phoneId)
-})
-
-ipcMain.handle('open-external', async (event, url) => {
-  const externalUrl = normalizeExternalUrl(url)
-  if (!externalUrl) return false
-  await shell.openExternal(externalUrl)
-  return true
-})
-
-// ==================== Storage API ====================
-
-// TOTP 管理
-ipcMain.handle('storage-get-all-totps', () => {
-  return getTotpSeedRecords()
-})
-
-ipcMain.handle('storage-add-totp', (event, totp) => {
-  return addLocalTotpSeed(totp)
-})
-
-ipcMain.handle('storage-update-totp', (event, id, updates) => {
-  return updateTotpSeed(id, updates)
-})
-
-ipcMain.handle('storage-delete-totp', (event, id) => {
-  return deleteTotpSeed(id)
-})
-
-ipcMain.handle('storage-get-totp-by-id', (event, id) => {
-  return toPublicTotpSeed(totpSeeds.get(String(id || '')))
-})
-
-// 短信管理
-ipcMain.handle('storage-get-all-sms', () => {
-  return storage.getAllSms()
-})
-
-ipcMain.handle('storage-add-sms', (event, sms) => {
-  return storage.addSms(sms)
-})
-
-ipcMain.handle('storage-delete-sms', (event, id) => {
-  return storage.deleteSms(id)
-})
-
-ipcMain.handle('storage-clear-all-sms', () => {
-  return storage.clearAllSms()
-})
-
-// 统计信息
-ipcMain.handle('storage-get-stats', () => {
-  const stats = storage.getStats()
-  return {
-    ...stats,
-    totpCount: totpSeeds.size,
-    localTotpCount: Array.from(totpSeeds.values()).filter(seed => seed.phoneId === LOCAL_TOTP_SOURCE_ID).length,
-    remoteTotpCount: Array.from(totpSeeds.values()).filter(seed => seed.phoneId !== LOCAL_TOTP_SOURCE_ID).length
-  }
-})
-
-// 设备信息
-ipcMain.handle('storage-get-device-id', () => {
-  return storage.getDeviceId()
-})
-
-ipcMain.handle('storage-get-device-name', () => {
-  return storage.getDeviceName()
-})
-
-ipcMain.handle('storage-set-device-name', (event, name) => {
-  return storage.setDeviceName(name)
-})
-
-// 数据导入导出
-ipcMain.handle('storage-export-data', () => {
-  const data = storage.exportData()
-  return {
-    ...data,
-    totps: getTotpSeedRecords()
-  }
-})
-
-ipcMain.handle('storage-import-data', (event, data) => {
-  const result = storage.importData(data)
-  // 导入的数据立即合并进主存储并通知界面，不必等下次重启
-  importStorageTotpsIntoPrimaryStore()
-  notifyTotpSeedsChanged()
-  return result
-})
-
-// ==================== QR Code Parser API ====================
-
-// 启动剪贴板监听
-ipcMain.handle('qr-start-clipboard-watch', () => {
-  qrCodeParser.startClipboardWatcher((result) => {
-    // 解析成功后发送到渲染进程
+registerDesktopIpc(ipcMain, {
+  getPairingInfo: async () => {
+    if (!pairingKey) {
+      loadOrCreatePairingKey()
+    }
+    const qrDataURL = await refreshPairingQR()
+    return {
+      host: getLocalIP(),
+      port: WS_PORT,
+      tsHost: getTailscaleIPv4(),
+      qrDataURL,
+      hasPairingKey: !!pairingKey,
+      authorizedPhones: getAuthorizedPhones()
+    }
+  },
+  copyToClipboard: text => {
+    clipboard.writeText(text)
     if (mainWindow) {
-      mainWindow.webContents.send('qr-code-detected', result)
+      mainWindow.webContents.send('copy-feedback')
     }
-  })
-  return { success: true }
-})
-
-// 停止剪贴板监听
-ipcMain.handle('qr-stop-clipboard-watch', () => {
-  qrCodeParser.stopClipboardWatcher()
-  return { success: true }
-})
-
-// 解析文件
-ipcMain.handle('qr-parse-file', async (event, filePath) => {
-  try {
-    if (!isSupportedImagePath(filePath)) {
-      return { success: false, error: '不支持的图片文件' }
-    }
-    const result = await qrCodeParser.parseFile(filePath)
-    return { success: true, result }
-  } catch (error) {
-    return { success: false, error: error.message }
-  }
-})
-
-// 选择文件并解析
-ipcMain.handle('qr-select-and-parse', async () => {
-  try {
-    const result = await dialog.showOpenDialog(mainWindow, {
-      title: '选择二维码图片',
-      filters: [
-        { name: '图片', extensions: ['png', 'jpg', 'jpeg', 'gif', 'bmp'] }
-      ],
-      properties: ['openFile', 'multiSelections']
+  },
+  hideWindow: () => {
+    if (mainWindow) mainWindow.hide()
+  },
+  minimizeWindow: () => {
+    if (mainWindow) mainWindow.hide()
+  },
+  regeneratePairing: async () => {
+    await regeneratePairingKey()
+    return true
+  },
+  getAuthorizedPhones: () => getAuthorizedPhones(),
+  getDesktopTotps: () => getDesktopTotps(),
+  getTopology: () => getTopologySnapshot(),
+  getMessageSettings: () => normalizeMessageSettings(desktopMessageSettings),
+  setMessageSettings: updates => {
+    desktopMessageSettings = normalizeMessageSettings({
+      ...desktopMessageSettings,
+      ...(updates || {})
     })
-
-    if (result.canceled || result.filePaths.length === 0) {
-      return { success: false, canceled: true }
+    savePairingKey()
+    if (desktopMessageSettings.syncClipboard === true) {
+      try {
+        lastClipboardText = clipboard.readText() || ''
+      } catch (_) {
+        lastClipboardText = ''
+      }
     }
-
-    const supportedFiles = result.filePaths.filter(isSupportedImagePath)
-    if (supportedFiles.length === 0) {
-      return { success: false, error: '不支持的图片文件' }
+    return normalizeMessageSettings(desktopMessageSettings)
+  },
+  scanLanDevices: () => scanLanDevices(),
+  getLanDevices: () => getDiscoveredLanDevices(),
+  pairDesktopDevice: pairingData => pairDesktopPeer(pairingData),
+  isWindowVisible: () => mainWindow ? mainWindow.isVisible() : false,
+  setPhoneEnabled: (phoneId, enabled) => setPhoneEnabled(phoneId, enabled),
+  setPhoneContentPolicy: (phoneId, updates) => setPhoneContentPolicy(phoneId, updates),
+  revokePhone: phoneId => revokePhone(phoneId),
+  restorePhone: phoneId => restorePhone(phoneId),
+  openExternal: async url => {
+    const externalUrl = normalizeExternalUrl(url)
+    if (!externalUrl) return false
+    await shell.openExternal(externalUrl)
+    return true
+  },
+  checkForUpdate: () => updater.checkForUpdate(true),
+  getUpdateState: () => updater.getUpdateState(),
+  storageGetAllTotps: () => getTotpSeedRecords(),
+  storageAddTotp: totp => addLocalTotpSeed(totp),
+  storageUpdateTotp: (id, updates) => updateTotpSeed(id, updates),
+  storageDeleteTotp: id => deleteTotpSeed(id),
+  storageGetTotpById: id => toPublicTotpSeed(totpSeeds.get(String(id || ''))),
+  storageGetAllSms: () => storage.getAllSms(),
+  storageAddSms: sms => storage.addSms(sms),
+  storageDeleteSms: id => storage.deleteSms(id),
+  storageClearAllSms: () => storage.clearAllSms(),
+  storageGetStats: () => {
+    const stats = storage.getStats()
+    return {
+      ...stats,
+      totpCount: totpSeeds.size,
+      localTotpCount: Array.from(totpSeeds.values()).filter(seed => seed.phoneId === LOCAL_TOTP_SOURCE_ID).length,
+      remoteTotpCount: Array.from(totpSeeds.values()).filter(seed => seed.phoneId !== LOCAL_TOTP_SOURCE_ID).length
     }
-    const qrResult = await qrCodeParser.parseFiles(supportedFiles)
+  },
+  storageGetDeviceId: () => storage.getDeviceId(),
+  storageGetDeviceName: () => storage.getDeviceName(),
+  storageSetDeviceName: name => storage.setDeviceName(name),
+  storageExportData: () => ({
+    ...storage.exportData(),
+    totps: getTotpSeedRecords()
+  }),
+  storageImportData: data => {
+    const result = storage.importData(data)
+    importStorageTotpsIntoPrimaryStore()
+    notifyTotpSeedsChanged()
+    return result
+  },
+  qrStartClipboardWatch: () => {
+    qrCodeParser.startClipboardWatcher(result => {
+      if (mainWindow) {
+        mainWindow.webContents.send('qr-code-detected', result)
+      }
+    })
+    return { success: true }
+  },
+  qrStopClipboardWatch: () => {
+    qrCodeParser.stopClipboardWatcher()
+    return { success: true }
+  },
+  qrParseFile: async filePath => {
+    try {
+      if (!isSupportedImagePath(filePath)) {
+        return { success: false, error: '不支持的图片文件' }
+      }
+      const result = await qrCodeParser.parseFile(filePath)
+      return { success: true, result }
+    } catch (error) {
+      return { success: false, error: error.message }
+    }
+  },
+  qrSelectAndParse: async () => {
+    try {
+      const result = await dialog.showOpenDialog(mainWindow, {
+        title: '选择二维码图片',
+        filters: [
+          { name: '图片', extensions: ['png', 'jpg', 'jpeg', 'gif', 'bmp'] }
+        ],
+        properties: ['openFile', 'multiSelections']
+      })
 
-    return { success: true, result: qrResult, filePaths: supportedFiles }
-  } catch (error) {
-    return { success: false, error: error.message }
+      if (result.canceled || result.filePaths.length === 0) {
+        return { success: false, canceled: true }
+      }
+
+      const supportedFiles = result.filePaths.filter(isSupportedImagePath)
+      if (supportedFiles.length === 0) {
+        return { success: false, error: '不支持的图片文件' }
+      }
+      const qrResult = await qrCodeParser.parseFiles(supportedFiles)
+      return { success: true, result: qrResult, filePaths: supportedFiles }
+    } catch (error) {
+      return { success: false, error: error.message }
+    }
+  },
+  qrParseClipboard: async () => {
+    try {
+      const image = clipboard.readImage()
+      if (image.isEmpty()) {
+        return { success: false, error: '剪贴板中没有图片' }
+      }
+
+      const result = await qrCodeParser.parseImage(image)
+      return { success: true, result }
+    } catch (error) {
+      return { success: false, error: error.message }
+    }
   }
 })
 
-// 从剪贴板解析
-ipcMain.handle('qr-parse-clipboard', async () => {
-  try {
-    const image = clipboard.readImage()
-    if (image.isEmpty()) {
-      return { success: false, error: '剪贴板中没有图片' }
-    }
 
-    const result = await qrCodeParser.parseImage(image)
-    return { success: true, result }
-  } catch (error) {
-    return { success: false, error: error.message }
-  }
-})
 
 if (!gotSingleInstanceLock) {
   app.quit()
@@ -3930,10 +4351,13 @@ if (!gotSingleInstanceLock) {
     importStorageTotpsIntoPrimaryStore()
     createWindow({ hidden: startHidden })
     createTray()
+    updater.initAutoUpdater(mainWindow)
     startWebSocketServer()
     startLanDiscoveryService()
+    startClipboardSyncWatcher()
     await refreshPairingQR()
     connectAllDesktopPeers()
+    startDesktopPeerReconnectLoop()
 
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow()
