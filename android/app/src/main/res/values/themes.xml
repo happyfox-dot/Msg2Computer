@@ -19,6 +19,17 @@
         <item name="android:windowLightStatusBar">false</item>
     </style>
 
+    <!-- 透明一闪主题：快捷磁贴拉起的 ClipboardSyncActivity 用——获焦读剪贴板后立即关闭，
+         全程不显示任何界面 -->
+    <style name="Theme.CodeSync.Translucent">
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowAnimationStyle">@null</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+    </style>
+
     <!-- 卡片：圆角 + 微弱描边，无重阴影，贴合深色界面。
          内部 padding 由各卡片内的 LinearLayout 负责，这里不设 contentPadding 以免叠加。 -->
     <style name="CardSurface" parent="Widget.Material3.CardView.Elevated">

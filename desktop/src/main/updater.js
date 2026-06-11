@@ -47,6 +47,12 @@ function initAutoUpdater(mainWindow) {
   // 注册监听/定时检查没有意义，直接当作不可用
   if (!autoUpdater || !app.isPackaged) return
 
+  // autoInstallOnAppQuit 的「退出时装更新」路径同样要放行主窗口 close 拦截：
+  // electron-updater 在为更新而退出前会发 before-quit-for-update
+  app.on('before-quit-for-update', () => {
+    app.isQuitting = true
+  })
+
   // 自动下载，但不自动安装（安装时机交给用户确认）
   autoUpdater.autoDownload = true
   autoUpdater.autoInstallOnAppQuit = true
@@ -129,8 +135,13 @@ function promptInstall(info) {
 
 function quitAndInstall() {
   if (!autoUpdater) return
-  // isSilent=false 显示安装进度，isForceRunAfter=true 安装后自动重启
-  setImmediate(() => autoUpdater.quitAndInstall(false, true))
+  // 关键：主窗口的 close 在非退出状态会 preventDefault 并隐藏窗口（托盘常驻设计），
+  // 这会拦截 quitAndInstall 内部的 app.quit()，退出流程中止、安装器永远不会启动
+  // ——用户点了「立即重启安装」却毫无反应。必须先标记退出状态放行 close 拦截。
+  app.isQuitting = true
+  // isSilent=true 静默安装（沿用原安装目录，无需用户再点一遍安装向导），
+  // isForceRunAfter=true 安装完成后自动重启应用
+  setImmediate(() => autoUpdater.quitAndInstall(true, true))
 }
 
 // 触发一次更新检查。manual=true 表示用户在设置页手动点击，会在「已是最新」「出错」时弹框。

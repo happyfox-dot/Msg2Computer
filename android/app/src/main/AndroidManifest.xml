@@ -36,6 +36,26 @@
             android:name=".QRScannerActivity"
             android:exported="false" />
 
+        <!-- 快捷磁贴拉起的透明一闪页：获焦读剪贴板→投递→关闭 -->
+        <activity
+            android:name=".ClipboardSyncActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:taskAffinity=""
+            android:theme="@style/Theme.CodeSync.Translucent" />
+
+        <!-- 快捷设置磁贴：一键同步剪贴板 -->
+        <service
+            android:name=".service.ClipboardSyncTileService"
+            android:exported="true"
+            android:icon="@drawable/ic_tile_clipboard"
+            android:label="@string/clipboard_tile_label"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+
         <service
             android:name=".service.WebSocketService"
             android:exported="false"

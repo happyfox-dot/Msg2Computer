@@ -878,6 +878,7 @@ function loadOrCreatePairingKey() {
         secret: unprotectSecret(item.secret)
       })).filter(Boolean)
       desktopMessageSettings = normalizeMessageSettings(saved.messageSettings || {})
+      clipboardSyncState = normalizeClipboardSyncState(saved.clipboardSyncState || {})
       importSavedTopologyLsdb(saved.topologyLsdb || {})
       pruneTotpDeleteTombstones()
       if (saved.pairingKey) {
@@ -969,6 +970,8 @@ function flushPairingConfigToDisk() {
         totpDeleteTombstones: getStoredTotpDeleteTombstones(),
         topologyLsdb: exportTopologyLsdb(),
         messageSettings: normalizeMessageSettings(desktopMessageSettings),
+        // 剪贴板 LWW 版本（仅哈希不含明文）：跨重启保持，避免补推用旧值盖新值
+        clipboardSyncState: { ...clipboardSyncState },
         updatedAt: Date.now()
       }, null, 2),
       'utf8'
@@ -2585,9 +2588,37 @@ const CLIPBOARD_MAX_LENGTH = 20000
 let clipboardWatchTimer = null
 // 上一次本机剪贴板内容快照：用于检测变化。
 let lastClipboardText = ''
-// 回环抑制：收到远端剪贴板写入本地后记下该文本，轮询检测到「变化成这个值」时
-// 跳过推送，避免 A→B→A 无限同步。只记最近一次即可（剪贴板只有一个当前值）。
-let suppressClipboardText = null
+
+// 剪贴板 LWW（last-writer-wins）寄存器状态：网络中剪贴板是一个单值寄存器，
+// 每次复制产生新版本 (ts, origin)。节点只应用比已知版本更新的内容——
+// 旧值、乱序副本、回环副本全部被版本比较吸收，取代了旧的 suppressClipboardText
+// 单次回环抑制。只存内容哈希不存明文；随 pairing.json 持久化，
+// 重启后的上线补推不会把旧值打上新时间戳盖掉别人的新内容。
+let clipboardSyncState = { ts: 0, origin: '', hash: '' }
+
+function hashClipText(text) {
+  return crypto.createHash('sha256').update(String(text), 'utf8').digest('hex').slice(0, 24)
+}
+
+function isNewerClipVersion(ts, origin) {
+  if (!Number.isFinite(ts) || ts <= 0) return false
+  if (ts !== clipboardSyncState.ts) return ts > clipboardSyncState.ts
+  // 同毫秒平手用 origin 字典序裁决，保证所有节点裁决结果一致
+  return String(origin || '') > String(clipboardSyncState.origin || '')
+}
+
+function rememberClipVersion(ts, origin, text) {
+  clipboardSyncState = { ts, origin: String(origin || ''), hash: hashClipText(text) }
+  savePairingKey()
+}
+
+function normalizeClipboardSyncState(saved = {}) {
+  return {
+    ts: Number(saved.ts) || 0,
+    origin: String(saved.origin || ''),
+    hash: String(saved.hash || '')
+  }
+}
 
 function startClipboardSyncWatcher() {
   if (clipboardWatchTimer) return
@@ -2616,56 +2647,77 @@ function pollClipboardForSync() {
   }
   if (text === lastClipboardText) return
   lastClipboardText = text
-  // 这次变化是远端同步写入造成的，吞掉一次，不再回推
-  if (suppressClipboardText !== null && text === suppressClipboardText) {
-    suppressClipboardText = null
-    return
-  }
   if (!text || text.length > CLIPBOARD_MAX_LENGTH) return
+  // 与已知版本内容相同（远端同步刚写入的内容 / 重复复制同一内容）→ 不产生新版本
+  if (hashClipText(text) === clipboardSyncState.hash) return
+  // 本机新复制：产生新版本并广播
+  rememberClipVersion(Date.now(), getDesktopIdentity().id, text)
   broadcastClipboardToNodes(text)
 }
 
-// 把本机剪贴板内容推送给已配对节点。
+// 把一条剪贴板状态推送给已配对节点（本机新复制的广播与收到后的 gossip 扩散共用）。
 // 投递通道按对端类型分流：
 //   - 手机节点：走 relay HTTP（端口 19529 的 NodeReceiverService）。手机的 WS 客户端
 //     不处理入站 verify_code，且按需模型下平时不连桌面，relay HTTP 才是手机的收件入口。
-//   - 桌面对端：走已建立的 WS 连接发 verify_code（对端 WS 服务器会交给 handleVerifyCode）。
-function broadcastClipboardToNodes(text) {
+//   - 桌面对端：走已建立的 WS 连接发 verify_code。
+// options：{ ts, origin, originDeviceName, relayPath, exclude } —— gossip 时保留
+// 原始版本与来源，不重新署名；不传则视为本机新复制（用当前 clipboardSyncState）。
+function broadcastClipboardToNodes(text, options = {}) {
   const identity = getDesktopIdentity()
+  const clipTs = Number(options.ts) || clipboardSyncState.ts || Date.now()
+  const clipOrigin = String(options.origin || clipboardSyncState.origin || identity.id)
+  const originDeviceName = String(options.originDeviceName || (clipOrigin === identity.id ? identity.name : clipOrigin))
+  const relayPath = Array.from(new Set(
+    (Array.isArray(options.relayPath) ? options.relayPath.map(String) : []).concat(identity.id)
+  ))
+  const exclude = options.exclude instanceof Set ? options.exclude : new Set()
+  relayPath.forEach(id => exclude.add(id))
+  exclude.add(clipOrigin)
+
   const targetPhones = getAuthorizedPhones().filter(phone =>
     phone.enabled !== false &&
     phone.revoked !== true &&
+    !exclude.has(phone.id) &&
     canPushContentToNode(phone, CODE_TYPES.CLIPBOARD) &&
     phone.pairingKey &&
     (phone.lastIP || phone.host)
   )
+  // 桌面对端没有 per-device 剪贴板策略 UI（allowClipboard 恒为默认 false，
+  // 旧实现查它导致桌面间剪贴板永远不发——死代码）。桌面间是对等互信关系，
+  // 改为只受两端总开关控制：本端开了才会走到这里，对端有自己的接收开关把关。
   const targetDesktopPeerIds = new Set(
-    Array.from(activeDesktopPeerConnections.keys())
-      .filter(peerId => canPushContentToNode(pairedDesktopPeers.get(peerId), CODE_TYPES.CLIPBOARD))
+    Array.from(activeDesktopPeerConnections.keys()).filter(peerId => {
+      if (exclude.has(peerId)) return false
+      const peer = pairedDesktopPeers.get(peerId)
+      return !!peer && peer.enabled !== false
+    })
   )
   const targetDeviceIds = [
     ...targetPhones.map(phone => phone.id),
     ...Array.from(targetDesktopPeerIds)
   ]
-  const originMessageId = `clipboard-${identity.id}-${Date.now()}`
+  if (targetDeviceIds.length === 0) return
+  // originMessageId 与版本绑定：同一版本经多条路径/多次补推到达同一节点时，
+  // 接收端用既有去重表（手机 markRelayMessageSeen / 桌面 recentDeliveryKeys）
+  // 即可收敛为一次处理，LWW 版本比较是第二道语义防线
+  const originMessageId = `clip-${clipOrigin}-${clipTs}`
   const basePayload = {
     type: CODE_TYPES.CLIPBOARD,
     code: '',
     source: '剪贴板',
     rawMessage: text,
-    timestamp: Date.now(),
-    phoneId: identity.id,
-    phoneName: identity.name,
-    sourceDeviceId: identity.id,
-    sourceDeviceName: identity.name,
-    sourceDeviceType: identity.type,
-    originDeviceId: identity.id,
-    originDeviceName: identity.name,
+    timestamp: clipTs,
+    phoneId: clipOrigin,
+    phoneName: originDeviceName,
+    sourceDeviceId: clipOrigin,
+    sourceDeviceName: originDeviceName,
+    sourceDeviceType: clipOrigin === identity.id ? identity.type : 'UNKNOWN_DEVICE',
+    originDeviceId: clipOrigin,
+    originDeviceName,
     originMessageId,
     relayMessageId: originMessageId,
-    relayPath: [identity.id],
-    // 开启多跳续传：收到的节点（手机/桌面）会把剪贴板续传给目标列表里
-    // 本机直投不到的节点，originMessageId 去重保证每个节点只消费一次
+    clipVersion: { ts: clipTs, origin: clipOrigin },
+    relayPath,
     relayTtl: USER_MESSAGE_RELAY_TTL,
     targetDeviceIds
   }
@@ -2681,7 +2733,7 @@ function broadcastClipboardToNodes(text) {
     const encrypted = encryptMessage(peerPayloadPlain, sessionKey)
     if (!encrypted) continue
     try {
-      ws.send(JSON.stringify({ type: 'verify_code', msgId: basePayload.relayMessageId, payload: encrypted }))
+      ws.send(JSON.stringify({ type: 'verify_code', msgId: originMessageId, payload: encrypted }))
       delivered += 1
     } catch (e) {
       console.error('剪贴板同步到桌面对端失败:', e)
@@ -2698,7 +2750,107 @@ function broadcastClipboardToNodes(text) {
   }
 
   if (delivered > 0 || targetPhones.length > 0) {
-    console.log(`剪贴板已同步：桌面对端 ${delivered}，手机 ${targetPhones.length}`)
+    console.log(`剪贴板已同步 v${clipTs}：桌面对端 ${delivered}，手机 ${targetPhones.length}`)
+  }
+}
+
+// ===== 剪贴板 LWW 应用 / gossip / 上线补推 =====
+
+// 应用一条远端剪贴板（LWW）：仅当版本比已应用版本新、且内容确实不同才写入。
+// 返回 true 表示本机状态前进了，调用方据此把该状态继续 gossip 给本机邻居。
+function applyRemoteClipboard(codeInfo, codeData) {
+  const text = codeInfo.rawMessage || ''
+  if (!text || text.length > CLIPBOARD_MAX_LENGTH) return false
+  const version = (codeData && codeData.clipVersion) || {}
+  // 旧版负载无 clipVersion：退化用消息时间戳参与排序，保持互通
+  const ts = Number(version.ts) || Number(codeInfo.timestamp) || 0
+  const origin = String(version.origin || codeInfo.originDeviceId || codeInfo.sourceDeviceId || '')
+  if (hashClipText(text) === clipboardSyncState.hash) return false
+  if (!isNewerClipVersion(ts, origin)) return false
+  rememberClipVersion(ts, origin, text)
+  // 先同步本地快照再写剪贴板，防 900ms 轮询把这次远端写入当成本机新复制
+  lastClipboardText = text
+  clipboard.writeText(text)
+  showCodeBubble(codeInfo)
+  showNotification('📋 剪贴板同步', `${text.slice(0, 80)}\n来源设备: ${codeInfo.sourceDeviceName}`)
+  return true
+}
+
+// 应用成功后把同一状态（保留原始版本与来源）扩散给本机授权邻居。
+// 每个节点对同一版本最多应用一次 → 最多 gossip 一次，全网收敛必然终止；
+// 传播范围是剪贴板授权图的连通分量，不再受限于源设备直接认识的节点。
+function gossipClipboardState(codeData) {
+  const text = codeData.rawMessage || ''
+  if (!text) return
+  const version = codeData.clipVersion || {}
+  broadcastClipboardToNodes(text, {
+    ts: Number(version.ts) || Number(codeData.timestamp) || clipboardSyncState.ts,
+    origin: String(version.origin || codeData.originDeviceId || ''),
+    originDeviceName: codeData.originDeviceName || codeData.sourceDeviceName || '',
+    relayPath: Array.isArray(codeData.relayPath) ? codeData.relayPath : [],
+    exclude: new Set(
+      [String(codeData.lastHopDeviceId || ''), String(codeData.lastRelayDeviceId || '')].filter(Boolean)
+    )
+  })
+}
+
+// 上线补推：节点（重新）连上的那一刻把本机当前剪贴板状态推一次。
+// 剪贴板只有一个值，离线期间错过的消息无需补队列，补「最新版本」即可最终一致；
+// 推过去的若是旧版本，对端 LWW 会丢弃。只推已版本化的内容（哈希对得上），
+// 避免把启动前就躺在剪贴板里的陈年内容打上新时间戳扩散出去。
+function buildClipboardStatePushPayload(targetIds) {
+  if (desktopMessageSettings.syncClipboard !== true) return null
+  if (!clipboardSyncState.ts) return null
+  let text = ''
+  try {
+    text = clipboard.readText() || ''
+  } catch (_) {
+    return null
+  }
+  if (!text || text.length > CLIPBOARD_MAX_LENGTH) return null
+  if (hashClipText(text) !== clipboardSyncState.hash) return null
+  const identity = getDesktopIdentity()
+  const originMessageId = `clip-${clipboardSyncState.origin}-${clipboardSyncState.ts}`
+  return {
+    type: CODE_TYPES.CLIPBOARD,
+    code: '',
+    source: '剪贴板',
+    rawMessage: text,
+    timestamp: clipboardSyncState.ts,
+    phoneId: clipboardSyncState.origin,
+    phoneName: identity.name,
+    sourceDeviceId: clipboardSyncState.origin,
+    sourceDeviceName: identity.name,
+    sourceDeviceType: identity.type,
+    originDeviceId: clipboardSyncState.origin,
+    originDeviceName: identity.name,
+    originMessageId,
+    relayMessageId: originMessageId,
+    clipVersion: { ts: clipboardSyncState.ts, origin: clipboardSyncState.origin },
+    relayPath: [identity.id],
+    relayTtl: USER_MESSAGE_RELAY_TTL,
+    targetDeviceIds: targetIds
+  }
+}
+
+function pushClipboardStateToPhone(phone) {
+  if (!phone || !canPushContentToNode(phone, CODE_TYPES.CLIPBOARD)) return
+  if (!phone.pairingKey || !(phone.lastIP || phone.host)) return
+  const payload = buildClipboardStatePushPayload([phone.id])
+  if (!payload) return
+  sendRelayEnvelopeToPhone(phone, payload).catch(() => {})
+}
+
+function pushClipboardStateToDesktopPeer(ws, sessionKey, peerId) {
+  if (!ws || ws.readyState !== WebSocket.OPEN || !sessionKey) return
+  const payload = buildClipboardStatePushPayload([peerId])
+  if (!payload) return
+  const encrypted = encryptMessage(JSON.stringify(payload), sessionKey)
+  if (!encrypted) return
+  try {
+    ws.send(JSON.stringify({ type: 'verify_code', msgId: payload.originMessageId, payload: encrypted }))
+  } catch (e) {
+    console.error('补推剪贴板状态到桌面对端失败:', e)
   }
 }
 
@@ -2887,6 +3039,8 @@ function connectDesktopPeer(peer, options = {}) {
         savePairingKey()
         notifyDesktopPeersChanged()
         sendLocalTotpSeedsToDesktopPeer(ws, sessionKey, peer)
+        // 对端（重新）连上时补推本机当前剪贴板状态（LWW 防旧盖新）
+        pushClipboardStateToDesktopPeer(ws, sessionKey, peer.id)
         sendEncryptedControlMessage(ws, sessionKey, 'topology_delta', buildTopologyDelta('desktop_peer_auth'))
         return
       }
@@ -3681,6 +3835,13 @@ function startWebSocketServer() {
             sendEncryptedControlMessage(ws, connectionSessionKey, 'topology_delta', buildTopologyDelta('auth_ok'))
             // 鉴权成功的一刻顺带把本机 TOTP 种子下发给手机（一次性同步，零额外耗电）
             sendLocalTotpSeedsToPhone(ws, connectionSessionKey, phone.id)
+            // 上线补推当前剪贴板状态：离线期间错过的值靠这里补齐（LWW 防旧盖新）。
+            // 入站桌面对端走 WS（其客户端已处理 verify_code），手机走 relay HTTP
+            if (String(phone.deviceType || '').includes('DESKTOP')) {
+              pushClipboardStateToDesktopPeer(ws, connectionSessionKey, phone.id)
+            } else {
+              pushClipboardStateToPhone(phone)
+            }
           } else {
             ws.send(JSON.stringify({ type: 'auth_fail' }))
             ws.close()
@@ -3905,15 +4066,9 @@ function handleVerifyCode(codeData) {
     showCodeBubble(codeInfo)
     showNotification(`🔔 ${codeInfo.appName || '新通知'}`, `${titleText}\n${bodyText}\n来源设备: ${codeInfo.sourceDeviceName}`)
   } else if (codeInfo.type === CODE_TYPES.CLIPBOARD) {
-    const text = codeInfo.rawMessage || ''
-    if (text) {
-      // 回环抑制：先记下即将写入的文本，轮询检测到剪贴板变成这个值时跳过回推，
-      // 同步更新 lastClipboardText 以防轮询把它当成本机新变化二次广播
-      suppressClipboardText = text
-      lastClipboardText = text
-      clipboard.writeText(text)
-      showCodeBubble(codeInfo)
-      showNotification('📋 剪贴板同步', `${text.slice(0, 80)}\n来源设备: ${codeInfo.sourceDeviceName}`)
+    // LWW 应用；状态前进时把同一版本继续 gossip 给本机授权邻居（见剪贴板同步小节）
+    if (applyRemoteClipboard(codeInfo, codeData)) {
+      gossipClipboardState(codeData)
     }
   }
 }

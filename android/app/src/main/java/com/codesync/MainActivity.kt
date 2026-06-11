@@ -37,6 +37,7 @@ import com.codesync.service.WebSocketService
 import com.codesync.util.DesktopDevice
 import com.codesync.util.DeviceStore
 import com.codesync.util.ApkUpdater
+import com.codesync.util.ClipboardSyncState
 import com.codesync.util.GoogleAuthMigrationParser
 import com.codesync.util.LanDiscoveredDevice
 import com.codesync.util.LanDiscovery
@@ -163,6 +164,28 @@ class MainActivity : AppCompatActivity() {
             if (ApkUpdater.canInstallPackages(this)) {
                 startUpdateDownload(info)
             }
+        }
+    }
+
+    // 回前台时自动同步剪贴板：Android 10+ 仅前台焦点应用可读剪贴板，这是
+    // 「手机→其它节点」方向能做到的最自动的时机——用户复制后切回本应用即同步。
+    // 内容与已同步版本相同时静默跳过（对话框开关引起的焦点抖动也会走到这里，
+    // 哈希比较保证幂等，开销可忽略）。
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) maybeAutoSyncClipboard()
+    }
+
+    private fun maybeAutoSyncClipboard() {
+        if (!SettingsStore.isSyncClipboardEnabled(this)) return
+        if (DeviceStore.getEnabledDevices(this).none { it.allowClipboard }) return
+        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+        val text = clipboard.primaryClip?.takeIf { it.itemCount > 0 }
+            ?.getItemAt(0)?.coerceToText(this)?.toString()?.trim().orEmpty()
+        if (text.isBlank() || text.length > 20000) return
+        if (ClipboardSyncState.hash(text) == ClipboardSyncState.appliedHash(this)) return
+        startServiceForAction(WebSocketService.ACTION_SEND_CLIPBOARD) {
+            putExtra(WebSocketService.EXTRA_MESSAGE_BODY, text)
         }
     }
 

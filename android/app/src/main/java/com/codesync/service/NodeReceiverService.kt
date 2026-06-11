@@ -13,7 +13,9 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.codesync.MainActivity
 import com.codesync.R
+import com.codesync.util.ClipboardSyncState
 import com.codesync.util.CryptoUtil
+import com.codesync.util.DeviceStore
 import com.codesync.util.LanDiscovery
 import com.codesync.util.PhoneIdentityStore
 import com.codesync.util.SettingsStore
@@ -227,12 +229,20 @@ class NodeReceiverService : Service() {
         } else if (isUserMessagePayload(payloadType)) {
             val sourceName = payload.optString("sourceDeviceName", payload.optString("phoneName", "未知设备"))
             if (SettingsStore.shouldReceiveContent(this, payloadType)) {
-                // 剪贴板：写入本机系统剪贴板（写入不受 Android 10+ 后台限制）
                 if (payloadType == "clipboard") {
-                    writeClipboard(payload.optString("rawMessage"))
+                    // LWW：仅当版本比已应用版本新且内容不同才写入与提示，
+                    // 旧值/重复/回环副本静默丢弃。应用成功后把目标列表改写为
+                    // 本机的剪贴板授权邻居（gossip 再扩散），传播范围由
+                    // 「源设备直接认识的节点」扩大为授权图的连通分量
+                    if (applyRemoteClipboard(payload)) {
+                        notifyUserMessageRelay(payload)
+                        WebSocketService.reportExternalStatus(this, receivedStatusMessage(payloadType, sourceName))
+                        rewriteClipboardGossipTargets(payload)
+                    }
+                } else {
+                    notifyUserMessageRelay(payload)
+                    WebSocketService.reportExternalStatus(this, receivedStatusMessage(payloadType, sourceName))
                 }
-                notifyUserMessageRelay(payload)
-                WebSocketService.reportExternalStatus(this, receivedStatusMessage(payloadType, sourceName))
             } else {
                 Log.d(TAG, "本机接收策略已关闭 $payloadType，跳过本机显示但保留中继")
             }
@@ -436,6 +446,44 @@ class NodeReceiverService : Service() {
         }.onFailure {
             Log.w(TAG, "写入剪贴板失败: ${it.message}")
         }
+    }
+
+    /**
+     * LWW 应用远端剪贴板：仅当版本比已应用版本新、且内容确实不同才写入。
+     * 返回 true 表示本机状态前进（调用方据此继续 gossip 扩散）。
+     */
+    private fun applyRemoteClipboard(payload: JSONObject): Boolean {
+        val text = payload.optString("rawMessage")
+        if (text.isBlank()) return false
+        val version = payload.optJSONObject("clipVersion")
+        // 旧版负载无 clipVersion：退化用消息时间戳参与排序，保持互通
+        val ts = (version?.optLong("ts", 0L) ?: 0L).takeIf { it > 0L }
+            ?: payload.optLong("timestamp", 0L)
+        val origin = version?.optString("origin").orEmpty()
+            .ifBlank { payload.optString("originDeviceId", payload.optString("sourceDeviceId")) }
+        if (ClipboardSyncState.hash(text) == ClipboardSyncState.appliedHash(this)) return false
+        if (!ClipboardSyncState.isNewer(this, ts, origin)) {
+            Log.d(TAG, "剪贴板 LWW：丢弃过期版本 ts=$ts")
+            return false
+        }
+        writeClipboard(text)
+        ClipboardSyncState.remember(this, ts, origin, text)
+        return true
+    }
+
+    /**
+     * gossip 改写：incoming 的目标列表是上一跳的授权集，应用成功后换成本机的
+     * 剪贴板授权设备，并刷新 TTL，随后的 ACTION_RELAY_SMS 续传据此把状态扩散给
+     * 上一跳不认识的节点。刷新 TTL 是安全的：LWW 保证每个节点对同一版本最多
+     * 应用/扩散一次，洪泛必然收敛。
+     */
+    private fun rewriteClipboardGossipTargets(payload: JSONObject) {
+        val targets = DeviceStore.getEnabledDevices(this)
+            .filter { it.allowClipboard }
+            .map { it.id }
+        if (targets.isEmpty()) return
+        payload.put("targetDeviceIds", JSONArray(targets))
+        payload.put("relayTtl", 4)
     }
 
     private fun writeHttpResponse(socket: Socket, code: Int) {

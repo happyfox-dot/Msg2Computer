@@ -14,6 +14,7 @@ import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.codesync.MainActivity
+import com.codesync.util.ClipboardSyncState
 import com.codesync.util.CryptoUtil
 import com.codesync.util.DesktopDevice
 import com.codesync.util.DeviceStore
@@ -279,12 +280,29 @@ class WebSocketService : Service() {
             return
         }
         holdForwardLocks()
+        // 剪贴板 LWW 版本：内容与已应用版本相同 → 复用现有版本（等于把当前状态
+        // 重新推一遍，接收端按版本去重/丢弃，天然幂等）；新内容 → 产生新版本
+        val identity = PhoneIdentityStore.get(this)
+        val clipTs: Long
+        val clipOrigin: String
+        if (ClipboardSyncState.hash(text) == ClipboardSyncState.appliedHash(this) &&
+            ClipboardSyncState.appliedTs(this) > 0L
+        ) {
+            clipTs = ClipboardSyncState.appliedTs(this)
+            clipOrigin = ClipboardSyncState.appliedOrigin(this).ifBlank { identity.id }
+        } else {
+            clipTs = System.currentTimeMillis()
+            clipOrigin = identity.id
+            ClipboardSyncState.remember(this, clipTs, clipOrigin, text)
+        }
         enqueueAndDeliver(
             code = "",
             source = "剪贴板",
             type = "clipboard",
             label = "剪贴板",
-            rawMessage = text
+            rawMessage = text,
+            clipVersionTs = clipTs,
+            clipVersionOrigin = clipOrigin
         )
     }
 
@@ -406,7 +424,9 @@ class WebSocketService : Service() {
         rawMessage: String? = null,
         title: String? = null,
         appName: String? = null,
-        packageName: String? = null
+        packageName: String? = null,
+        clipVersionTs: Long = 0L,
+        clipVersionOrigin: String = ""
     ) {
         val targetDevices = targetDevicesForType(type)
         if (targetDevices.isEmpty()) {
@@ -419,7 +439,13 @@ class WebSocketService : Service() {
         val phoneIdentity = PhoneIdentityStore.get(this)
         val targetTopology = buildTargetTopology(targetDevices)
         val msgId = "m-${phoneIdentity.id}-${System.currentTimeMillis()}-${msgIdSeq.incrementAndGet()}"
-        val originMessageId = msgId
+        // 剪贴板：originMessageId 与 LWW 版本绑定（clip-<origin>-<ts>），同一版本经
+        // 多条路径/重复推送到达同一节点时，接收端用既有去重表即可收敛为一次处理
+        val originMessageId = if (type == "clipboard" && clipVersionTs > 0L) {
+            "clip-$clipVersionOrigin-$clipVersionTs"
+        } else {
+            msgId
+        }
         val relayMessageId = originMessageId
         val payload = JSONObject()
             .put("code", code)
@@ -437,13 +463,19 @@ class WebSocketService : Service() {
             .put("pushAuthorityDeviceId", phoneIdentity.id)
             .apply {
                 if (isUserMessageType(type)) {
-                    put("originDeviceId", phoneIdentity.id)
+                    put("originDeviceId", if (type == "clipboard" && clipVersionOrigin.isNotBlank()) clipVersionOrigin else phoneIdentity.id)
                     put("originDeviceName", phoneIdentity.name)
                     put("originMessageId", originMessageId)
                     put("relayMessageId", relayMessageId)
                     put("relayPath", JSONArray().put(phoneIdentity.id))
                     put("relayTtl", SMS_RELAY_TTL)
                     put("relayPolicy", "source_selected_targets")
+                }
+                if (type == "clipboard" && clipVersionTs > 0L) {
+                    put(
+                        "clipVersion",
+                        JSONObject().put("ts", clipVersionTs).put("origin", clipVersionOrigin)
+                    )
                 }
                 if (label != null) put("label", label)
                 if (!rawMessage.isNullOrBlank()) put("rawMessage", rawMessage)
