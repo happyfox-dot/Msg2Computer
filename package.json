@@ -1,0 +1,13 @@
+{
+  "name": "code-sync-desktop",
+  "version": "1.0.26",
+  "description": "跨设备验证码同步工具 - 桌面端",
+  "main": "main.js",
+  "dependencies": {
+    "canvas": "^3.2.3",
+    "jsqr": "^1.4.0",
+    "qrcode": "^1.5.3",
+    "qrcode-decoder": "^0.3.4",
+    "ws": "^8.16.0"
+  }
+}
