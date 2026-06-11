@@ -1,5 +1,6 @@
 package com.codesync.util
 
+import android.net.Uri
 import android.util.Base64
 import java.nio.ByteBuffer
 
@@ -38,18 +39,7 @@ object GoogleAuthMigrationParser {
      * 从 URI 中提取 data 参数
      */
     private fun extractDataParam(uri: String): String? {
-        val dataPrefix = "data="
-        val startIndex = uri.indexOf(dataPrefix)
-        if (startIndex == -1) return null
-
-        val dataStart = startIndex + dataPrefix.length
-        val endIndex = uri.indexOf('&', dataStart)
-
-        return if (endIndex == -1) {
-            uri.substring(dataStart)
-        } else {
-            uri.substring(dataStart, endIndex)
-        }
+        return Uri.parse(uri).getQueryParameter("data")
     }
 
     /**

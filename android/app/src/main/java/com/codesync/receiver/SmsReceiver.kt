@@ -31,31 +31,48 @@ class SmsReceiver : BroadcastReceiver() {
         Log.d(TAG, "收到短信来自 $sender: ${body.take(60)}...")
 
         val code = CodeExtractor.extract(body)
-        if (code == null) {
-            Log.d(TAG, "收到短信但未识别到验证码")
-            WebSocketService.reportExternalStatus(context, "收到短信，但未识别到验证码：$sender")
+        val sendSmsCode = code != null && SettingsStore.isForwardingEnabled(context)
+        val sendAllSms = SettingsStore.isSendAllSmsEnabled(context)
+        val contentType = when {
+            sendSmsCode -> "sms"
+            sendAllSms -> "sms_message"
+            else -> ""
+        }
+        val enabledDevices = DeviceStore.getEnabledDevices(context)
+        Log.d(
+            TAG,
+            "短信转发检查: smsCode=$sendSmsCode, allSms=$sendAllSms, type=$contentType, targets=${enabledDevices.size}, " +
+                enabledDevices.joinToString { "${it.name}/${it.type}/${it.host}:${it.port}" }
+        )
+
+        if (contentType.isBlank()) {
+            Log.d(TAG, "当前策略不推送这条短信")
+            WebSocketService.reportExternalStatus(
+                context,
+                if (code == null) "收到短信，但未开启全部短信推送：$sender" else "收到验证码，但验证码短信推送已关闭：$sender"
+            )
+            return
+        }
+        if (enabledDevices.isEmpty()) {
+            Log.d(TAG, "无启用的推送目标，跳过推送")
+            WebSocketService.reportExternalStatus(context, "收到短信，但未启用任何推送目标：$sender")
             return
         }
 
-        Log.d(TAG, "提取到验证码: $code")
-
-        // 按需模型前置检查：转发开关关闭、或没有启用的电脑目标，就不唤起服务（省电）
-        if (!SettingsStore.isForwardingEnabled(context)) {
-            Log.d(TAG, "短信转发已关闭，跳过推送")
-            return
-        }
-        if (DeviceStore.getEnabledDevices(context).isEmpty()) {
-            Log.d(TAG, "无启用的电脑目标，跳过推送")
-            WebSocketService.reportExternalStatus(context, "收到验证码，但未启用任何电脑：$sender")
-            return
-        }
-
-        WebSocketService.reportExternalStatus(context, "收到短信验证码，准备同步：$sender")
+        WebSocketService.reportExternalStatus(
+            context,
+            if (contentType == "sms") {
+                "收到短信验证码，准备同步到 ${enabledDevices.size} 个目标：$sender"
+            } else {
+                "收到短信，准备同步到 ${enabledDevices.size} 个目标：$sender"
+            }
+        )
         holdReceiverWakeLock(context)
 
         val serviceIntent = Intent(context, WebSocketService::class.java).apply {
             action = WebSocketService.ACTION_SEND_SMS
-            putExtra(WebSocketService.EXTRA_CODE, code)
+            putExtra(WebSocketService.EXTRA_CONTENT_TYPE, contentType)
+            if (!code.isNullOrBlank()) putExtra(WebSocketService.EXTRA_CODE, code)
             putExtra(WebSocketService.EXTRA_SOURCE, sender)
             putExtra(WebSocketService.EXTRA_MESSAGE_BODY, body)
         }

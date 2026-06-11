@@ -8,6 +8,8 @@ import androidx.appcompat.app.AppCompatActivity
 import com.codesync.service.WebSocketService
 import com.codesync.util.DeviceStore
 import com.codesync.util.GoogleAuthMigrationParser
+import com.codesync.util.PhoneIdentityStore
+import com.codesync.util.TopologyStore
 import com.codesync.util.TotpEntry
 import com.codesync.util.TotpStore
 import com.codesync.util.TotpUtil
@@ -30,7 +32,7 @@ class QRScannerActivity : AppCompatActivity() {
         val prompt = if (intent.getBooleanExtra(EXTRA_SCAN_TOTP_ONLY, false)) {
             "扫描 TOTP 二维码\n（支持标准 TOTP 和 Google Authenticator 批量导出）"
         } else {
-            "扫描电脑配对二维码或 TOTP 二维码"
+            "扫描设备配对二维码或 TOTP 二维码"
         }
 
         val options = ScanOptions().apply {
@@ -71,6 +73,10 @@ class QRScannerActivity : AppCompatActivity() {
             val port = json.optInt("port", 19527)
             val pairingKey = json.optString("pk", "")
             val deviceName = json.optString("name", "Desktop $host:$port")
+            val deviceId = json.optString("id", json.optString("deviceId", ""))
+            val deviceType = json.optString("type", json.optString("deviceType", "WINDOWS_DESKTOP"))
+            // 桌面端二维码可携带其 Tailscale IP，作为主地址连不通时的备用地址
+            val tsHost = json.optString("tsHost", "").trim()
 
             if (host.isEmpty() || pairingKey.isEmpty()) {
                 Toast.makeText(this, "无效的二维码", Toast.LENGTH_SHORT).show()
@@ -82,18 +88,28 @@ class QRScannerActivity : AppCompatActivity() {
                 host = host,
                 port = port,
                 pairingKey = pairingKey,
-                name = deviceName
+                name = deviceName,
+                deviceId = deviceId,
+                deviceType = deviceType,
+                altHosts = if (tsHost.isNotEmpty()) listOf(tsHost) else emptyList()
             )
+            TopologyStore.markDeviceState(this, device, enabled = device.enabled)
 
             val serviceIntent = Intent(this, WebSocketService::class.java).apply {
                 action = WebSocketService.ACTION_CONNECT
                 putExtra(WebSocketService.EXTRA_DEVICE_ID, device.id)
             }
+            val topologyIntent = Intent(this, WebSocketService::class.java).apply {
+                action = WebSocketService.ACTION_BROADCAST_TOPOLOGY
+                putExtra(WebSocketService.EXTRA_TOPOLOGY_REASON, "qr_pairing")
+            }
 
             if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
                 startForegroundService(serviceIntent)
+                startForegroundService(topologyIntent)
             } else {
                 startService(serviceIntent)
+                startService(topologyIntent)
             }
 
             Toast.makeText(this, "正在连接 ${host}:${port}...", Toast.LENGTH_SHORT).show()
@@ -238,6 +254,7 @@ class QRScannerActivity : AppCompatActivity() {
         digits: Int = 6,
         period: Int = 30
     ) {
+        val identity = PhoneIdentityStore.get(this)
         val entry = TotpEntry(
             label = label,
             secret = secret,
@@ -245,7 +262,11 @@ class QRScannerActivity : AppCompatActivity() {
             accountName = accountName,
             algorithm = algorithm,
             digits = digits,
-            period = period
+            period = period,
+            sourceDeviceId = identity.id,
+            sourceDeviceName = identity.name,
+            sourceDeviceType = "ANDROID_PHONE",
+            isLocal = true
         )
         TotpStore.add(this, entry)
     }

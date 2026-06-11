@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- 单台电脑（推送目标）行 -->
+<!-- 单个设备节点（推送目标）行 -->
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools"
     android:layout_width="match_parent"
@@ -33,7 +33,7 @@
             android:textStyle="bold"
             android:maxLines="1"
             android:ellipsize="end"
-            tools:text="我的电脑" />
+            tools:text="我的设备节点" />
 
         <TextView
             android:id="@+id/deviceAddress"

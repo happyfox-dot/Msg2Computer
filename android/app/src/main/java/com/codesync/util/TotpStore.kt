@@ -12,7 +12,9 @@ import androidx.security.crypto.MasterKey
 object TotpStore {
     private const val PREFS_NAME = "totp_secrets_encrypted"
     private const val KEY_ENTRIES = "entries"
+    private const val KEY_DELETE_TOMBSTONES = "delete_tombstones"
     private const val LEGACY_PREFS_NAME = "totp_secrets"
+    private const val MAX_DELETE_TOMBSTONES = 300
 
     private var encryptedPrefs: SharedPreferences? = null
 
@@ -45,7 +47,7 @@ object TotpStore {
 
         if (legacyEntries.isNotEmpty()) {
             val migratedEntries = legacyEntries.mapNotNull { entry ->
-                TotpEntry.fromLegacyString(entry)
+                TotpEntry.fromLegacyString(entry)?.withStableId()
             }
             saveAll(context, migratedEntries)
         }
@@ -66,8 +68,11 @@ object TotpStore {
         val jsonSet = prefs.getStringSet(KEY_ENTRIES, emptySet()) ?: emptySet()
 
         return jsonSet.mapNotNull { json ->
-            TotpEntry.fromJson(json)
-        }.sortedBy { it.label.lowercase() }
+            TotpEntry.fromJson(json)?.withStableId()
+        }.sortedWith(
+            compareByDescending<TotpEntry> { it.pinnedAt }
+                .thenBy { it.label.lowercase() }
+        )
     }
 
     /**
@@ -75,7 +80,7 @@ object TotpStore {
      */
     private fun saveAll(context: Context, entries: List<TotpEntry>) {
         val prefs = getEncryptedPrefs(context)
-        val jsonSet = entries.map { it.toJson() }.toSet()
+        val jsonSet = entries.map { it.withStableId().toJson() }.toSet()
         prefs.edit().putStringSet(KEY_ENTRIES, jsonSet).apply()
     }
 
@@ -83,11 +88,20 @@ object TotpStore {
      * 添加单个 TOTP 条目
      */
     fun add(context: Context, entry: TotpEntry) {
+        val normalized = entry.withStableId()
         val entries = loadAll(context).toMutableList()
-        // 去重：相同 label 的只保留最新的
-        entries.removeAll { it.label == entry.label }
-        entries.add(entry)
+        val existing = entries.firstOrNull { it.id == normalized.id }
+        val merged = if (existing != null && normalized.pinnedAt == 0L) {
+            normalized.copy(pinnedAt = existing.pinnedAt)
+        } else {
+            normalized
+        }
+        entries.removeAll { it.id == normalized.id }
+        entries.add(merged)
         saveAll(context, entries)
+        if (merged.isLocal) {
+            removeDeleteTombstone(context, merged)
+        }
     }
 
     /**
@@ -96,6 +110,58 @@ object TotpStore {
     fun remove(context: Context, label: String) {
         val entries = loadAll(context).filter { it.label != label }
         saveAll(context, entries)
+    }
+
+    fun removeById(context: Context, id: String) {
+        val entries = loadAll(context).filter { it.id != id }
+        saveAll(context, entries)
+    }
+
+    fun setPinned(context: Context, id: String, pinned: Boolean) {
+        val now = System.currentTimeMillis()
+        val entries = loadAll(context).map {
+            if (it.id == id) it.copy(pinnedAt = if (pinned) now else 0L) else it
+        }
+        saveAll(context, entries)
+    }
+
+    fun loadDeleteTombstones(context: Context): List<TotpEntry> {
+        migrateFromLegacy(context)
+
+        val prefs = getEncryptedPrefs(context)
+        val jsonSet = prefs.getStringSet(KEY_DELETE_TOMBSTONES, emptySet()) ?: emptySet()
+
+        return jsonSet.mapNotNull { json ->
+            TotpEntry.fromJson(json)?.withStableId()
+        }
+    }
+
+    private fun saveDeleteTombstones(context: Context, entries: List<TotpEntry>) {
+        val prefs = getEncryptedPrefs(context)
+        val jsonSet = entries.takeLast(MAX_DELETE_TOMBSTONES)
+            .map { it.withStableId().toJson() }
+            .toSet()
+        prefs.edit().putStringSet(KEY_DELETE_TOMBSTONES, jsonSet).apply()
+    }
+
+    fun addDeleteTombstone(context: Context, entry: TotpEntry) {
+        val normalized = entry.withStableId()
+        val entries = loadDeleteTombstones(context).toMutableList()
+        entries.removeAll {
+            it.id == normalized.id &&
+                it.sourceDeviceId == normalized.sourceDeviceId
+        }
+        entries.add(normalized)
+        saveDeleteTombstones(context, entries)
+    }
+
+    fun removeDeleteTombstone(context: Context, entry: TotpEntry) {
+        val normalized = entry.withStableId()
+        val entries = loadDeleteTombstones(context).filterNot {
+            it.id == normalized.id &&
+                it.sourceDeviceId == normalized.sourceDeviceId
+        }
+        saveDeleteTombstones(context, entries)
     }
 
     /**

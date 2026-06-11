@@ -1,0 +1,353 @@
+package com.codesync.util
+
+import android.content.Context
+import org.json.JSONArray
+import org.json.JSONObject
+import java.util.Locale
+
+object TopologyStore {
+    private const val PREFS_NAME = "topology_lsdb"
+    private const val KEY_NODES = "nodes"
+    private const val KEY_LINKS = "links"
+    private const val KEY_SEEN_SEQ = "seen_seq"
+    private const val ENTRY_TTL_MS = 24 * 60 * 60 * 1000L
+    private const val DEFAULT_DELTA_TTL = 4
+
+    fun applyDelta(context: Context, rawDelta: JSONObject): Boolean {
+        val delta = normalizeDelta(rawDelta)
+        if (delta.optString("type") != "topology_delta") return false
+
+        val identity = PhoneIdentityStore.get(context)
+        val sourceId = delta.optString("sourceDeviceId", delta.optString("originDeviceId")).trim()
+        val seq = delta.optLong("seq", 0L)
+        if (sourceId.isNotBlank() && sourceId != identity.id && seq > 0L) {
+            val seen = loadSeenSeq(context)
+            val lastSeq = seen.optLong(sourceId, 0L)
+            if (seq <= lastSeq) return false
+            seen.put(sourceId, seq)
+            saveSeenSeq(context, seen)
+        }
+
+        var changed = false
+        val nodes = loadArray(context, KEY_NODES)
+        val links = loadArray(context, KEY_LINKS)
+        val nodesById = toObjectMap(nodes, "id")
+        val linksById = toObjectMap(links, "id")
+
+        val incomingNodes = delta.optJSONArray("nodes") ?: JSONArray()
+        for (i in 0 until incomingNodes.length()) {
+            val node = normalizeNode(incomingNodes.optJSONObject(i) ?: continue) ?: continue
+            if (node.optString("id") == identity.id) continue
+            val existing = nodesById[node.optString("id")]
+            if (isNewer(node, existing)) {
+                nodesById[node.optString("id")] = node
+                upsertDeviceFromNode(context, node)
+                changed = true
+            }
+        }
+
+        val incomingLinks = delta.optJSONArray("links") ?: JSONArray()
+        for (i in 0 until incomingLinks.length()) {
+            val link = normalizeLink(incomingLinks.optJSONObject(i) ?: continue) ?: continue
+            val existing = linksById[link.optString("id")]
+            if (isNewer(link, existing)) {
+                linksById[link.optString("id")] = link
+                changed = true
+            }
+        }
+
+        if (changed) {
+            saveArray(context, KEY_NODES, JSONArray(nodesById.values))
+            saveArray(context, KEY_LINKS, JSONArray(linksById.values))
+        }
+        return changed
+    }
+
+    fun buildDelta(context: Context, reason: String = "stored_topology", ttl: Int = DEFAULT_DELTA_TTL): JSONObject {
+        val identity = PhoneIdentityStore.get(context)
+        val now = System.currentTimeMillis()
+        val nodesById = toObjectMap(loadArray(context, KEY_NODES), "id")
+        val linksById = toObjectMap(loadArray(context, KEY_LINKS), "id")
+
+        val localHost = LanDiscovery.localTailscaleHost()
+        nodesById[identity.id] = JSONObject()
+            .put("type", "ANDROID_PHONE")
+            .put("id", identity.id)
+            .put("name", identity.name)
+            .put("role", "phone")
+            .put("host", localHost)
+            .put("port", LanDiscovery.NODE_RELAY_PORT)
+            .put("pairingKey", identity.pairingKey)
+            .put("tsHost", localHost)
+            .put("enabled", true)
+            .put("connected", true)
+            .put("status", "online")
+            .put("routable", localHost.isNotBlank())
+            .put("authority", "local_phone")
+            .put("seq", now)
+            .put("updatedAt", now)
+            .put("lastSeen", now)
+            .put("expiresAt", now + ENTRY_TTL_MS)
+
+        DeviceStore.getDevices(context).forEach { device ->
+            val isPhone = isPhoneType(device.type)
+            nodesById[device.id] = JSONObject()
+                .put("id", device.id)
+                .put("name", device.name)
+                .put("type", device.type)
+                .put("role", if (isPhone) "phone" else "desktop")
+                .put("host", device.host)
+                .put("port", device.port)
+                .put("pairingKey", device.pairingKey)
+                .put("altHosts", JSONArray(device.altHosts))
+                .put("enabled", device.enabled)
+                .put("connected", false)
+                .put("status", if (device.enabled) "known" else "disabled")
+                .put("routable", device.enabled && device.host.isNotBlank() && device.pairingKey.isNotBlank())
+                .put("authority", "device_store")
+                .put("seq", device.updatedAt)
+                .put("updatedAt", device.updatedAt)
+                .put("lastSeen", device.lastSyncAt.takeIf { it > 0L } ?: device.updatedAt)
+                .put("expiresAt", now + ENTRY_TTL_MS)
+
+            val linkType = if (isPhone) "relay_route" else "verify_push"
+            val linkId = "${identity.id}->${device.id}:$linkType"
+            linksById[linkId] = JSONObject()
+                .put("id", linkId)
+                .put("from", identity.id)
+                .put("to", device.id)
+                .put("type", linkType)
+                .put("label", if (isPhone) "节点直连 relay" else "验证码推送")
+                .put("enabled", device.enabled)
+                .put("active", false)
+                .put("routable", device.enabled && device.host.isNotBlank() && device.pairingKey.isNotBlank())
+                .put("authority", "device_store")
+                .put("seq", device.updatedAt)
+                .put("updatedAt", device.updatedAt)
+                .put("expiresAt", now + ENTRY_TTL_MS)
+        }
+
+        return JSONObject()
+            .put("type", "topology_delta")
+            .put("version", 2)
+            .put("routingProtocol", "link-state-spf")
+            .put("controlPlane", true)
+            .put("messageTypes", JSONArray(listOf("node_advertisement", "link_advertisement")))
+            .put("reason", reason)
+            .put("sourceDeviceId", identity.id)
+            .put("sourceDeviceName", identity.name)
+            .put("sourceDeviceType", "ANDROID_PHONE")
+            .put("originDeviceId", identity.id)
+            .put("seq", now)
+            .put("ttl", ttl)
+            .put("updatedAt", now)
+            .put("nodes", JSONArray(nodesById.values))
+            .put("links", JSONArray(linksById.values))
+    }
+
+    fun markDeviceState(
+        context: Context,
+        device: DesktopDevice,
+        enabled: Boolean = device.enabled,
+        revoked: Boolean = false
+    ) {
+        val identity = PhoneIdentityStore.get(context)
+        val now = System.currentTimeMillis()
+        val nodesById = toObjectMap(loadArray(context, KEY_NODES), "id")
+        val linksById = toObjectMap(loadArray(context, KEY_LINKS), "id")
+        val isPhone = isPhoneType(device.type)
+        val routable = enabled && !revoked && device.host.isNotBlank() && device.pairingKey.isNotBlank()
+
+        nodesById[device.id] = JSONObject()
+            .put("id", device.id)
+            .put("name", device.name)
+            .put("type", normalizeDeviceType(device.type))
+            .put("role", if (isPhone) "phone" else "desktop")
+            .put("host", device.host)
+            .put("port", device.port)
+            .put("pairingKey", device.pairingKey)
+            .put("altHosts", JSONArray(device.altHosts))
+            .put("enabled", enabled)
+            .put("revoked", revoked)
+            .put("connected", false)
+            .put("status", when {
+                revoked -> "revoked"
+                enabled -> "known"
+                else -> "disabled"
+            })
+            .put("routable", routable)
+            .put("authority", "local_device_store")
+            .put("seq", now)
+            .put("updatedAt", now)
+            .put("lastSeen", device.lastSyncAt.takeIf { it > 0L } ?: now)
+            .put("expiresAt", now + ENTRY_TTL_MS)
+
+        val linkType = if (isPhone) "relay_route" else "verify_push"
+        val linkId = "${identity.id}->${device.id}:$linkType"
+        linksById[linkId] = JSONObject()
+            .put("id", linkId)
+            .put("from", identity.id)
+            .put("to", device.id)
+            .put("type", linkType)
+            .put("label", if (isPhone) "节点直连 relay" else "验证码推送")
+            .put("enabled", enabled)
+            .put("revoked", revoked)
+            .put("active", false)
+            .put("routable", routable)
+            .put("authority", "local_device_store")
+            .put("seq", now)
+            .put("updatedAt", now)
+            .put("expiresAt", now + ENTRY_TTL_MS)
+
+        saveArray(context, KEY_NODES, JSONArray(nodesById.values))
+        saveArray(context, KEY_LINKS, JSONArray(linksById.values))
+    }
+
+    private fun normalizeDelta(raw: JSONObject): JSONObject {
+        return when (raw.optString("type")) {
+            "node_advertisement" -> JSONObject()
+                .put("type", "topology_delta")
+                .put("sourceDeviceId", raw.optString("sourceDeviceId", raw.optString("id")))
+                .put("seq", raw.optLong("seq", raw.optLong("updatedAt", 0L)))
+                .put("ttl", raw.optInt("ttl", DEFAULT_DELTA_TTL))
+                .put("nodes", JSONArray().put(raw))
+                .put("links", JSONArray())
+            "link_advertisement" -> JSONObject()
+                .put("type", "topology_delta")
+                .put("sourceDeviceId", raw.optString("sourceDeviceId", raw.optString("from")))
+                .put("seq", raw.optLong("seq", raw.optLong("updatedAt", 0L)))
+                .put("ttl", raw.optInt("ttl", DEFAULT_DELTA_TTL))
+                .put("nodes", JSONArray())
+                .put("links", JSONArray().put(raw))
+            else -> raw
+        }
+    }
+
+    private fun normalizeNode(raw: JSONObject): JSONObject? {
+        val id = raw.optString("id", raw.optString("deviceId")).trim()
+        if (id.isBlank()) return null
+        val type = normalizeDeviceType(raw.optString("type", raw.optString("deviceType", "UNKNOWN_DEVICE")))
+        val isPhone = isPhoneType(type)
+        val host = raw.optString("host", raw.optString("lastIP")).trim()
+        val now = System.currentTimeMillis()
+        val updatedAt = raw.optLong("updatedAt", raw.optLong("lastSeen", now)).takeIf { it > 0L } ?: now
+        return JSONObject(raw.toString())
+            .put("id", id)
+            .put("name", raw.optString("name", raw.optString("deviceName", id)).ifBlank { id })
+            .put("type", type)
+            .put("host", host)
+            .put("port", raw.optInt("port", if (isPhone) LanDiscovery.NODE_RELAY_PORT else 19527))
+            .put("pairingKey", raw.optString("pairingKey", raw.optString("pk")).trim())
+            .put("enabled", raw.optBoolean("enabled", true))
+            .put("revoked", raw.optBoolean("revoked", false))
+            .put("routable", raw.optBoolean("routable", host.isNotBlank() && raw.optString("pairingKey", raw.optString("pk")).isNotBlank()))
+            .put("seq", raw.optLong("seq", updatedAt))
+            .put("updatedAt", updatedAt)
+            .put("lastSeen", raw.optLong("lastSeen", updatedAt))
+            .put("expiresAt", raw.optLong("expiresAt", updatedAt + ENTRY_TTL_MS))
+    }
+
+    private fun normalizeLink(raw: JSONObject): JSONObject? {
+        val from = raw.optString("from", raw.optString("source")).trim()
+        val to = raw.optString("to", raw.optString("target")).trim()
+        if (from.isBlank() || to.isBlank()) return null
+        val type = raw.optString("type", "routing_adjacency").ifBlank { "routing_adjacency" }
+        val now = System.currentTimeMillis()
+        val updatedAt = raw.optLong("updatedAt", now).takeIf { it > 0L } ?: now
+        return JSONObject(raw.toString())
+            .put("id", raw.optString("id", "$from->$to:$type"))
+            .put("from", from)
+            .put("to", to)
+            .put("type", type)
+            .put("enabled", raw.optBoolean("enabled", true))
+            .put("active", raw.optBoolean("active", false))
+            .put("routable", raw.optBoolean("routable", false))
+            .put("seq", raw.optLong("seq", updatedAt))
+            .put("updatedAt", updatedAt)
+            .put("expiresAt", raw.optLong("expiresAt", updatedAt + ENTRY_TTL_MS))
+    }
+
+    private fun upsertDeviceFromNode(context: Context, node: JSONObject) {
+        val id = node.optString("id").trim()
+        val type = node.optString("type").trim()
+        val host = node.optString("host").trim()
+        val pairingKey = node.optString("pairingKey").trim()
+        if (id.isBlank() || host.isBlank() || pairingKey.isBlank()) return
+        if (!isDeviceType(type)) return
+        DeviceStore.upsertDevice(
+            context = context,
+            host = host,
+            port = node.optInt("port", if (isPhoneType(type)) LanDiscovery.NODE_RELAY_PORT else 19527),
+            pairingKey = pairingKey,
+            name = node.optString("name", "Device $host").ifBlank { "Device $host" },
+            deviceId = id,
+            deviceType = type,
+            routeUpdatedAt = node.optLong("updatedAt", 0L),
+            altHosts = jsonArrayToList(node.optJSONArray("altHosts")) +
+                listOfNotNull(node.optString("tsHost").takeIf { it.isNotBlank() }),
+            enabled = node.optBoolean("enabled", true) &&
+                !node.optBoolean("revoked", false) &&
+                node.optBoolean("routable", true)
+        )
+    }
+
+    private fun isNewer(incoming: JSONObject, existing: JSONObject?): Boolean {
+        if (existing == null) return true
+        return incoming.optLong("seq", incoming.optLong("updatedAt", 0L)) >=
+            existing.optLong("seq", existing.optLong("updatedAt", 0L))
+    }
+
+    private fun normalizeDeviceType(type: String): String {
+        val value = type.trim().uppercase(Locale.ROOT)
+        return when {
+            value.contains("PHONE") || value.contains("ANDROID") -> "ANDROID_PHONE"
+            value.contains("MAC") -> "MAC_DESKTOP"
+            value.contains("LINUX") -> "LINUX_DESKTOP"
+            value.contains("WINDOWS") || value.contains("DESKTOP") -> "WINDOWS_DESKTOP"
+            else -> value.ifBlank { "UNKNOWN_DEVICE" }
+        }
+    }
+
+    private fun isPhoneType(type: String): Boolean =
+        type.uppercase(Locale.ROOT).contains("PHONE")
+
+    private fun isDeviceType(type: String): Boolean {
+        val value = type.uppercase(Locale.ROOT)
+        return value.contains("PHONE") || value.contains("DESKTOP")
+    }
+
+    private fun toObjectMap(array: JSONArray, key: String): LinkedHashMap<String, JSONObject> {
+        val map = linkedMapOf<String, JSONObject>()
+        for (i in 0 until array.length()) {
+            val obj = array.optJSONObject(i) ?: continue
+            val id = obj.optString(key).trim()
+            if (id.isNotBlank()) map[id] = obj
+        }
+        return map
+    }
+
+    private fun jsonArrayToList(array: JSONArray?): List<String> {
+        if (array == null) return emptyList()
+        return (0 until array.length()).mapNotNull {
+            array.optString(it).takeIf { value -> value.isNotBlank() }
+        }
+    }
+
+    private fun loadSeenSeq(context: Context): JSONObject =
+        runCatching { JSONObject(prefs(context).getString(KEY_SEEN_SEQ, "{}").orEmpty()) }
+            .getOrElse { JSONObject() }
+
+    private fun saveSeenSeq(context: Context, seen: JSONObject) {
+        prefs(context).edit().putString(KEY_SEEN_SEQ, seen.toString()).apply()
+    }
+
+    private fun loadArray(context: Context, key: String): JSONArray =
+        runCatching { JSONArray(prefs(context).getString(key, "[]").orEmpty()) }
+            .getOrElse { JSONArray() }
+
+    private fun saveArray(context: Context, key: String, array: JSONArray) {
+        prefs(context).edit().putString(key, array.toString()).apply()
+    }
+
+    private fun prefs(context: Context) = SecurePrefs.get(context, PREFS_NAME)
+}

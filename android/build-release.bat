@@ -33,7 +33,7 @@ set JAVA_HOME=C:\Program Files\Microsoft\jdk-17.0.19.10-hotspot
 set PATH=%JAVA_HOME%\bin;%PATH%
 
 cd /d "%~dp0"
-call gradle clean assembleRelease
+call "%~dp0gradlew.bat" clean assembleRelease --no-daemon --max-workers=1
 
 if %ERRORLEVEL% neq 0 (
     echo.

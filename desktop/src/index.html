@@ -5,6 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>验证码同步</title>
 <link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="qr-styles.css">
+<link rel="stylesheet" href="notification.css">
+<link rel="stylesheet" href="source-styles.css">
 </head>
 <body>
 <div id="app">
@@ -26,9 +29,13 @@
       <span class="tab-icon">⏱️</span>
       <span class="tab-label">动态验证码</span>
     </button>
+    <button class="tab-btn" data-tab="topology">
+      <span class="tab-icon">◎</span>
+      <span class="tab-label">拓扑图</span>
+    </button>
     <button class="tab-btn" data-tab="phones">
       <span class="tab-icon">📲</span>
-      <span class="tab-label">已授权手机</span>
+      <span class="tab-label">已授权设备</span>
       <span id="phones-count" class="tab-badge"></span>
     </button>
     <button class="tab-btn" data-tab="pairing">
@@ -64,22 +71,57 @@
     <div class="tab-panel" data-panel="totp">
       <div class="panel-header">
         <h2 class="panel-title">TOTP 动态验证码</h2>
+        <div class="totp-actions">
+          <button id="btn-upload-qr" class="btn-action" title="上传二维码">📁 上传</button>
+          <button id="btn-paste-qr" class="btn-action" title="从剪贴板粘贴">📋 粘贴</button>
+          <label class="auto-monitor-label">
+            <input type="checkbox" id="chk-auto-monitor">
+            <span>自动监听</span>
+          </label>
+        </div>
       </div>
       <div class="panel-body scrollable">
+        <!-- 拖拽区域 -->
+        <div id="qr-drop-zone" class="qr-drop-zone">
+          <div class="drop-zone-content">
+            <div class="drop-icon">📷</div>
+            <p class="drop-title">拖拽二维码图片到这里</p>
+            <p class="drop-hint">支持 Google Authenticator 迁移和标准 TOTP 二维码</p>
+          </div>
+        </div>
+
         <div id="totp-list">
           <div class="empty-state">暂无 TOTP 验证码</div>
         </div>
       </div>
     </div>
 
-    <!-- 已授权手机标签页 -->
+    <!-- 设备拓扑标签页 -->
+    <div class="tab-panel" data-panel="topology">
+      <div class="panel-header">
+        <h2 class="panel-title">设备拓扑</h2>
+        <button id="btn-refresh-topology" class="btn-action" type="button">刷新</button>
+      </div>
+      <div class="panel-body scrollable">
+        <div id="topology-summary" class="topology-summary"></div>
+        <div id="topology-graph" class="topology-graph">
+          <div class="empty-state">暂无拓扑数据</div>
+        </div>
+        <div id="topology-node-detail" class="topology-node-detail">
+          <div class="topology-node-detail-empty">点击或悬停节点查看设备详情</div>
+        </div>
+        <div id="topology-edge-list" class="topology-edge-list"></div>
+      </div>
+    </div>
+
+    <!-- 已授权设备标签页 -->
     <div class="tab-panel" data-panel="phones">
       <div class="panel-header">
-        <h2 class="panel-title">已授权手机</h2>
+        <h2 class="panel-title">已授权设备</h2>
       </div>
       <div class="panel-body scrollable">
         <div id="phones-list">
-          <div class="empty-state">暂无已授权手机</div>
+          <div class="empty-state">暂无已授权设备</div>
         </div>
       </div>
     </div>
@@ -87,15 +129,25 @@
     <!-- 配对标签页 -->
     <div class="tab-panel" data-panel="pairing">
       <div class="panel-header">
-        <h2 class="panel-title">扫码配对</h2>
+        <h2 class="panel-title">设备配对</h2>
       </div>
-      <div class="panel-body scrollable center-content">
+      <div class="panel-body scrollable">
         <div id="qr-container">
           <img id="qr-image" src="" alt="配对二维码" />
-          <p class="hint">使用手机端 App 扫描二维码完成配对</p>
+          <p class="hint">使用手机端 App 扫描二维码，或在局域网内发现其它设备节点</p>
           <p id="pairing-address" class="pairing-address"></p>
         </div>
         <button id="btn-refresh-qr" class="btn-secondary">🔄 重新生成配对码</button>
+        <button id="btn-copy-address" class="btn-secondary" type="button">📋 复制连接地址</button>
+        <div class="lan-discovery-section">
+          <div class="lan-discovery-header">
+            <span>局域网设备</span>
+            <button id="btn-scan-lan" class="btn-action" type="button">发现设备</button>
+          </div>
+          <div id="lan-devices-list" class="lan-devices-list">
+            <div class="empty-state">点击“发现设备”扫描同一局域网内的客户端</div>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -109,14 +161,14 @@
           <h3 class="settings-group-title">连接状态</h3>
           <div class="settings-item">
             <span class="settings-label">当前状态</span>
-            <span id="connection-status-detail" class="status-disconnected">● 未连接</span>
+            <span id="connection-status-detail" class="status-disconnected">● 等待同步</span>
           </div>
         </div>
 
         <div class="settings-group">
           <h3 class="settings-group-title">统计信息</h3>
           <div class="settings-item">
-            <span class="settings-label">已授权手机</span>
+            <span class="settings-label">已授权设备</span>
             <span id="stats-phones" class="settings-value">0 台</span>
           </div>
           <div class="settings-item">
@@ -130,10 +182,26 @@
         </div>
 
         <div class="settings-group">
+          <h3 class="settings-group-title">接收内容</h3>
+          <label class="settings-item settings-checkbox">
+            <span class="settings-label">验证码短信</span>
+            <input type="checkbox" id="chk-receive-sms-codes">
+          </label>
+          <label class="settings-item settings-checkbox">
+            <span class="settings-label">普通短信</span>
+            <input type="checkbox" id="chk-receive-all-sms">
+          </label>
+          <label class="settings-item settings-checkbox">
+            <span class="settings-label">App 通知</span>
+            <input type="checkbox" id="chk-receive-notifications">
+          </label>
+        </div>
+
+        <div class="settings-group">
           <h3 class="settings-group-title">关于</h3>
           <div class="settings-item">
             <span class="settings-label">版本号</span>
-            <span class="settings-value">v1.0.7</span>
+            <span class="settings-value">v1.0.24</span>
           </div>
           <div class="settings-item">
             <span class="settings-label">项目地址</span>
@@ -146,11 +214,13 @@
   </div>
 
   <div id="status-bar">
-    <span id="connection-status" class="status-disconnected">● 未连接</span>
+    <span id="connection-status" class="status-disconnected">● 等待同步</span>
   </div>
 </div>
 
 <script src="totp.js"></script>
+<script src="device-helpers.js"></script>
 <script src="renderer.js"></script>
+<script src="qr-handler.js"></script>
 </body>
 </html>

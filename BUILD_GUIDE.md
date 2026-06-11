@@ -76,7 +76,7 @@ npm install
 npm run build:win
 ```
 
-产物：`desktop/dist/验证码同步 Setup 1.0.7.exe`（约 66MB）
+产物：`desktop/dist/验证码同步 Setup 1.0.8.exe`（约 66MB）
 
 ### macOS 安装包（需在 macOS 上执行）
 
@@ -86,7 +86,7 @@ npm install
 npm run build:mac
 ```
 
-产物：`desktop/dist/验证码同步-1.0.7.dmg`
+产物：`desktop/dist/验证码同步-1.0.8.dmg`
 
 ---
 
@@ -94,32 +94,32 @@ npm run build:mac
 
 ### 准备发布文件
 
-1. **Android**: `android/release/CodeBridge-android-1.0.7-release-signed.apk`
-2. **Windows**: `desktop/dist/验证码同步 Setup 1.0.7.exe`
+1. **Android**: `android/release/CodeBridge-android-1.0.8-release-signed.apk`
+2. **Windows**: `desktop/dist/验证码同步 Setup 1.0.8.exe`
 
 ### 重命名为 ASCII 文件名
 
 ```bash
 # Android APK
-copy "android\release\CodeBridge-android-1.0.7-release-signed.apk" "Msg2Computer-Android-1.0.7.apk"
+copy "android\release\CodeBridge-android-1.0.8-release-signed.apk" "Msg2Computer-Android-1.0.8.apk"
 
 # Windows 安装包
-copy "desktop\dist\验证码同步 Setup 1.0.7.exe" "Msg2Computer-Setup-1.0.7.exe"
+copy "desktop\dist\验证码同步 Setup 1.0.8.exe" "Msg2Computer-Setup-1.0.8.exe"
 ```
 
 ### 使用 gh CLI 发布
 
 ```bash
 # 创建 Release 并上传文件
-gh release create v1.0.7 ^
-  Msg2Computer-Setup-1.0.7.exe ^
-  Msg2Computer-Android-1.0.7.apk ^
+gh release create v1.0.8 ^
+  Msg2Computer-Setup-1.0.8.exe ^
+  Msg2Computer-Android-1.0.8.apk ^
   --repo happyfox-dot/Msg2Computer ^
-  --title "v1.0.7 - TOTP 完整升级版" ^
-  --notes "本次更新：详见 CHANGELOG_TOTP.md"
+  --title "v1.0.8" ^
+  --notes "修复与改进"
 
 # 或对已存在的 Release 追加文件
-gh release upload v1.0.7 Msg2Computer-Android-1.0.7.apk ^
+gh release upload v1.0.8 Msg2Computer-Android-1.0.8.apk ^
   --repo happyfox-dot/Msg2Computer
 ```
 
@@ -132,14 +132,14 @@ gh release upload v1.0.7 Msg2Computer-Android-1.0.7.apk ^
 ### Android
 编辑 `android/app/build.gradle.kts`：
 ```kotlin
-versionCode = 8      // 每次发布递增
-versionName = "1.0.7"
+versionCode = 9      // 每次发布递增
+versionName = "1.0.8"
 ```
 
 ### 桌面端
 编辑 `desktop/package.json`：
 ```json
-"version": "1.0.7"
+"version": "1.0.8"
 ```
 
 ---

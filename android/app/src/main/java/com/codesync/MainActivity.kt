@@ -13,44 +13,72 @@ import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
 import android.provider.Settings
+import android.text.InputType
+import android.view.Gravity
 import android.view.LayoutInflater
 import android.view.View
+import android.widget.CheckBox
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
+import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import com.codesync.databinding.ActivityMainBinding
+import com.codesync.service.NodeReceiverService
 import com.codesync.service.WebSocketService
 import com.codesync.util.DesktopDevice
 import com.codesync.util.DeviceStore
 import com.codesync.util.GoogleAuthMigrationParser
+import com.codesync.util.LanDiscoveredDevice
+import com.codesync.util.LanDiscovery
 import com.codesync.util.MigrationOtpAccount
+import com.codesync.util.PhoneIdentityStore
 import com.codesync.util.SettingsStore
+import com.codesync.util.TopologyStore
 import com.codesync.util.TotpEntry
 import com.codesync.util.TotpStore
 import com.codesync.util.TotpUtil
+import com.codesync.ui.TopologyGraphView
+import com.google.android.material.bottomsheet.BottomSheetDialog
+import com.google.android.material.button.MaterialButton
 import com.google.android.material.materialswitch.MaterialSwitch
+import com.google.android.material.textfield.TextInputEditText
+import com.google.android.material.textfield.TextInputLayout
 import com.google.zxing.BinaryBitmap
 import com.google.zxing.DecodeHintType
 import com.google.zxing.MultiFormatReader
 import com.google.zxing.RGBLuminanceSource
 import com.google.zxing.common.HybridBinarizer
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
     private var totpUpdateJob: Job? = null
     private var updatingForwardSwitch = false
+    private var updatingMessagePolicySwitches = false
+    private var discoveredLanNodes: List<LanDiscoveredDevice> = emptyList()
+
+    private data class SheetAction(
+        val title: String,
+        val subtitle: String = "",
+        val destructive: Boolean = false,
+        val enabled: Boolean = true,
+        val onClick: () -> Unit
+    )
 
     // 相册图片选择器
     private val pickImageLauncher = registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
@@ -59,12 +87,19 @@ class MainActivity : AppCompatActivity() {
 
     private val connectionReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
-            if (intent?.action != WebSocketService.CONNECTION_STATE_ACTION) return
-            updateConnectionUI(
-                connected = intent.getBooleanExtra("connected", false),
-                connectedCount = intent.getIntExtra("connected_count", 0),
-                detail = intent.getStringExtra("status_message")
-            )
+            when (intent?.action) {
+                WebSocketService.CONNECTION_STATE_ACTION -> {
+                    updateConnectionUI(
+                        connected = intent.getBooleanExtra("connected", false),
+                        connectedCount = intent.getIntExtra("connected_count", 0),
+                        detail = intent.getStringExtra("status_message")
+                    )
+                }
+                WebSocketService.TOTP_SYNCED_ACTION -> {
+                    rebuildTotpList()
+                    rebuildTopologyList()
+                }
+            }
         }
     }
 
@@ -77,6 +112,7 @@ class MainActivity : AppCompatActivity() {
         requestBatteryOptimizationExemption()
         setupUI()
         refreshDeviceList()
+        rebuildTopologyList()
         // 按需模型：启动时不再建立常驻连接，仅展示当前空闲状态
         refreshConnectionSnapshot()
         startTotpUpdates()
@@ -85,25 +121,39 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         refreshDeviceList()
+        rebuildTopologyList()
         syncForwardSwitch()
+        syncMessagePolicySwitches()
         refreshConnectionSnapshot()
     }
 
     override fun onStart() {
         super.onStart()
-        val filter = IntentFilter(WebSocketService.CONNECTION_STATE_ACTION)
+        val filter = IntentFilter(WebSocketService.CONNECTION_STATE_ACTION).apply {
+            addAction(WebSocketService.TOTP_SYNCED_ACTION)
+        }
         ContextCompat.registerReceiver(
             this,
             connectionReceiver,
             filter,
             ContextCompat.RECEIVER_NOT_EXPORTED
         )
+        startNodeReceiverService()
         refreshConnectionSnapshot()
     }
 
     override fun onStop() {
         runCatching { unregisterReceiver(connectionReceiver) }
         super.onStop()
+    }
+
+    private fun startNodeReceiverService() {
+        val intent = Intent(this, NodeReceiverService::class.java)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(intent)
+        } else {
+            startService(intent)
+        }
     }
 
     private fun requestPermissions() {
@@ -120,21 +170,6 @@ class MainActivity : AppCompatActivity() {
         ) {
             permissions.add(Manifest.permission.POST_NOTIFICATIONS)
         }
-        // 读取相册权限（Android 13+ 使用 READ_MEDIA_IMAGES）
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_IMAGES)
-                != PackageManager.PERMISSION_GRANTED
-            ) {
-                permissions.add(Manifest.permission.READ_MEDIA_IMAGES)
-            }
-        } else {
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE)
-                != PackageManager.PERMISSION_GRANTED
-            ) {
-                permissions.add(Manifest.permission.READ_EXTERNAL_STORAGE)
-            }
-        }
-
         if (permissions.isNotEmpty()) {
             requestPermissionLauncher.launch(permissions.toTypedArray())
         }
@@ -154,10 +189,11 @@ class MainActivity : AppCompatActivity() {
         val powerManager = getSystemService(POWER_SERVICE) as PowerManager
         if (powerManager.isIgnoringBatteryOptimizations(packageName)) return
 
-        AlertDialog.Builder(this)
-            .setTitle(R.string.battery_title)
-            .setMessage(R.string.battery_message)
-            .setPositiveButton(R.string.battery_go) { _, _ ->
+        showConfirmSheet(
+            title = getString(R.string.battery_title),
+            message = getString(R.string.battery_message),
+            positiveText = getString(R.string.battery_go)
+        ) {
                 try {
                     startActivity(
                         Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
@@ -167,14 +203,26 @@ class MainActivity : AppCompatActivity() {
                 } catch (_: Exception) {
                     startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
                 }
-            }
-            .setNegativeButton(R.string.cancel, null)
-            .show()
+        }
     }
 
     private fun setupUI() {
         binding.btnScanQR.setOnClickListener {
             startActivity(Intent(this, QRScannerActivity::class.java))
+        }
+
+        binding.btnDiscoverLan.setOnClickListener {
+            showLanDiscoveryDialog()
+        }
+
+        binding.btnTestPush.setOnClickListener {
+            showTestPushDialog()
+        }
+
+        binding.btnRefreshTopology.setOnClickListener {
+            refreshDeviceList()
+            rebuildTopologyList()
+            refreshConnectionSnapshot()
         }
 
         binding.btnAddTotp.setOnClickListener {
@@ -197,6 +245,8 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
             refreshConnectionSnapshot()
         }
+
+        setupMessagePolicyControls()
     }
 
     /** 把开关状态同步为「短信自动转发」偏好，而非常驻连接开关。 */
@@ -204,6 +254,81 @@ class MainActivity : AppCompatActivity() {
         updatingForwardSwitch = true
         binding.switchAutoSync.isChecked = SettingsStore.isForwardingEnabled(this)
         updatingForwardSwitch = false
+    }
+
+    private fun setupMessagePolicyControls() {
+        syncMessagePolicySwitches()
+
+        binding.switchSendAllSms.setOnCheckedChangeListener { _, isChecked ->
+            if (updatingMessagePolicySwitches) return@setOnCheckedChangeListener
+            SettingsStore.setSendAllSmsEnabled(this, isChecked)
+            showMessagePolicySaved()
+        }
+        binding.switchSendNotifications.setOnCheckedChangeListener { _, isChecked ->
+            if (updatingMessagePolicySwitches) return@setOnCheckedChangeListener
+            SettingsStore.setSendNotificationsEnabled(this, isChecked)
+            showMessagePolicySaved()
+        }
+        binding.switchReceiveSmsCodes.setOnCheckedChangeListener { _, isChecked ->
+            if (updatingMessagePolicySwitches) return@setOnCheckedChangeListener
+            SettingsStore.setReceiveSmsCodesEnabled(this, isChecked)
+            showMessagePolicySaved()
+        }
+        binding.switchReceiveAllSms.setOnCheckedChangeListener { _, isChecked ->
+            if (updatingMessagePolicySwitches) return@setOnCheckedChangeListener
+            SettingsStore.setReceiveAllSmsEnabled(this, isChecked)
+            showMessagePolicySaved()
+        }
+        binding.switchReceiveNotifications.setOnCheckedChangeListener { _, isChecked ->
+            if (updatingMessagePolicySwitches) return@setOnCheckedChangeListener
+            SettingsStore.setReceiveNotificationsEnabled(this, isChecked)
+            showMessagePolicySaved()
+        }
+        binding.btnNotificationAccess.setOnClickListener {
+            startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+        }
+    }
+
+    private fun syncMessagePolicySwitches() {
+        updatingMessagePolicySwitches = true
+        binding.switchSendAllSms.isChecked = SettingsStore.isSendAllSmsEnabled(this)
+        binding.switchSendNotifications.isChecked = SettingsStore.isSendNotificationsEnabled(this)
+        binding.switchReceiveSmsCodes.isChecked = SettingsStore.isReceiveSmsCodesEnabled(this)
+        binding.switchReceiveAllSms.isChecked = SettingsStore.isReceiveAllSmsEnabled(this)
+        binding.switchReceiveNotifications.isChecked = SettingsStore.isReceiveNotificationsEnabled(this)
+        updatingMessagePolicySwitches = false
+    }
+
+    private fun showMessagePolicySaved() {
+        Toast.makeText(this, R.string.message_policy_saved, Toast.LENGTH_SHORT).show()
+        refreshConnectionSnapshot()
+    }
+
+    /**
+     * 测试推送：生成一条模拟验证码，走与真实短信完全相同的投递链路
+     * （ACTION_SEND_SMS → 连接/鉴权 → 加密投递 + 手机节点 relay 中继），
+     * 用于配对后验证整条推送链路是否通畅。
+     */
+    private fun showTestPushDialog() {
+        val enabledCount = DeviceStore.getEnabledDevices(this).size
+        if (enabledCount == 0) {
+            Toast.makeText(this, getString(R.string.test_push_no_target), Toast.LENGTH_SHORT).show()
+            return
+        }
+        val code = (100000..999999).random().toString()
+        androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle(getString(R.string.test_push_title))
+            .setMessage(getString(R.string.test_push_message, code, enabledCount))
+            .setPositiveButton(getString(R.string.test_push_confirm)) { _, _ ->
+                startServiceForAction(WebSocketService.ACTION_SEND_SMS) {
+                    putExtra(WebSocketService.EXTRA_CODE, code)
+                    putExtra(WebSocketService.EXTRA_SOURCE, getString(R.string.test_push_source))
+                    putExtra(WebSocketService.EXTRA_MESSAGE_BODY, getString(R.string.test_push_body, code))
+                }
+                Toast.makeText(this, getString(R.string.test_push_sent, code), Toast.LENGTH_LONG).show()
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
     }
 
     private fun refreshDeviceList() {
@@ -218,6 +343,7 @@ class MainActivity : AppCompatActivity() {
                     textSize = 13f
                 }
             )
+            rebuildTopologyList()
             return
         }
 
@@ -225,6 +351,7 @@ class MainActivity : AppCompatActivity() {
         devices.forEach { device ->
             binding.deviceList.addView(createDeviceRow(inflater, device))
         }
+        rebuildTopologyList()
     }
 
     private fun createDeviceRow(inflater: LayoutInflater, device: DesktopDevice): View {
@@ -235,27 +362,70 @@ class MainActivity : AppCompatActivity() {
         val switch = row.findViewById<MaterialSwitch>(R.id.deviceSwitch)
 
         name.text = device.name
-        address.text = getString(R.string.device_address, device.host, device.port)
+        // 单行摘要：地址 · TS（Tailscale 可达）· 路由 · 上次同步；点击行可看完整详情
+        val viaOtherNode = device.routeNextHopId.isNotBlank() && device.routeNextHopId != device.id
+        val hasTailscale = (listOf(device.host) + device.altHosts)
+            .any { LanDiscovery.isTailscaleAddress(it) }
+        address.text = buildList {
+            add(getString(R.string.device_address, device.host, device.port))
+            if (hasTailscale) add("TS")
+            if (viaOtherNode) add("经 ${device.routeNextHopName.ifBlank { "中继" }}")
+            add(getString(R.string.last_sync_time, formatRelativeSyncTime(device.lastSyncAt)))
+        }.joinToString(" · ")
         tintDot(dot, device.enabled)
 
         switch.setOnCheckedChangeListener(null)
         switch.isChecked = device.enabled
         switch.setOnCheckedChangeListener { _, checked ->
             DeviceStore.setDeviceEnabled(this, device.id, checked)
+            TopologyStore.markDeviceState(this, device.copy(enabled = checked), enabled = checked)
             tintDot(dot, checked)
+            rebuildTopologyList()
+            broadcastTopologyChange(if (checked) "device_enabled" else "device_disabled")
             if (checked) {
-                // 启用时做一次配对登记连接，让电脑端立即看到这台手机在线
+                // 启用时做一次配对登记连接，让目标节点立即看到这台手机在线
                 startServiceForAction(WebSocketService.ACTION_CONNECT) {
                     putExtra(WebSocketService.EXTRA_DEVICE_ID, device.id)
                 }
             }
         }
 
+        row.setOnClickListener {
+            showDeviceDetailSheet(device)
+        }
         row.setOnLongClickListener {
             confirmRemoveDevice(device)
             true
         }
         return row
+    }
+
+    /** 设备节点完整详情（地址 / Tailscale / 路由 / 同步时间），点设备行弹出。 */
+    private fun showDeviceDetailSheet(device: DesktopDevice) {
+        val state = if (device.enabled) getString(R.string.push_enabled) else getString(R.string.push_disabled)
+        val tailscaleHosts = (listOf(device.host) + device.altHosts)
+            .filter { LanDiscovery.isTailscaleAddress(it) }
+        val viaOtherNode = device.routeNextHopId.isNotBlank() && device.routeNextHopId != device.id
+        val detail = buildList {
+            add("设备：${device.name}")
+            add("类型：${device.type}")
+            add("地址：${device.host}:${device.port}")
+            if (device.altHosts.isNotEmpty()) add("备用地址：${device.altHosts.joinToString("、")}")
+            if (tailscaleHosts.isNotEmpty()) add("Tailscale：${tailscaleHosts.joinToString("、")}（跨网段可达）")
+            add(
+                when {
+                    viaOtherNode -> "路由：经 ${device.routeNextHopName.ifBlank { device.routeNextHopId }} 中继" +
+                        (if (device.routeMetric > 0) "（metric ${device.routeMetric}）" else "")
+                    device.routeMetric > 0 -> "路由：SPF 直连（metric ${device.routeMetric}）"
+                    else -> "路由：直连"
+                }
+            )
+            if (device.routePath.size > 2) add("路径：${device.routePath.joinToString(" → ")}")
+            add("状态：$state")
+            add("上次同步：${formatFullSyncTime(device.lastSyncAt)}")
+            add("提示：长按列表项可移除该设备")
+        }
+        showDetailSheet(getString(R.string.topology_device_detail), detail)
     }
 
     private fun tintDot(dot: View, online: Boolean) {
@@ -266,16 +436,552 @@ class MainActivity : AppCompatActivity() {
         dot.backgroundTintList = ColorStateList.valueOf(color)
     }
 
+    private fun rebuildTopologyList() {
+        val container = binding.topologyList
+        container.removeAllViews()
+
+        val phone = PhoneIdentityStore.get(this)
+        val devices = DeviceStore.getDevices(this)
+        val remoteTotps = loadTotpEntries().filter { !it.isLocal && it.sourceDeviceId.isNotBlank() }
+        val pairedIds = devices.map { it.id }.toSet()
+        val discoveredPeers = discoveredLanNodes
+            .filter { it.id != phone.id && it.id !in pairedIds }
+            .distinctBy { it.id }
+
+        val graphNodes = mutableListOf(
+            TopologyGraphView.Node(
+                id = phone.id,
+                name = phone.name,
+                type = "ANDROID_PHONE",
+                status = "online",
+                local = true
+            )
+        )
+        val graphEdges = mutableListOf<TopologyGraphView.Edge>()
+
+        container.addView(
+            createTopologyRow(
+                title = "${deviceIcon("ANDROID_PHONE")} ${phone.name}",
+                meta = "${getString(R.string.topology_local_phone)} · 对等节点 · 来源设备",
+                detail = listOf(
+                    "设备：${phone.name}",
+                    "类型：ANDROID_PHONE",
+                    "角色：验证码来源设备",
+                    "推送目标：${devices.count { it.enabled }} / ${devices.size} 个节点",
+                    "局域网发现：${discoveredPeers.size} 个临近节点"
+                )
+            )
+        )
+
+        devices.forEach { device ->
+            // 路由信息（由桌面节点 SPF 计算后下发）：直连显示地址，多跳显示下一跳
+            val viaOtherNode = device.routeNextHopId.isNotBlank() && device.routeNextHopId != device.id
+            val tsTag = if (
+                LanDiscovery.isTailscaleAddress(device.host) ||
+                device.altHosts.any { LanDiscovery.isTailscaleAddress(it) }
+            ) " · TS" else ""
+            graphNodes.add(
+                TopologyGraphView.Node(
+                    id = device.id,
+                    name = device.name,
+                    type = device.type,
+                    status = if (device.enabled) "enabled" else "disabled",
+                    meta = when {
+                        viaOtherNode -> "经 ${device.routeNextHopName.ifBlank { "中继节点" }}$tsTag"
+                        else -> device.host + tsTag
+                    }
+                )
+            )
+            graphEdges.add(
+                TopologyGraphView.Edge(
+                    from = phone.id,
+                    to = device.id,
+                    label = when {
+                        viaOtherNode -> "经 ${device.routeNextHopName.ifBlank { "中继" }}"
+                        device.routeMetric > 0 -> "SPF 路由"
+                        else -> "推送"
+                    },
+                    active = device.enabled,
+                    kind = if (viaOtherNode) "relay" else "push",
+                    metric = device.routeMetric
+                )
+            )
+        }
+
+        remoteTotps
+            .groupBy { it.sourceDeviceId }
+            .forEach { (sourceId, entries) ->
+                val first = entries.first()
+                val nodeId = sourceId.ifBlank { first.sourceDeviceName }
+                if (nodeId.isNotBlank() && graphNodes.none { it.id == nodeId }) {
+                    graphNodes.add(
+                        TopologyGraphView.Node(
+                            id = nodeId,
+                            name = first.sourceDeviceName.ifBlank { "远端节点" },
+                            type = first.sourceDeviceType,
+                            status = "synced"
+                        )
+                    )
+                }
+                if (nodeId.isNotBlank()) {
+                    graphEdges.add(
+                        TopologyGraphView.Edge(
+                            from = nodeId,
+                            to = phone.id,
+                            label = "TOTP 同步",
+                            active = true,
+                            kind = "totp"
+                        )
+                    )
+                }
+            }
+
+        discoveredPeers.forEach { peer ->
+            graphNodes.add(
+                TopologyGraphView.Node(
+                    id = peer.id,
+                    name = peer.name,
+                    type = peer.type,
+                    status = "discovered",
+                    meta = "${peer.host} · 待配对"
+                )
+            )
+            graphEdges.add(
+                TopologyGraphView.Edge(
+                    from = phone.id,
+                    to = peer.id,
+                    label = "发现",
+                    active = false,
+                    kind = "discovery"
+                )
+            )
+        }
+
+        binding.topologyGraph.setGraph(graphNodes, graphEdges)
+
+        if (devices.isEmpty() && remoteTotps.isEmpty() && discoveredPeers.isEmpty()) {
+            container.addView(
+                TextView(this).apply {
+                    text = getString(R.string.topology_empty)
+                    setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_tertiary))
+                    textSize = 13f
+                    gravity = Gravity.CENTER
+                    setPadding(0, 18, 0, 8)
+                }
+            )
+            return
+        }
+
+        devices.forEach { device ->
+            val state = if (device.enabled) getString(R.string.push_enabled) else getString(R.string.push_disabled)
+            val lastSync = formatRelativeSyncTime(device.lastSyncAt)
+            val routeLine = when {
+                device.routeNextHopId.isNotBlank() && device.routeNextHopId != device.id ->
+                    "路由：经 ${device.routeNextHopName.ifBlank { device.routeNextHopId }} 中继" +
+                        (if (device.routeMetric > 0) "（metric ${device.routeMetric}）" else "")
+                device.routeMetric > 0 -> "路由：SPF 直连（metric ${device.routeMetric}）"
+                else -> "路由：直连"
+            }
+            val tailscaleHosts = (listOf(device.host) + device.altHosts)
+                .filter { LanDiscovery.isTailscaleAddress(it) }
+            container.addView(
+                createTopologyRow(
+                    title = "${deviceIcon("ANDROID_PHONE")} ${phone.name}  →  ${deviceIcon(device.type)} ${device.name}",
+                    meta = "${getString(R.string.topology_push_edge)} · $state · ${getString(R.string.status_last_sync, lastSync)}",
+                    detail = buildList {
+                        add("来源：${phone.name}")
+                        add("目标：${device.name}")
+                        add("地址：${device.host}:${device.port}")
+                        if (device.altHosts.isNotEmpty()) {
+                            add("备用地址：${device.altHosts.joinToString("、")}")
+                        }
+                        if (tailscaleHosts.isNotEmpty()) {
+                            add("Tailscale：${tailscaleHosts.joinToString("、")}（跨网段可达）")
+                        }
+                        add(routeLine)
+                        if (device.routePath.size > 2) {
+                            add("路径：${device.routePath.joinToString(" → ")}")
+                        }
+                        add("状态：$state")
+                        add("上次同步：${formatFullSyncTime(device.lastSyncAt)}")
+                        add("权限：来源手机控制推送范围")
+                    }
+                )
+            )
+        }
+
+        remoteTotps
+            .groupBy { it.sourceDeviceId }
+            .forEach { (_, entries) ->
+                val first = entries.first()
+                val sourceName = first.sourceDeviceName.ifBlank { "远端节点" }
+                container.addView(
+                    createTopologyRow(
+                        title = "${deviceIcon(first.sourceDeviceType)} $sourceName  →  ${deviceIcon("ANDROID_PHONE")} ${phone.name}",
+                        meta = "远端 TOTP 种子同步 · ${entries.size} 个验证码",
+                        detail = listOf(
+                            "来源：$sourceName",
+                            "目标：${phone.name}",
+                            "类型：${first.sourceDeviceType}",
+                            "同步内容：${entries.size} 个 TOTP 种子",
+                            "权限：远端来源只读，本机不再二次分发"
+                        )
+                    )
+                )
+            }
+
+        discoveredPeers.forEach { peer ->
+            val pairHint = if (peer.type.contains("DESKTOP") && peer.pairingKey.isNotBlank()) {
+                "可配对"
+            } else {
+                "仅发现，暂未建立直连同步"
+            }
+            container.addView(
+                createTopologyRow(
+                    title = "${deviceIcon("ANDROID_PHONE")} ${phone.name}  ⇢  ${deviceIcon(peer.type)} ${peer.name}",
+                    meta = "局域网对等节点 · $pairHint · ${peer.host}:${peer.port}",
+                    detail = listOf(
+                        "节点：${peer.name}",
+                        "类型：${peer.type}",
+                        "地址：${peer.host}:${peer.port}",
+                        "状态：局域网已发现",
+                        "说明：手机节点会进入拓扑，但当前同步连接仍需受配对协议控制"
+                    )
+                )
+            )
+        }
+    }
+
+    private fun deviceIcon(type: String): String {
+        return if (type.uppercase(Locale.ROOT).contains("PHONE")) "📱" else "💻"
+    }
+
+    private fun createTopologyRow(title: String, meta: String, detail: List<String>): View {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundResource(R.drawable.bg_row)
+            setPadding(14.dp(), 11.dp(), 14.dp(), 11.dp())
+            isClickable = true
+            isFocusable = true
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                bottomMargin = 8.dp()
+            }
+
+            addView(TextView(this@MainActivity).apply {
+                text = title
+                setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_primary))
+                textSize = 13f
+                setTypeface(typeface, android.graphics.Typeface.BOLD)
+                maxLines = 2
+            })
+            addView(TextView(this@MainActivity).apply {
+                text = meta
+                setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_secondary))
+                textSize = 11f
+                setPadding(0, 3.dp(), 0, 0)
+            })
+
+            setOnClickListener {
+                showDetailSheet(getString(R.string.topology_device_detail), detail)
+            }
+        }
+    }
+
+    private fun Int.dp(): Int = (this * resources.displayMetrics.density).toInt()
+
+    private fun createBottomSheet(title: String, message: String? = null): Pair<BottomSheetDialog, LinearLayout> {
+        val dialog = BottomSheetDialog(this)
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(20.dp(), 10.dp(), 20.dp(), 18.dp())
+        }
+        content.addView(View(this).apply {
+            setBackgroundColor(ContextCompat.getColor(this@MainActivity, R.color.outline))
+            layoutParams = LinearLayout.LayoutParams(44.dp(), 4.dp()).apply {
+                gravity = Gravity.CENTER_HORIZONTAL
+                bottomMargin = 18.dp()
+            }
+        })
+        content.addView(TextView(this).apply {
+            text = title
+            setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_primary))
+            textSize = 19f
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+        })
+        if (!message.isNullOrBlank()) {
+            content.addView(TextView(this).apply {
+                text = message
+                setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_secondary))
+                textSize = 13f
+                setPadding(0, 8.dp(), 0, 4.dp())
+            })
+        }
+
+        val scroll = ScrollView(this).apply {
+            addView(content)
+        }
+        dialog.setContentView(scroll)
+        return dialog to content
+    }
+
+    private fun addSheetButton(
+        parent: LinearLayout,
+        text: String,
+        destructive: Boolean = false,
+        outlined: Boolean = false,
+        onClick: () -> Unit
+    ): MaterialButton {
+        val button = MaterialButton(this).apply {
+            this.text = text
+            cornerRadius = 14.dp()
+            minHeight = 48.dp()
+            if (destructive) {
+                setTextColor(ContextCompat.getColor(this@MainActivity, R.color.danger))
+            }
+            if (outlined) {
+                strokeColor = ColorStateList.valueOf(ContextCompat.getColor(this@MainActivity, R.color.outline))
+                strokeWidth = 1.dp()
+            }
+            setOnClickListener { onClick() }
+        }
+        parent.addView(button, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            48.dp()
+        ).apply {
+            topMargin = 10.dp()
+        })
+        return button
+    }
+
+    private fun showActionSheet(title: String, actions: List<SheetAction>) {
+        val (dialog, content) = createBottomSheet(title)
+        actions.forEach { action ->
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setBackgroundResource(R.drawable.bg_row)
+                alpha = if (action.enabled) 1f else 0.45f
+                isEnabled = action.enabled
+                isClickable = action.enabled
+                setPadding(14.dp(), 12.dp(), 14.dp(), 12.dp())
+                setOnClickListener {
+                    dialog.dismiss()
+                    action.onClick()
+                }
+            }
+            row.addView(TextView(this).apply {
+                text = action.title
+                setTextColor(ContextCompat.getColor(
+                    this@MainActivity,
+                    if (action.destructive) R.color.danger else R.color.text_primary
+                ))
+                textSize = 15f
+                setTypeface(typeface, android.graphics.Typeface.BOLD)
+            })
+            if (action.subtitle.isNotBlank()) {
+                row.addView(TextView(this).apply {
+                    text = action.subtitle
+                    setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_secondary))
+                    textSize = 12f
+                    setPadding(0, 3.dp(), 0, 0)
+                })
+            }
+            content.addView(row, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = 10.dp()
+            })
+        }
+        addSheetButton(content, getString(R.string.cancel), outlined = true) {
+            dialog.dismiss()
+        }
+        dialog.show()
+    }
+
+    private fun showConfirmSheet(
+        title: String,
+        message: String,
+        positiveText: String,
+        destructive: Boolean = false,
+        onConfirm: () -> Unit
+    ) {
+        val (dialog, content) = createBottomSheet(title, message)
+        addSheetButton(content, positiveText, destructive = destructive) {
+            dialog.dismiss()
+            onConfirm()
+        }
+        addSheetButton(content, getString(R.string.cancel), outlined = true) {
+            dialog.dismiss()
+        }
+        dialog.show()
+    }
+
+    private fun showDetailSheet(title: String, lines: List<String>) {
+        val (dialog, content) = createBottomSheet(title)
+        content.addView(TextView(this).apply {
+            text = lines.joinToString("\n")
+            setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_secondary))
+            textSize = 13f
+            setPadding(0, 12.dp(), 0, 4.dp())
+        })
+        addSheetButton(content, getString(android.R.string.ok), outlined = true) {
+            dialog.dismiss()
+        }
+        dialog.show()
+    }
+
+    private fun showMultiChoiceSheet(
+        title: String,
+        message: String,
+        items: List<String>,
+        selected: BooleanArray,
+        positiveText: String,
+        neutralText: String? = null,
+        onPositive: () -> Unit,
+        onNeutral: (() -> Unit)? = null
+    ) {
+        val (dialog, content) = createBottomSheet(title, message)
+        items.forEachIndexed { index, item ->
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setBackgroundResource(R.drawable.bg_row)
+                setPadding(10.dp(), 8.dp(), 12.dp(), 8.dp())
+            }
+            val checkBox = CheckBox(this).apply {
+                isChecked = selected[index]
+                buttonTintList = ColorStateList.valueOf(ContextCompat.getColor(this@MainActivity, R.color.primary))
+                setOnCheckedChangeListener { _, checked -> selected[index] = checked }
+            }
+            row.setOnClickListener {
+                checkBox.isChecked = !checkBox.isChecked
+            }
+            row.addView(checkBox)
+            row.addView(TextView(this).apply {
+                text = item
+                setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_primary))
+                textSize = 13f
+            }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            content.addView(row, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = 8.dp()
+            })
+        }
+        addSheetButton(content, positiveText) {
+            dialog.dismiss()
+            onPositive()
+        }
+        if (!neutralText.isNullOrBlank() && onNeutral != null) {
+            addSheetButton(content, neutralText, outlined = true) {
+                dialog.dismiss()
+                onNeutral()
+            }
+        }
+        addSheetButton(content, getString(R.string.cancel), outlined = true) {
+            dialog.dismiss()
+        }
+        dialog.show()
+    }
+
     private fun confirmRemoveDevice(device: DesktopDevice) {
-        AlertDialog.Builder(this)
-            .setTitle(R.string.remove_device_title)
-            .setMessage(getString(R.string.remove_device_message, device.name))
-            .setPositiveButton(R.string.remove) { _, _ ->
+        showConfirmSheet(
+            title = getString(R.string.remove_device_title),
+            message = getString(R.string.remove_device_message, device.name),
+            positiveText = getString(R.string.remove),
+            destructive = true
+        ) {
+                TopologyStore.markDeviceState(this, device.copy(enabled = false), enabled = false, revoked = true)
                 DeviceStore.removeDevice(this, device.id)
                 refreshDeviceList()
+                rebuildTopologyList()
+                broadcastTopologyChange("device_revoked")
+        }
+    }
+
+    private fun showLanDiscoveryDialog() {
+        binding.btnDiscoverLan.isEnabled = false
+        Toast.makeText(this, R.string.discovering_lan, Toast.LENGTH_SHORT).show()
+
+        lifecycleScope.launch {
+            try {
+                val devices = withContext(Dispatchers.IO) {
+                    LanDiscovery.discover(this@MainActivity)
+                }
+                if (devices.isEmpty()) {
+                    Toast.makeText(this@MainActivity, R.string.lan_discovery_empty, Toast.LENGTH_SHORT).show()
+                    return@launch
+                }
+                discoveredLanNodes = devices
+                rebuildTopologyList()
+                showDiscoveredLanDevices(devices)
+            } catch (e: Exception) {
+                val message = e.message ?: e.javaClass.simpleName
+                Toast.makeText(
+                    this@MainActivity,
+                    getString(R.string.lan_discovery_failed, message),
+                    Toast.LENGTH_LONG
+                ).show()
+            } finally {
+                binding.btnDiscoverLan.isEnabled = true
             }
-            .setNegativeButton(R.string.cancel, null)
-            .show()
+        }
+    }
+
+    private fun showDiscoveredLanDevices(devices: List<LanDiscoveredDevice>) {
+        showActionSheet(
+            title = getString(R.string.lan_discovery_title),
+            actions = devices.map { device ->
+                val canPairNode = device.pairingKey.isNotBlank()
+                SheetAction(
+                    title = "${deviceIcon(device.type)} ${device.name}",
+                    subtitle = "${device.host}:${device.port} · ${device.type} · ${if (canPairNode) "可加入推送目标" else "对等节点"}"
+                ) {
+                    if (canPairNode) {
+                        pairDiscoveredLanDevice(device)
+                    } else {
+                        showDetailSheet(
+                            title = device.name,
+                            lines = listOf(
+                                "类型：${device.type}",
+                                "地址：${device.host}:${device.port}",
+                                "状态：已加入本机拓扑视图",
+                                "说明：该节点未提供配对密钥，暂不能加入推送目标"
+                            )
+                        )
+                    }
+                }
+            }
+        )
+    }
+
+    private fun pairDiscoveredLanDevice(device: LanDiscoveredDevice) {
+        val paired = DeviceStore.upsertDevice(
+            context = this,
+            host = device.host,
+            port = device.port,
+            pairingKey = device.pairingKey,
+            name = device.name,
+            deviceId = device.id,
+            deviceType = device.type
+        )
+        TopologyStore.markDeviceState(this, paired, enabled = paired.enabled)
+
+        refreshDeviceList()
+        startServiceForAction(WebSocketService.ACTION_CONNECT) {
+            putExtra(WebSocketService.EXTRA_DEVICE_ID, paired.id)
+        }
+        broadcastTopologyChange("lan_device_paired")
+        Toast.makeText(
+            this,
+            getString(R.string.lan_device_paired, paired.name),
+            Toast.LENGTH_SHORT
+        ).show()
+        refreshConnectionSnapshot()
     }
 
     private fun showDisconnectTargetsDialog() {
@@ -289,33 +995,38 @@ class MainActivity : AppCompatActivity() {
             val state = if (device.enabled) getString(R.string.push_enabled)
             else getString(R.string.push_disabled)
             "${device.name}\n${device.host}:${device.port} · $state"
-        }.toTypedArray()
+        }
         val selected = BooleanArray(devices.size) { devices[it].enabled }
 
-        AlertDialog.Builder(this)
-            .setTitle(R.string.select_disconnect_title)
-            .setMultiChoiceItems(items, selected) { _, index, checked ->
-                selected[index] = checked
-            }
-            .setPositiveButton(R.string.disconnect_selected) { _, _ ->
+        showMultiChoiceSheet(
+            title = getString(R.string.select_disconnect_title),
+            message = getString(R.string.select_device_to_disconnect),
+            items = items,
+            selected = selected,
+            positiveText = getString(R.string.disconnect_selected),
+            neutralText = getString(R.string.disconnect_all),
+            onPositive = {
                 disableDevices(devices.filterIndexed { index, _ -> selected[index] })
-            }
-            .setNeutralButton(R.string.disconnect_all) { _, _ ->
+            },
+            onNeutral = {
                 disableDevices(devices)
             }
-            .setNegativeButton(R.string.cancel, null)
-            .show()
+        )
     }
 
-    /** 按需模型下「断开」即关闭该电脑的推送目标（停止向其转发）。 */
+    /** 按需模型下「断开」即关闭该设备节点的推送目标（停止向其转发）。 */
     private fun disableDevices(devices: List<DesktopDevice>) {
         if (devices.isEmpty()) {
             Toast.makeText(this, R.string.select_device_to_disconnect, Toast.LENGTH_SHORT).show()
             return
         }
 
-        devices.forEach { DeviceStore.setDeviceEnabled(this, it.id, false) }
+        devices.forEach {
+            DeviceStore.setDeviceEnabled(this, it.id, false)
+            TopologyStore.markDeviceState(this, it.copy(enabled = false), enabled = false)
+        }
         refreshDeviceList()
+        broadcastTopologyChange("devices_disabled")
         Toast.makeText(
             this,
             getString(R.string.disconnected_n_devices, devices.size),
@@ -335,20 +1046,19 @@ class MainActivity : AppCompatActivity() {
             val state = if (device.enabled) getString(R.string.push_enabled)
             else getString(R.string.push_disabled)
             "${device.name}\n${device.host}:${device.port} · $state"
-        }.toTypedArray()
+        }
         val selected = BooleanArray(devices.size) { false }
 
-        AlertDialog.Builder(this)
-            .setTitle(R.string.revoke_totp_access_title)
-            .setMessage(R.string.revoke_totp_access_message)
-            .setMultiChoiceItems(items, selected) { _, index, checked ->
-                selected[index] = checked
-            }
-            .setPositiveButton(R.string.revoke_totp_access_selected) { _, _ ->
+        showMultiChoiceSheet(
+            title = getString(R.string.revoke_totp_access_title),
+            message = getString(R.string.revoke_totp_access_message),
+            items = items,
+            selected = selected,
+            positiveText = getString(R.string.revoke_totp_access_selected),
+            onPositive = {
                 revokeTotpAccess(devices.filterIndexed { index, _ -> selected[index] })
             }
-            .setNegativeButton(R.string.cancel, null)
-            .show()
+        )
     }
 
     private fun revokeTotpAccess(devices: List<DesktopDevice>) {
@@ -372,103 +1082,109 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showAddTotpDialog() {
-        val items = arrayOf(
-            getString(R.string.add_totp_scan),      // 📷 扫描二维码
-            getString(R.string.add_totp_from_image), // 🖼️ 从相册导入
-            getString(R.string.add_totp_manual)     // ⌨️ 手动输入密钥
-        )
-
-        AlertDialog.Builder(this)
-            .setTitle(R.string.add_totp)
-            .setItems(items) { _, which ->
-                when (which) {
-                    0 -> {
-                        // 扫描二维码
-                        val intent = Intent(this, QRScannerActivity::class.java).apply {
-                            putExtra(QRScannerActivity.EXTRA_SCAN_TOTP_ONLY, true)
-                        }
-                        startActivity(intent)
+        showActionSheet(
+            title = getString(R.string.add_totp),
+            actions = listOf(
+                SheetAction(
+                    title = getString(R.string.add_totp_scan),
+                    subtitle = "直接打开相机扫描标准 TOTP 或迁移二维码"
+                ) {
+                    val intent = Intent(this, QRScannerActivity::class.java).apply {
+                        putExtra(QRScannerActivity.EXTRA_SCAN_TOTP_ONLY, true)
                     }
-                    1 -> {
-                        // 从相册导入
-                        pickImageLauncher.launch("image/*")
-                    }
-                    2 -> showManualTotpInputDialog()
+                    startActivity(intent)
+                },
+                SheetAction(
+                    title = getString(R.string.add_totp_from_image),
+                    subtitle = "从截图或相册图片中解析二维码"
+                ) {
+                    pickImageLauncher.launch("image/*")
+                },
+                SheetAction(
+                    title = getString(R.string.add_totp_manual),
+                    subtitle = "手动填写 Base32 密钥和标签"
+                ) {
+                    showManualTotpInputDialog()
                 }
-            }
-            .setNegativeButton(R.string.cancel, null)
-            .show()
+            )
+        )
     }
 
     private fun showManualTotpInputDialog() {
-        val secretInput = com.google.android.material.textfield.TextInputEditText(this).apply {
-            hint = getString(R.string.totp_secret_hint)
-            inputType = android.text.InputType.TYPE_CLASS_TEXT or
-                        android.text.InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS or
-                        android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+        val (dialog, content) = createBottomSheet(getString(R.string.add_totp_manual))
+        val labelInput = TextInputEditText(this).apply {
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
         }
-        val labelInput = com.google.android.material.textfield.TextInputEditText(this).apply {
+        val secretInput = TextInputEditText(this).apply {
+            inputType = InputType.TYPE_CLASS_TEXT or
+                InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS or
+                InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+        }
+
+        val labelLayout = TextInputLayout(this).apply {
             hint = getString(R.string.totp_label_hint)
-            inputType = android.text.InputType.TYPE_CLASS_TEXT or
-                        android.text.InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+            boxBackgroundColor = ContextCompat.getColor(this@MainActivity, R.color.bg_surface_variant)
+            addView(labelInput)
+        }
+        val secretLayout = TextInputLayout(this).apply {
+            hint = getString(R.string.totp_secret_hint)
+            boxBackgroundColor = ContextCompat.getColor(this@MainActivity, R.color.bg_surface_variant)
+            addView(secretInput)
         }
 
-        val layout = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(40, 20, 40, 10)
-            addView(labelInput.apply {
-                layoutParams = LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT
-                ).apply { bottomMargin = 16 }
-            })
-            addView(secretInput.apply {
-                layoutParams = LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT
-                )
-            })
-        }
+        content.addView(labelLayout, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = 14.dp() })
+        content.addView(secretLayout, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = 10.dp() })
 
-        AlertDialog.Builder(this)
-            .setTitle(R.string.add_totp_manual)
-            .setView(layout)
-            .setPositiveButton(R.string.save) { _, _ ->
-                val secret = secretInput.text?.toString()
-                    ?.trim()
-                    ?.uppercase()
-                    ?.replace(" ", "")
-                    ?.replace("-", "") ?: ""
-                val label = labelInput.text?.toString()?.trim()?.takeIf { it.isNotEmpty() } ?: "TOTP"
+        addSheetButton(content, getString(R.string.save)) {
+            val secret = secretInput.text?.toString()
+                ?.trim()
+                ?.uppercase()
+                ?.replace(" ", "")
+                ?.replace("-", "") ?: ""
+            val label = labelInput.text?.toString()?.trim()?.takeIf { it.isNotEmpty() } ?: "TOTP"
 
-                if (secret.isEmpty()) {
-                    Toast.makeText(this, R.string.totp_secret_required, Toast.LENGTH_SHORT).show()
-                    return@setPositiveButton
-                }
-
-                if (!TotpUtil.validateSecret(secret)) {
-                    Toast.makeText(this, R.string.totp_secret_invalid, Toast.LENGTH_LONG).show()
-                    return@setPositiveButton
-                }
-
-                saveTotpSecret(label, secret)
+            if (secret.isEmpty()) {
+                Toast.makeText(this, R.string.totp_secret_required, Toast.LENGTH_SHORT).show()
+                return@addSheetButton
             }
-            .setNegativeButton(R.string.cancel, null)
-            .show()
+
+            if (!TotpUtil.validateSecret(secret)) {
+                Toast.makeText(this, R.string.totp_secret_invalid, Toast.LENGTH_LONG).show()
+                return@addSheetButton
+            }
+
+            dialog.dismiss()
+            saveTotpSecret(label, secret)
+        }
+        addSheetButton(content, getString(R.string.cancel), outlined = true) {
+            dialog.dismiss()
+        }
+        dialog.show()
     }
 
     private fun saveTotpSecret(label: String, secret: String) {
+        val identity = PhoneIdentityStore.get(this)
         val entry = TotpEntry(
             label = label,
             secret = secret,
             algorithm = "SHA1",
             digits = 6,
-            period = 30
+            period = 30,
+            sourceDeviceId = identity.id,
+            sourceDeviceName = identity.name,
+            sourceDeviceType = "ANDROID_PHONE",
+            isLocal = true
         )
         TotpStore.add(this, entry)
         Toast.makeText(this, getString(R.string.totp_saved, label), Toast.LENGTH_SHORT).show()
         rebuildTotpList()
-        // 添加时推送一次到电脑端登记（按需模型：不再每周期反复推送）
+        // 添加时推送一次到目标节点登记（按需模型：不再每周期反复推送）
         syncTotpToDesktop(entry)
     }
 
@@ -477,10 +1193,26 @@ class MainActivity : AppCompatActivity() {
         startServiceForAction(WebSocketService.ACTION_SEND_TOTP_SEED) {
             putExtra(WebSocketService.EXTRA_TOTP_LABEL, entry.label)
             putExtra(WebSocketService.EXTRA_TOTP_SECRET, entry.secret)
+            putExtra(WebSocketService.EXTRA_TOTP_ISSUER, entry.issuer)
+            putExtra(WebSocketService.EXTRA_TOTP_ACCOUNT, entry.accountName)
             putExtra(WebSocketService.EXTRA_TOTP_ALGORITHM, entry.algorithm)
             putExtra(WebSocketService.EXTRA_TOTP_DIGITS, entry.digits)
             putExtra(WebSocketService.EXTRA_TOTP_PERIOD, entry.period)
         }
+    }
+
+    private fun syncDeletedTotpToDesktop(entry: TotpEntry) {
+        if (DeviceStore.getEnabledDevices(this).isEmpty()) return
+        startServiceForAction(WebSocketService.ACTION_DELETE_TOTP_SEED) {
+            putExtra(WebSocketService.EXTRA_TOTP_LABEL, entry.label)
+            putExtra(WebSocketService.EXTRA_TOTP_SECRET, entry.secret)
+            putExtra(WebSocketService.EXTRA_TOTP_ISSUER, entry.issuer)
+            putExtra(WebSocketService.EXTRA_TOTP_ACCOUNT, entry.accountName)
+            putExtra(WebSocketService.EXTRA_TOTP_ALGORITHM, entry.algorithm)
+            putExtra(WebSocketService.EXTRA_TOTP_DIGITS, entry.digits)
+            putExtra(WebSocketService.EXTRA_TOTP_PERIOD, entry.period)
+        }
+        refreshConnectionSnapshot()
     }
 
     /** 从相册选择的图片中解析二维码 */
@@ -521,8 +1253,9 @@ class MainActivity : AppCompatActivity() {
                     return
                 }
 
-                // 判断是否是 TOTP 二维码
-                if (qrContent.startsWith("otpauth://totp", ignoreCase = true)) {
+                if (qrContent.startsWith("otpauth-migration://", ignoreCase = true)) {
+                    handleGoogleMigration(qrContent)
+                } else if (qrContent.startsWith("otpauth://totp", ignoreCase = true)) {
                     parseTotpUri(qrContent)
                 } else {
                     Toast.makeText(this, R.string.totp_qr_invalid, Toast.LENGTH_LONG).show()
@@ -613,32 +1346,33 @@ class MainActivity : AppCompatActivity() {
 
     /** 显示批量导入确认对话框 */
     private fun showBatchImportDialog(accounts: List<MigrationOtpAccount>) {
-        val accountNames: Array<String> = accounts.map { account ->
+        val accountNames: List<String> = accounts.map { account ->
             val label = account.getDisplayLabel()
             val details = "${account.getAlgorithmString()}, ${account.getDigitsInt()} 位"
             "$label\n  $details"
-        }.toTypedArray()
+        }
 
         val selected = BooleanArray(accounts.size) { true } // 默认全选
 
-        AlertDialog.Builder(this)
-            .setTitle(getString(R.string.google_migration_found, accounts.size))
-            .setMultiChoiceItems(accountNames, selected) { _: android.content.DialogInterface, which: Int, isChecked: Boolean ->
-                selected[which] = isChecked
-            }
-            .setPositiveButton(R.string.import_selected) { _: android.content.DialogInterface, _: Int ->
+        showMultiChoiceSheet(
+            title = getString(R.string.google_migration_found, accounts.size),
+            message = "选择要导入到本机的动态验证码",
+            items = accountNames,
+            selected = selected,
+            positiveText = getString(R.string.import_selected),
+            neutralText = getString(R.string.import_all),
+            onPositive = {
                 val selectedAccounts = accounts.filterIndexed { index: Int, _: MigrationOtpAccount -> selected[index] }
                 if (selectedAccounts.isEmpty()) {
                     Toast.makeText(this, R.string.no_account_selected, Toast.LENGTH_SHORT).show()
-                    return@setPositiveButton
+                } else {
+                    batchImportAccounts(selectedAccounts)
                 }
-                batchImportAccounts(selectedAccounts)
-            }
-            .setNeutralButton(R.string.import_all) { _: android.content.DialogInterface, _: Int ->
+            },
+            onNeutral = {
                 batchImportAccounts(accounts)
             }
-            .setNegativeButton(R.string.cancel, null)
-            .show()
+        )
     }
 
     /** 批量导入账号 */
@@ -686,6 +1420,7 @@ class MainActivity : AppCompatActivity() {
         digits: Int = 6,
         period: Int = 30
     ) {
+        val identity = PhoneIdentityStore.get(this)
         val entry = TotpEntry(
             label = label,
             secret = secret,
@@ -693,7 +1428,11 @@ class MainActivity : AppCompatActivity() {
             accountName = accountName,
             algorithm = algorithm,
             digits = digits,
-            period = period
+            period = period,
+            sourceDeviceId = identity.id,
+            sourceDeviceName = identity.name,
+            sourceDeviceType = "ANDROID_PHONE",
+            isLocal = true
         )
         TotpStore.add(this, entry)
         rebuildTotpList()
@@ -717,6 +1456,12 @@ class MainActivity : AppCompatActivity() {
             startForegroundService(intent)
         } else {
             startService(intent)
+        }
+    }
+
+    private fun broadcastTopologyChange(reason: String) {
+        startServiceForAction(WebSocketService.ACTION_BROADCAST_TOPOLOGY) {
+            putExtra(WebSocketService.EXTRA_TOPOLOGY_REASON, reason)
         }
     }
 
@@ -762,6 +1507,27 @@ class MainActivity : AppCompatActivity() {
         entries.forEach { entry: TotpEntry ->
             val row = inflater.inflate(R.layout.item_totp, container, false)
             row.findViewById<TextView>(R.id.totpLabel).text = entry.label
+            val pinView = row.findViewById<TextView>(R.id.totpPin)
+            pinView.text = if (entry.pinnedAt > 0) "★" else "☆"
+            pinView.contentDescription = getString(
+                if (entry.pinnedAt > 0) R.string.totp_unpin else R.string.totp_pin
+            )
+            pinView.setTextColor(
+                ContextCompat.getColor(
+                    this,
+                    if (entry.pinnedAt > 0) R.color.warning else R.color.text_tertiary
+                )
+            )
+            pinView.setOnClickListener {
+                val shouldPin = entry.pinnedAt <= 0
+                TotpStore.setPinned(this, entry.withStableId().id, shouldPin)
+                rebuildTotpList()
+                Toast.makeText(
+                    this,
+                    getString(if (shouldPin) R.string.totp_pinned else R.string.totp_unpinned, entry.label),
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
 
             // 使用完整参数生成 TOTP
             val code = TotpUtil.generate(
@@ -805,16 +1571,22 @@ class MainActivity : AppCompatActivity() {
 
     /** 确认删除 TOTP */
     private fun confirmDeleteTotp(entry: TotpEntry) {
-        AlertDialog.Builder(this)
-            .setTitle(R.string.delete_totp_title)
-            .setMessage(getString(R.string.delete_totp_message, entry.label))
-            .setPositiveButton(R.string.delete) { _, _ ->
-                TotpStore.remove(this, entry.label)
+        showConfirmSheet(
+            title = getString(R.string.delete_totp_title),
+            message = getString(R.string.delete_totp_message, entry.label),
+            positiveText = getString(R.string.delete),
+            destructive = true
+        ) {
+                val normalized = entry.withStableId()
+                TotpStore.removeById(this, normalized.id)
+                if (normalized.isLocal) {
+                    TotpStore.addDeleteTombstone(this, normalized)
+                    syncDeletedTotpToDesktop(normalized)
+                }
                 rebuildTotpList()
+                rebuildTopologyList()
                 Toast.makeText(this, getString(R.string.totp_deleted, entry.label), Toast.LENGTH_SHORT).show()
-            }
-            .setNegativeButton(R.string.cancel, null)
-            .show()
+        }
     }
 
     /** 每秒更新所有 TOTP 行的倒计时环和剩余秒数（本地，支持动态周期）。 */
@@ -865,12 +1637,41 @@ class MainActivity : AppCompatActivity() {
         Toast.makeText(this, "$text 已复制", Toast.LENGTH_SHORT).show()
     }
 
+    private fun getLastSyncAt(): Long {
+        return DeviceStore.getDevices(this).maxOfOrNull { it.lastSyncAt } ?: 0L
+    }
+
+    private fun formatRelativeSyncTime(timestamp: Long): String {
+        if (timestamp <= 0L) return getString(R.string.last_sync_never)
+        val delta = System.currentTimeMillis() - timestamp
+        return when {
+            delta < 60_000L -> "刚刚"
+            delta < 3_600_000L -> "${delta / 60_000L} 分钟前"
+            delta < 24 * 3_600_000L -> "${delta / 3_600_000L} 小时前"
+            else -> SimpleDateFormat("MM-dd HH:mm", Locale.getDefault()).format(Date(timestamp))
+        }
+    }
+
+    private fun formatFullSyncTime(timestamp: Long): String {
+        if (timestamp <= 0L) return getString(R.string.last_sync_never)
+        return SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date(timestamp))
+    }
+
+    private fun getLastSyncStatusText(): String {
+        val lastSyncAt = getLastSyncAt()
+        return if (lastSyncAt > 0L) {
+            getString(R.string.status_last_sync, formatRelativeSyncTime(lastSyncAt))
+        } else {
+            getString(R.string.status_waiting_first_sync)
+        }
+    }
+
     private fun refreshConnectionSnapshot() {
         val forwarding = SettingsStore.isForwardingEnabled(this)
         val detail = if (WebSocketService.isRunning) {
             WebSocketService.lastStatusMessage
         } else if (forwarding) {
-            getString(R.string.status_idle)
+            getLastSyncStatusText()
         } else {
             getString(R.string.forwarding_off)
         }
@@ -885,13 +1686,15 @@ class MainActivity : AppCompatActivity() {
         runOnUiThread {
             val online = connected && connectedCount > 0
             binding.tvConnectionStatus.text =
-                if (online) "投递中 ($connectedCount)" else getString(R.string.status_idle)
+                if (online) "投递中 ($connectedCount)"
+                else getLastSyncStatusText()
             val color = ContextCompat.getColor(
                 this,
                 if (online) R.color.status_online else R.color.text_secondary
             )
             binding.tvConnectionStatus.setTextColor(color)
             binding.statusDot.backgroundTintList = ColorStateList.valueOf(color)
+            rebuildTopologyList()
 
             val detailText = detail?.takeIf { it.isNotBlank() }
             binding.tvConnectionDetail.text = detailText.orEmpty()

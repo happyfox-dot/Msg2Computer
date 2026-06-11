@@ -1,0 +1,15 @@
+/* 通知提示 */
+.notification-toast {
+  position: fixed;
+  top: 60px;
+  right: 20px;
+  background: rgba(30, 30, 40, 0.95);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 8px;
+  padding: 12px 16px;
+  min-width: 200px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+  z-index: 2000;
+  opacity: 1;
+  transition: opacity 0.3s;
+}

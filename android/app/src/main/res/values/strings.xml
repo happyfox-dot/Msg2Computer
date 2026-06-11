@@ -33,20 +33,56 @@
     <string name="save">保存</string>
     <string name="cancel">取消</string>
     <string name="disconnect">断开连接</string>
-    <string name="connect">连接电脑</string>
+    <string name="connect">连接设备</string>
+    <string name="refresh">刷新</string>
+    <string name="discover_lan">局域网发现设备</string>
+    <string name="discovering_lan">正在扫描同一局域网内的设备...</string>
+    <string name="lan_discovery_title">局域网节点</string>
+    <string name="lan_discovery_empty">未发现同网段内的 CodeBridge 节点</string>
+    <string name="lan_discovery_failed">局域网发现失败：%1$s</string>
+    <string name="lan_device_paired">正在连接 %1$s...</string>
 
     <!-- 设备列表 -->
     <string name="push_targets">推送目标</string>
-    <string name="no_device_paired">尚未配对电脑，请扫描电脑端二维码</string>
+    <string name="no_device_paired">尚未配对推送目标，请扫描二维码或使用局域网发现</string>
     <string name="auto_sync">短信自动转发</string>
-    <string name="auto_sync_desc">收到验证码短信时自动推送到电脑</string>
+    <string name="auto_sync_desc">收到验证码短信时自动推送到启用的设备节点</string>
+    <string name="message_policy_title">消息同步策略</string>
+    <string name="message_policy_send_title">本节点发送</string>
+    <string name="message_policy_receive_title">本节点接收</string>
+    <string name="send_all_sms">推送全部短信</string>
+    <string name="send_notifications">推送 App 通知</string>
+    <string name="open_notification_access">打开通知使用权授权</string>
+    <string name="receive_sms_codes">接收验证码短信</string>
+    <string name="receive_all_sms">接收普通短信</string>
+    <string name="receive_notifications">接收 App 通知</string>
+    <string name="message_policy_saved">消息同步策略已更新</string>
     <string name="totp_section">动态验证码 (TOTP)</string>
+    <string name="topology_section">设备拓扑</string>
+    <string name="topology_empty">尚未形成设备拓扑</string>
+    <string name="topology_local_phone">本机手机</string>
+    <string name="topology_push_edge">验证码 / TOTP 推送</string>
+    <string name="topology_device_detail">设备详情</string>
+
+    <!-- 测试推送 -->
+    <string name="test_push">测试推送验证码</string>
+    <string name="test_push_title">测试推送</string>
+    <string name="test_push_message">将生成模拟验证码 %1$s，按真实短信链路（连接 → 加密 → 投递/中继）推送到 %2$d 个已启用节点。\n\n收到方会像收到真实验证码一样弹出通知。</string>
+    <string name="test_push_no_target">暂无已启用的推送目标，请先扫码配对或在局域网发现设备</string>
+    <string name="test_push_source">测试推送</string>
+    <string name="test_push_body">【CodeBridge 测试】验证码 %1$s，用于验证节点推送链路，可忽略。</string>
+    <string name="test_push_confirm">立即推送</string>
+    <string name="test_push_sent">测试验证码 %1$s 已开始投递，可在目标设备查看</string>
     <string name="copy">复制</string>
     <string name="connection_status">连接状态</string>
     <string name="forwarding_on">已开启自动转发</string>
     <string name="forwarding_off">已关闭自动转发</string>
     <string name="status_idle">空闲（收到验证码时才连接）</string>
-    <string name="remove_device_title">移除电脑</string>
+    <string name="status_last_sync">上次同步 %1$s</string>
+    <string name="status_waiting_first_sync">等待首次同步</string>
+    <string name="last_sync_never">暂无同步记录</string>
+    <string name="last_sync_time">上次同步：%1$s</string>
+    <string name="remove_device_title">移除设备</string>
     <string name="remove_device_message">确定移除「%1$s」？</string>
     <string name="remove">移除</string>
     <string name="device_address">%1$s:%2$d</string>
@@ -60,22 +96,26 @@
     <string name="delete_totp_message">确定删除「%1$s」？\n删除后无法恢复，需要重新扫码添加。</string>
     <string name="delete">删除</string>
     <string name="totp_deleted">已删除 TOTP「%1$s」</string>
+    <string name="totp_pin">置顶</string>
+    <string name="totp_unpin">取消置顶</string>
+    <string name="totp_pinned">已置顶「%1$s」</string>
+    <string name="totp_unpinned">已取消置顶「%1$s」</string>
 
     <!-- 断开对话框 -->
-    <string name="select_disconnect_title">选择要断开的电脑</string>
+    <string name="select_disconnect_title">选择要断开的设备</string>
     <string name="disconnect_selected">断开所选</string>
     <string name="disconnect_all">断开全部</string>
-    <string name="no_device_to_disconnect">暂无可断开的电脑</string>
-    <string name="select_device_to_disconnect">请选择要断开的电脑</string>
-    <string name="disconnected_n_devices">已断开 %1$d 台电脑</string>
+    <string name="no_device_to_disconnect">暂无可断开的设备</string>
+    <string name="select_device_to_disconnect">请选择要断开的设备</string>
+    <string name="disconnected_n_devices">已断开 %1$d 个设备</string>
     <string name="push_enabled">推送已启用</string>
     <string name="push_disabled">推送已禁用</string>
     <string name="totp_access">2FA权限</string>
-    <string name="revoke_totp_access_title">撤销电脑端 2FA 显示权限</string>
-    <string name="revoke_totp_access_message">将从所选 Windows 电脑删除本手机同步过去的 TOTP 验证码。</string>
+    <string name="revoke_totp_access_title">撤销目标设备 2FA 显示权限</string>
+    <string name="revoke_totp_access_message">将从所选目标设备删除本手机同步过去的 TOTP 验证码。</string>
     <string name="revoke_totp_access_selected">撤销所选</string>
-    <string name="select_device_to_revoke_totp">请选择要撤销的电脑</string>
-    <string name="revoking_totp_access_n_devices">正在撤销 %1$d 台电脑的 2FA 显示权限</string>
+    <string name="select_device_to_revoke_totp">请选择要撤销的设备</string>
+    <string name="revoking_totp_access_n_devices">正在撤销 %1$d 个设备的 2FA 显示权限</string>
 
     <!-- 电池优化 -->
     <string name="battery_title">允许熄屏后台同步</string>

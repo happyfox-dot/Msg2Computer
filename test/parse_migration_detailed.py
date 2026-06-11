@@ -8,6 +8,7 @@ import sys
 import base64
 from urllib.parse import unquote
 import struct
+from pathlib import Path
 
 def read_varint(data, offset):
     """读取 varint 编码的整数"""
@@ -127,11 +128,15 @@ def main():
     from PIL import Image
     from pyzbar.pyzbar import decode
 
-    image_path = "D:/test/google_auth/微信图片_20260609234739_11972_1.jpg"
+    default_image_path = Path(__file__).with_name("user_totp_migration_qr.jpg")
+    image_path = Path(sys.argv[1]) if len(sys.argv) > 1 else default_image_path
+    if not image_path.exists():
+        raise FileNotFoundError(f"QR image not found: {image_path}")
 
     print("=" * 80)
     print("Google Authenticator 多账号二维码详细解析")
     print("=" * 80)
+    print(f"图片路径: {image_path}")
     print()
 
     # 解码二维码
