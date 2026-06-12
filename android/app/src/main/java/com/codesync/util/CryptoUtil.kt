@@ -45,6 +45,38 @@ object CryptoUtil {
         return String(plaintext, Charsets.UTF_8)
     }
 
+    // 二进制变体：加解密原始字节（文件分片用），收发裸 ByteArray 而非 base64，
+    // 避免网络上 +33% 膨胀。布局与桌面 encryptBytes/decryptBytes 一致：
+    // iv[12] + ciphertext + authTag[16]（GCM tag 由 doFinal 附在 ciphertext 尾部）。
+    fun encryptBytes(plain: ByteArray, keyBase64: String): ByteArray {
+        val keyBytes = Base64.decode(keyBase64, Base64.DEFAULT)
+        val key = SecretKeySpec(keyBytes, "AES")
+
+        val iv = ByteArray(GCM_IV_LENGTH)
+        SecureRandom().nextBytes(iv)
+
+        val cipher = Cipher.getInstance(ALGORITHM)
+        val spec = GCMParameterSpec(GCM_TAG_LENGTH, iv)
+        cipher.init(Cipher.ENCRYPT_MODE, key, spec)
+
+        val ciphertext = cipher.doFinal(plain)
+        return iv + ciphertext
+    }
+
+    fun decryptBytes(combined: ByteArray, keyBase64: String): ByteArray {
+        val keyBytes = Base64.decode(keyBase64, Base64.DEFAULT)
+        val key = SecretKeySpec(keyBytes, "AES")
+
+        val iv = combined.copyOfRange(0, GCM_IV_LENGTH)
+        val ciphertext = combined.copyOfRange(GCM_IV_LENGTH, combined.size)
+
+        val cipher = Cipher.getInstance(ALGORITHM)
+        val spec = GCMParameterSpec(GCM_TAG_LENGTH, iv)
+        cipher.init(Cipher.DECRYPT_MODE, key, spec)
+
+        return cipher.doFinal(ciphertext)
+    }
+
     fun generateRandomKey(): String {
         val key = ByteArray(32)
         SecureRandom().nextBytes(key)

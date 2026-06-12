@@ -60,6 +60,16 @@
     <string name="sync_clipboard">剪贴板同步</string>
     <string name="sync_clipboard_desc">开启后接收其它节点同步来的剪贴板内容并写入本机。系统限制后台读取剪贴板，发送需在 App 内主动触发。</string>
     <string name="sync_current_clipboard">同步当前剪贴板</string>
+    <string name="sync_file_transfer">允许发送文件</string>
+    <string name="sync_file_transfer_desc">主动选择文件后，通过受信节点网络加密分片传输。</string>
+    <string name="receive_file_transfer">接收其它节点文件</string>
+    <string name="receive_file_transfer_desc">默认关闭；开启后远端文件会保存到应用下载目录。</string>
+    <string name="send_file">选择文件发送</string>
+    <string name="file_transfer_disabled">请先开启文件发送开关</string>
+    <string name="file_receive_disabled">请先开启文件接收开关</string>
+    <string name="file_no_target">没有允许文件传输的推送目标</string>
+    <string name="file_prepare_failed">文件准备失败：%1$s</string>
+    <string name="file_transfer_started">已开始发送文件：%1$s</string>
     <string name="clipboard_empty">当前剪贴板为空，无可同步内容</string>
     <string name="clipboard_sent">已同步剪贴板到设备节点</string>
     <string name="clipboard_sync_disabled">请先开启剪贴板同步开关</string>

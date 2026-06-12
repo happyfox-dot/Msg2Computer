@@ -16,7 +16,11 @@ let messageSettings = {
   receiveAllSms: true,
   receiveNotifications: true,
   // 剪贴板同步默认关闭，需用户显式开启
-  syncClipboard: false
+  syncClipboard: false,
+  syncClipboardText: false,
+  syncClipboardImage: false,
+  syncClipboardFile: false,
+  receiveFileTransfer: false
 }
 
 document.addEventListener('DOMContentLoaded', async () => {
@@ -79,6 +83,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   window.electronAPI.onLanDevicesChanged?.((devices) => {
     lanDevices = Array.isArray(devices) ? devices : []
     renderLanDevices()
+  })
+
+  window.electronAPI.onLanJoinRequest?.((request) => {
+    showLanJoinRequestModal(request)
   })
 
   document.getElementById('btn-refresh-qr').addEventListener('click', async () => {
@@ -243,6 +251,8 @@ function setupSettings() {
     })
   }
   setupMessageSettings()
+  setupFileTransferControls()
+  setupLanJoinSettings()
   setupUpdateControl()
   updateSettingsStats()
 }
@@ -302,13 +312,22 @@ async function setupMessageSettings() {
     receiveSmsCodes: document.getElementById('chk-receive-sms-codes'),
     receiveAllSms: document.getElementById('chk-receive-all-sms'),
     receiveNotifications: document.getElementById('chk-receive-notifications'),
-    syncClipboard: document.getElementById('chk-sync-clipboard')
+    syncClipboardText: document.getElementById('chk-sync-clipboard-text'),
+    syncClipboardImage: document.getElementById('chk-sync-clipboard-image'),
+    syncClipboardFile: document.getElementById('chk-sync-clipboard-file')
   }
   if (!fields.receiveSmsCodes || !window.electronAPI.getMessageSettings) return
 
   const applyToUi = () => {
     Object.entries(fields).forEach(([key, element]) => {
-      if (element) element.checked = messageSettings[key] !== false
+      if (!element) return
+      if (key.startsWith('syncClipboard')) {
+        element.checked = key === 'syncClipboardFile'
+          ? (messageSettings.syncClipboardFile === true || messageSettings.receiveFileTransfer === true)
+          : messageSettings[key] === true
+      } else {
+        element.checked = messageSettings[key] !== false
+      }
     })
   }
 
@@ -322,7 +341,12 @@ async function setupMessageSettings() {
   Object.entries(fields).forEach(([key, element]) => {
     if (!element) return
     element.addEventListener('change', async () => {
-      const nextSettings = { ...messageSettings, [key]: element.checked }
+      const nextSettings = {
+        ...messageSettings,
+        [key]: element.checked,
+        syncClipboard: key === 'syncClipboardText' ? element.checked : messageSettings.syncClipboard,
+        receiveFileTransfer: key === 'syncClipboardFile' ? element.checked : messageSettings.receiveFileTransfer
+      }
       try {
         messageSettings = await window.electronAPI.setMessageSettings(nextSettings)
         applyToUi()
@@ -334,6 +358,75 @@ async function setupMessageSettings() {
   })
 }
 
+function setupFileTransferControls() {
+  const button = document.getElementById('btn-send-file')
+  const status = document.getElementById('file-transfer-status')
+  if (!button || !window.electronAPI.selectAndSendFile) return
+
+  const setStatus = (text) => {
+    if (status) status.textContent = text || ''
+  }
+
+  button.addEventListener('click', async () => {
+    button.disabled = true
+    setStatus('选择文件…')
+    try {
+      const result = await window.electronAPI.selectAndSendFile()
+      if (result?.canceled) {
+        setStatus('')
+      } else if (result?.success) {
+        const count = Array.isArray(result.sent) ? result.sent.length : 0
+        setStatus(`已发送 ${count} 个文件`)
+        showNotification('文件已发送', `目标 ${result.targetIds?.length || 0} 个节点`)
+      } else {
+        setStatus(result?.error || '发送失败')
+        showNotification('文件发送失败', result?.error || '没有可用目标')
+      }
+    } catch (error) {
+      setStatus('发送失败')
+      showNotification('文件发送失败', error.message || '请重试')
+    } finally {
+      button.disabled = false
+      setTimeout(() => setStatus(''), 5000)
+    }
+  })
+
+  window.electronAPI.onFileTransferProgress?.((progress) => {
+    if (!progress || !progress.size) return
+    const percent = Math.min(100, Math.round((progress.received || 0) * 100 / progress.size))
+    setStatus(`接收 ${progress.name || '文件'} ${percent}%`)
+  })
+  window.electronAPI.onFileTransferComplete?.((result) => {
+    setStatus(`已接收 ${result?.name || '文件'}`)
+    showNotification('文件接收完成', result?.name || '')
+    setTimeout(() => setStatus(''), 5000)
+  })
+}
+
+async function setupLanJoinSettings() {
+  const checkbox = document.getElementById('chk-allow-lan-join')
+  if (!checkbox || !window.electronAPI.getLanJoinSettings) return
+
+  try {
+    const settings = await window.electronAPI.getLanJoinSettings()
+    checkbox.checked = settings?.allowLanJoinRequests !== false
+  } catch (error) {
+    console.error('Failed to load LAN join settings:', error)
+  }
+
+  checkbox.addEventListener('change', async () => {
+    try {
+      const settings = await window.electronAPI.setLanJoinSettings({
+        allowLanJoinRequests: checkbox.checked
+      })
+      checkbox.checked = settings?.allowLanJoinRequests !== false
+    } catch (error) {
+      console.error('Failed to save LAN join settings:', error)
+      checkbox.checked = !checkbox.checked
+    }
+  })
+}
+
 function setupPhoneList() {
   const container = document.getElementById('phones-list')
 
@@ -342,12 +435,15 @@ function setupPhoneList() {
     const row = target.closest('.phone-row')
     if (!row) return
 
-    if (target.matches('[data-action="toggle-phone-totp"], [data-action="toggle-phone-clipboard"]')) {
+    if (target.matches('[data-action="toggle-phone-totp"], [data-action="toggle-phone-clipboard"], [data-action="toggle-phone-clipboard-image"]')) {
       target.disabled = true
       try {
-        const phones = await window.electronAPI.setPhoneContentPolicy(row.dataset.phoneId, {
-          [target.dataset.action === 'toggle-phone-clipboard' ? 'allowClipboard' : 'allowTotp']: target.checked
-        })
+        const updates = target.dataset.action === 'toggle-phone-clipboard'
+          ? { allowClipboard: target.checked, allowClipboardText: target.checked }
+          : target.dataset.action === 'toggle-phone-clipboard-image'
+            ? { allowClipboardImage: target.checked }
+            : { allowTotp: target.checked }
+        const phones = await window.electronAPI.setPhoneContentPolicy(row.dataset.phoneId, updates)
         authorizedPhones = Array.isArray(phones) ? phones : []
         renderPhones()
         renderTopology()
@@ -483,13 +579,16 @@ function setupLanDiscovery() {
     if (!device) return
     button.disabled = true
     try {
-      const result = await window.electronAPI.pairDesktopDevice(device)
+      const result = device.canRequestJoin && typeof window.electronAPI.requestLanJoin === 'function'
+        ? await window.electronAPI.requestLanJoin(device, 'basic')
+        : await window.electronAPI.pairDesktopDevice(device)
       if (result?.success) {
-        showNotification('桌面配对已发起', result.peer?.name || device.name)
+        showNotification(device.canRequestJoin ? '已加入可信网络' : '桌面配对已发起', result.peer?.name || device.name)
         await refreshTopology()
+        lanDevices = await window.electronAPI.getLanDevices()
         renderLanDevices()
       } else {
-        showNotification('配对失败', result?.error || '无法连接该设备')
+        showNotification(result?.rejected ? '入网被拒绝' : '配对失败', result?.error || '无法连接该设备')
       }
     } catch (error) {
       console.error('Failed to pair LAN device:', error)
@@ -639,7 +738,8 @@ function renderPhones() {
     const checked = phone.enabled !== false && phone.revoked !== true
     const contentPolicy = phone.contentPolicy || {}
     const totpChecked = contentPolicy.allowTotp !== false
-    const clipboardChecked = contentPolicy.allowClipboard === true
+    const clipboardChecked = contentPolicy.allowClipboardText !== false && contentPolicy.allowClipboard !== false
+    const clipboardImageChecked = contentPolicy.allowClipboardImage === true
     const meta = [
       phone.lastSeen ? `上次 ${formatTime(phone.lastSeen)}` : '',
       phone.lastIP || ''
@@ -672,7 +772,11 @@ function renderPhones() {
         </label>
         <label class="phone-policy-toggle" title="是否向该节点同步本机剪贴板">
           <input type="checkbox" data-action="toggle-phone-clipboard" ${clipboardChecked ? 'checked' : ''} ${phone.revoked ? 'disabled' : ''}>
-          <span>剪贴板</span>
+          <span>文本</span>
+        </label>
+        <label class="phone-policy-toggle" title="是否向该节点同步本机图片剪贴板">
+          <input type="checkbox" data-action="toggle-phone-clipboard-image" ${clipboardImageChecked ? 'checked' : ''} ${phone.revoked ? 'disabled' : ''}>
+          <span>图片</span>
         </label>
         ${actionButton}
       </div>
@@ -692,23 +796,93 @@ function renderLanDevices() {
   container.innerHTML = lanDevices.map(device => {
     const icon = getDeviceIcon(device.deviceType)
     const typeName = getDeviceTypeName(device.deviceType)
-    const address = [device.host, device.port].filter(Boolean).join(':')
-    const canPair = device.canPair !== false
+    const address = [device.host, device.joinPort || device.port].filter(Boolean).join(':')
+    const canPair = device.canPair === true || device.canRequestJoin === true
+    const trustLabel = device.trustStatus === 'trusted' ? '已信任' : (device.canRequestJoin ? '未确认' : '已发现')
+    const fingerprint = device.joinFingerprint ? ` · 指纹 ${device.joinFingerprint}` : ''
     const action = canPair
-      ? `<button class="lan-pair-btn" data-action="pair-lan-device" data-device-id="${escapeHtml(device.id)}">加入</button>`
-      : '<span class="lan-device-hint">已发现节点</span>'
+      ? `<button class="lan-pair-btn" data-action="pair-lan-device" data-device-id="${escapeHtml(device.id)}">${device.canRequestJoin ? '请求加入' : '加入'}</button>`
+      : `<span class="lan-device-hint">${escapeHtml(trustLabel)}</span>`
 
     return `
       <div class="lan-device-row">
         <div class="lan-device-icon">${icon}</div>
         <div class="lan-device-main">
           <div class="lan-device-name">${escapeHtml(device.name || '未知设备')}</div>
-          <div class="lan-device-meta">${escapeHtml(typeName)} · ${escapeHtml(address)}</div>
+          <div class="lan-device-meta">${escapeHtml(typeName)} · ${escapeHtml(address)} · ${escapeHtml(trustLabel)}${escapeHtml(fingerprint)}</div>
         </div>
         ${action}
       </div>
     `
   }).join('')
+}
+
+function capabilitySummary(capabilities = {}) {
+  const items = []
+  if (capabilities.topology) items.push('拓扑')
+  if (capabilities.relay) items.push('中继')
+  if (capabilities.sms) items.push('短信')
+  if (capabilities.totp) items.push('TOTP')
+  if (capabilities.clipboardText) items.push('剪贴板')
+  if (capabilities.fileTransfer) items.push('文件')
+  return items.length ? items.join('、') : '未声明'
+}
+
+function showLanJoinRequestModal(request) {
+  if (!request?.requestId) return
+  document.querySelectorAll('.lan-join-dialog').forEach(item => item.remove())
+  const dialog = document.createElement('div')
+  dialog.className = 'lan-join-dialog'
+  const typeName = getDeviceTypeName(request.nodeType)
+  const lines = [
+    ['设备', request.nodeName || request.nodeId],
+    ['类型', typeName],
+    ['地址', [request.host, request.joinPort || request.port].filter(Boolean).join(':')],
+    ['指纹', request.fingerprint || '未提供'],
+    ['能力', capabilitySummary(request.capabilities || {})],
+    ['网络', request.networkId || '新节点']
+  ]
+
+  dialog.innerHTML = `
+    <div class="lan-join-card">
+      <div class="lan-join-title">局域网加入请求</div>
+      <div class="lan-join-subtitle">确认后该节点会进入可信拓扑，并获得当前拓扑快照。</div>
+      <div class="lan-join-device">
+        ${lines.map(([label, value]) => `
+          <div class="lan-join-line">
+            <span>${escapeHtml(label)}</span>
+            <strong>${escapeHtml(value)}</strong>
+          </div>
+        `).join('')}
+      </div>
+      <div class="lan-join-actions">
+        <button class="btn-dialog btn-secondary" data-template="topology_only">只加入拓扑</button>
+        <button class="btn-dialog btn-secondary" data-template="basic">基础同步</button>
+        <button class="btn-dialog btn-primary" data-template="full">完整同步</button>
+      </div>
+      <button class="lan-join-reject" data-action="reject">拒绝</button>
+    </div>
+  `
+
+  const respond = async (accepted, template = 'basic') => {
+    try {
+      await window.electronAPI.respondLanJoin(request.requestId, accepted, template)
+      showNotification(accepted ? '已允许入网' : '已拒绝入网', request.nodeName || request.nodeId)
+    } catch (error) {
+      showNotification('处理入网请求失败', error.message || '请重试')
+    } finally {
+      dialog.remove()
+    }
+  }
+
+  dialog.querySelectorAll('[data-template]').forEach(button => {
+    button.addEventListener('click', () => respond(true, button.dataset.template || 'basic'))
+  })
+  dialog.querySelector('[data-action="reject"]')?.addEventListener('click', () => respond(false))
+  dialog.addEventListener('click', event => {
+    if (event.target === dialog) respond(false)
+  })
+  document.body.appendChild(dialog)
 }
 
 function renderCodes() {
@@ -1187,12 +1361,17 @@ function mergeTopologyViewNode(nodeMap, node) {
 }
 
 function normalizeTopologyContentPolicy(policy = {}) {
+  const allowClipboardText = policy.allowClipboardText !== false && policy.allowClipboard !== false
   return {
     allowSmsCodes: policy.allowSmsCodes !== false,
     allowSmsMessages: policy.allowSmsMessages !== false,
     allowNotifications: policy.allowNotifications !== false,
     allowTotp: policy.allowTotp !== false,
-    allowClipboard: policy.allowClipboard === true
+    allowClipboard: allowClipboardText,
+    allowClipboardText,
+    allowClipboardImage: policy.allowClipboardImage === true,
+    allowClipboardFile: policy.allowClipboardFile === true,
+    allowFileTransfer: policy.allowFileTransfer === true
   }
 }
 
@@ -1203,7 +1382,9 @@ function formatTopologyContentPolicy(policy = {}) {
   if (normalized.allowSmsMessages) items.push('短信')
   if (normalized.allowNotifications) items.push('通知')
   if (normalized.allowTotp) items.push('TOTP')
-  if (normalized.allowClipboard) items.push('剪贴板')
+  if (normalized.allowClipboardText) items.push('剪贴板文本')
+  if (normalized.allowClipboardImage) items.push('剪贴板图片')
+  if (normalized.allowClipboardFile || normalized.allowFileTransfer) items.push('文件')
   return items.length ? items.join('、') : '不推送'
 }
 

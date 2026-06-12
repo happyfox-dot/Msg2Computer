@@ -18,6 +18,9 @@ object SettingsStore {
     // 受 Android 10+ 后台读剪贴板限制，发送侧只能由用户在前台主动触发；
     // 接收侧（把其它节点同步来的剪贴板写入本机）不受限，可自动完成。
     private const val KEY_SYNC_CLIPBOARD = "sync_clipboard_enabled"
+    private const val KEY_SYNC_CLIPBOARD_IMAGE = "sync_clipboard_image_enabled"
+    private const val KEY_SYNC_CLIPBOARD_FILE = "sync_clipboard_file_enabled"
+    private const val KEY_RECEIVE_FILE_TRANSFER = "receive_file_transfer_enabled"
 
     fun isForwardingEnabled(context: Context): Boolean =
         prefs(context).getBoolean(KEY_FORWARD_SMS, true)
@@ -68,12 +71,36 @@ object SettingsStore {
         prefs(context).edit().putBoolean(KEY_SYNC_CLIPBOARD, enabled).apply()
     }
 
+    fun isSyncClipboardImageEnabled(context: Context): Boolean =
+        prefs(context).getBoolean(KEY_SYNC_CLIPBOARD_IMAGE, isSyncClipboardEnabled(context))
+
+    fun setSyncClipboardImageEnabled(context: Context, enabled: Boolean) {
+        prefs(context).edit().putBoolean(KEY_SYNC_CLIPBOARD_IMAGE, enabled).apply()
+    }
+
+    fun isSyncClipboardFileEnabled(context: Context): Boolean =
+        prefs(context).getBoolean(KEY_SYNC_CLIPBOARD_FILE, false)
+
+    fun setSyncClipboardFileEnabled(context: Context, enabled: Boolean) {
+        prefs(context).edit().putBoolean(KEY_SYNC_CLIPBOARD_FILE, enabled).apply()
+    }
+
+    fun isReceiveFileTransferEnabled(context: Context): Boolean =
+        prefs(context).getBoolean(KEY_RECEIVE_FILE_TRANSFER, false)
+
+    fun setReceiveFileTransferEnabled(context: Context, enabled: Boolean) {
+        prefs(context).edit().putBoolean(KEY_RECEIVE_FILE_TRANSFER, enabled).apply()
+    }
+
     fun shouldReceiveContent(context: Context, type: String): Boolean {
         return when (type) {
             "sms" -> isReceiveSmsCodesEnabled(context)
             "sms_message" -> isReceiveAllSmsEnabled(context)
             "app_notification" -> isReceiveNotificationsEnabled(context)
-            "clipboard" -> isSyncClipboardEnabled(context)
+            "clipboard", "clipboard_text" -> isSyncClipboardEnabled(context)
+            "clipboard_image" -> isSyncClipboardImageEnabled(context)
+            "clipboard_file" -> isSyncClipboardFileEnabled(context)
+            "file_transfer" -> isReceiveFileTransferEnabled(context)
             else -> true
         }
     }

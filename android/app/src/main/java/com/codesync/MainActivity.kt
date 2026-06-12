@@ -13,6 +13,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
+import android.provider.OpenableColumns
 import android.provider.Settings
 import android.text.InputType
 import android.view.Gravity
@@ -38,9 +39,14 @@ import com.codesync.util.DesktopDevice
 import com.codesync.util.DeviceStore
 import com.codesync.util.ApkUpdater
 import com.codesync.util.ClipboardSyncState
+import com.codesync.util.FileTransferCoordinator
+import com.codesync.util.FileTransferRegistry
 import com.codesync.util.GoogleAuthMigrationParser
 import com.codesync.util.LanDiscoveredDevice
 import com.codesync.util.LanDiscovery
+import com.codesync.util.LanJoinClient
+import com.codesync.util.LanJoinCoordinator
+import com.codesync.util.LanTrustStore
 import com.codesync.util.MigrationOtpAccount
 import com.codesync.util.PhoneIdentityStore
 import com.codesync.util.SettingsStore
@@ -67,6 +73,8 @@ import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.io.File
+import java.io.FileOutputStream
 
 class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
@@ -74,6 +82,7 @@ class MainActivity : AppCompatActivity() {
     private var updatingForwardSwitch = false
     private var updatingMessagePolicySwitches = false
     private var discoveredLanNodes: List<LanDiscoveredDevice> = emptyList()
+    private val shownFileTransferRequests = mutableSetOf<String>()
 
     // 应用内更新：DownloadManager 的下载 id 与待安装的版本号；下载完成由系统广播触发安装
     private var pendingUpdateDownloadId: Long = -1L
@@ -92,6 +101,10 @@ class MainActivity : AppCompatActivity() {
     // 相册图片选择器
     private val pickImageLauncher = registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
         uri?.let { handleImageFromGallery(it) }
+    }
+
+    private val pickFileLauncher = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
+        uri?.let { handleFileForTransfer(it) }
     }
 
     private val connectionReceiver = object : BroadcastReceiver() {
@@ -122,6 +135,22 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private val lanJoinReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action != LanJoinCoordinator.ACTION_JOIN_REQUEST) return
+            val requestId = intent.getStringExtra(LanJoinCoordinator.EXTRA_REQUEST_ID).orEmpty()
+            if (requestId.isNotBlank()) showLanJoinRequest(requestId)
+        }
+    }
+
+    private val fileTransferReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action != FileTransferCoordinator.ACTION_FILE_TRANSFER_REQUEST) return
+            val requestId = intent.getStringExtra(FileTransferCoordinator.EXTRA_REQUEST_ID).orEmpty()
+            if (requestId.isNotBlank()) showFileTransferRequest(requestId)
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
@@ -146,8 +175,41 @@ class MainActivity : AppCompatActivity() {
             IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE),
             ContextCompat.RECEIVER_EXPORTED
         )
+        ContextCompat.registerReceiver(
+            this,
+            lanJoinReceiver,
+            IntentFilter(LanJoinCoordinator.ACTION_JOIN_REQUEST),
+            ContextCompat.RECEIVER_NOT_EXPORTED
+        )
+        ContextCompat.registerReceiver(
+            this,
+            fileTransferReceiver,
+            IntentFilter(FileTransferCoordinator.ACTION_FILE_TRANSFER_REQUEST),
+            ContextCompat.RECEIVER_NOT_EXPORTED
+        )
+        handleLanJoinIntent(intent)
+        handleFileTransferIntent(intent)
         // 启动后静默检查一次更新（已被用户忽略的版本不再打扰）
         autoCheckUpdateSilently()
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleLanJoinIntent(intent)
+        handleFileTransferIntent(intent)
+    }
+
+    private fun handleLanJoinIntent(intent: Intent?) {
+        if (intent?.action != LanJoinCoordinator.ACTION_JOIN_REQUEST) return
+        val requestId = intent.getStringExtra(LanJoinCoordinator.EXTRA_REQUEST_ID).orEmpty()
+        if (requestId.isNotBlank()) showLanJoinRequest(requestId)
+    }
+
+    private fun handleFileTransferIntent(intent: Intent?) {
+        if (intent?.action != FileTransferCoordinator.ACTION_FILE_TRANSFER_REQUEST) return
+        val requestId = intent.getStringExtra(FileTransferCoordinator.EXTRA_REQUEST_ID).orEmpty()
+        if (requestId.isNotBlank()) showFileTransferRequest(requestId)
     }
 
     override fun onResume() {
@@ -314,6 +376,16 @@ class MainActivity : AppCompatActivity() {
             refreshConnectionSnapshot()
         }
 
+        binding.switchAllowLanJoin.isChecked = LanTrustStore.isJoinRequestAllowed(this)
+        binding.switchAllowLanJoin.setOnCheckedChangeListener { _, isChecked ->
+            LanTrustStore.setJoinRequestAllowed(this, isChecked)
+            Toast.makeText(
+                this,
+                if (isChecked) "已允许局域网入网请求" else "已关闭局域网入网请求",
+                Toast.LENGTH_SHORT
+            ).show()
+        }
+
         setupMessagePolicyControls()
     }
 
@@ -469,6 +541,16 @@ class MainActivity : AppCompatActivity() {
             SettingsStore.setSyncClipboardEnabled(this, isChecked)
             showMessagePolicySaved()
         }
+        binding.switchSyncClipboardFile.setOnCheckedChangeListener { _, isChecked ->
+            if (updatingMessagePolicySwitches) return@setOnCheckedChangeListener
+            SettingsStore.setSyncClipboardFileEnabled(this, isChecked)
+            showMessagePolicySaved()
+        }
+        binding.switchReceiveFileTransfer.setOnCheckedChangeListener { _, isChecked ->
+            if (updatingMessagePolicySwitches) return@setOnCheckedChangeListener
+            SettingsStore.setReceiveFileTransferEnabled(this, isChecked)
+            showMessagePolicySaved()
+        }
         binding.btnNotificationAccess.setOnClickListener {
             startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
         }
@@ -476,6 +558,9 @@ class MainActivity : AppCompatActivity() {
         // 点击按钮时（App 处于前台，读剪贴板合法）读取当前剪贴板并投递。
         binding.btnSyncClipboard.setOnClickListener {
             sendCurrentClipboard()
+        }
+        binding.btnSendFile.setOnClickListener {
+            sendSelectedFile()
         }
     }
 
@@ -503,6 +588,102 @@ class MainActivity : AppCompatActivity() {
         refreshConnectionSnapshot()
     }
 
+    private fun sendSelectedFile() {
+        if (!SettingsStore.isSyncClipboardFileEnabled(this)) {
+            Toast.makeText(this, R.string.file_transfer_disabled, Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (DeviceStore.getEnabledDevices(this).none { it.allowFileTransfer }) {
+            Toast.makeText(this, R.string.file_no_target, Toast.LENGTH_SHORT).show()
+            return
+        }
+        pickFileLauncher.launch(arrayOf("*/*"))
+    }
+
+    private fun handleFileForTransfer(uri: Uri) {
+        lifecycleScope.launch {
+            val prepared = withContext(Dispatchers.IO) {
+                runCatching { copyUriToOutgoingFile(uri) }
+            }
+            prepared.onSuccess { file ->
+                val name = queryDisplayName(uri).ifBlank { file.name }
+                val mime = contentResolver.getType(uri).orEmpty()
+                    .ifBlank { FileTransferRegistry.guessMime(name) }
+                startNodeReceiverService()
+                startServiceForAction(WebSocketService.ACTION_SEND_FILE) {
+                    putExtra(WebSocketService.EXTRA_FILE_PATH, file.absolutePath)
+                    putExtra(WebSocketService.EXTRA_FILE_NAME, name)
+                    putExtra(WebSocketService.EXTRA_FILE_MIME, mime)
+                }
+                Toast.makeText(
+                    this@MainActivity,
+                    getString(R.string.file_transfer_started, name),
+                    Toast.LENGTH_LONG
+                ).show()
+                refreshConnectionSnapshot()
+            }.onFailure { error ->
+                Toast.makeText(
+                    this@MainActivity,
+                    getString(R.string.file_prepare_failed, error.message ?: "unknown"),
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        }
+    }
+
+    private fun copyUriToOutgoingFile(uri: Uri): File {
+        val name = sanitizeOutgoingFileName(queryDisplayName(uri).ifBlank { "file-${System.currentTimeMillis()}" })
+        val dir = File(filesDir, "outgoing_files").apply { mkdirs() }
+        val outputFile = uniqueFile(dir, name)
+        contentResolver.openInputStream(uri)?.use { input ->
+            FileOutputStream(outputFile).use { output ->
+                val buffer = ByteArray(128 * 1024)
+                while (true) {
+                    val read = input.read(buffer)
+                    if (read <= 0) break
+                    output.write(buffer, 0, read)
+                }
+            }
+        } ?: error("无法读取文件")
+        if (outputFile.length() <= 0L) {
+            outputFile.delete()
+            error("文件为空")
+        }
+        return outputFile
+    }
+
+    private fun queryDisplayName(uri: Uri): String {
+        contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+            if (cursor.moveToFirst()) {
+                val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if (index >= 0) return cursor.getString(index).orEmpty()
+            }
+        }
+        return uri.lastPathSegment.orEmpty()
+    }
+
+    private fun sanitizeOutgoingFileName(name: String): String {
+        return name.substringAfterLast('/').substringAfterLast('\\')
+            .replace(Regex("[\\\\/\\x00-\\x1F<>:\"|?*]"), "_")
+            .trim()
+            .take(180)
+            .ifBlank { "file" }
+    }
+
+    private fun uniqueFile(dir: File, name: String): File {
+        val safe = sanitizeOutgoingFileName(name)
+        var candidate = File(dir, safe)
+        if (!candidate.exists()) return candidate
+        val dot = safe.lastIndexOf('.')
+        val stem = if (dot > 0) safe.substring(0, dot) else safe
+        val ext = if (dot > 0) safe.substring(dot) else ""
+        for (i in 1..9999) {
+            candidate = File(dir, "$stem ($i)$ext")
+            if (!candidate.exists()) return candidate
+        }
+        return File(dir, "$stem-${System.currentTimeMillis()}$ext")
+    }
+
     private fun syncMessagePolicySwitches() {
         updatingMessagePolicySwitches = true
         binding.switchSendAllSms.isChecked = SettingsStore.isSendAllSmsEnabled(this)
@@ -511,6 +692,8 @@ class MainActivity : AppCompatActivity() {
         binding.switchReceiveAllSms.isChecked = SettingsStore.isReceiveAllSmsEnabled(this)
         binding.switchReceiveNotifications.isChecked = SettingsStore.isReceiveNotificationsEnabled(this)
         binding.switchSyncClipboard.isChecked = SettingsStore.isSyncClipboardEnabled(this)
+        binding.switchSyncClipboardFile.isChecked = SettingsStore.isSyncClipboardFileEnabled(this)
+        binding.switchReceiveFileTransfer.isChecked = SettingsStore.isReceiveFileTransferEnabled(this)
         updatingMessagePolicySwitches = false
     }
 
@@ -665,14 +848,18 @@ class MainActivity : AppCompatActivity() {
             getString(R.string.policy_all_sms),
             getString(R.string.policy_notifications),
             getString(R.string.policy_totp),
-            getString(R.string.policy_clipboard)
+            getString(R.string.policy_clipboard),
+            "剪贴板图片",
+            "文件传输"
         )
         val selected = booleanArrayOf(
             device.allowSmsCodes,
             device.allowSmsMessages,
             device.allowNotifications,
             device.allowTotp,
-            device.allowClipboard
+            device.allowClipboard,
+            device.allowClipboardImage,
+            device.allowFileTransfer
         )
 
         showMultiChoiceSheet(
@@ -689,7 +876,10 @@ class MainActivity : AppCompatActivity() {
                     allowSmsMessages = selected[1],
                     allowNotifications = selected[2],
                     allowTotp = selected[3],
-                    allowClipboard = selected[4]
+                    allowClipboard = selected[4],
+                    allowClipboardImage = selected[5],
+                    allowClipboardFile = selected[6],
+                    allowFileTransfer = selected[6]
                 )
                 refreshDeviceList()
                 rebuildTopologyList()
@@ -706,6 +896,8 @@ class MainActivity : AppCompatActivity() {
             if (device.allowNotifications) add(getString(R.string.policy_notifications_short))
             if (device.allowTotp) add("TOTP")
             if (device.allowClipboard) add(getString(R.string.policy_clipboard_short))
+            if (device.allowClipboardImage) add("图片剪贴板")
+            if (device.allowFileTransfer) add("文件")
         }
         return items.joinToString("、").ifBlank { getString(R.string.policy_none) }
     }
@@ -1219,10 +1411,10 @@ class MainActivity : AppCompatActivity() {
         showActionSheet(
             title = getString(R.string.lan_discovery_title),
             actions = devices.map { device ->
-                val canPairNode = device.pairingKey.isNotBlank()
+                val canPairNode = device.pairingKey.isNotBlank() || device.joinPublicKey.isNotBlank()
                 SheetAction(
                     title = "${deviceIcon(device.type)} ${device.name}",
-                    subtitle = "${device.host}:${device.port} · ${device.type} · ${if (canPairNode) "可加入推送目标" else "对等节点"}"
+                    subtitle = "${device.host}:${device.joinPort} · ${device.type} · ${if (device.joinPublicKey.isNotBlank()) "可请求加入可信网络" else if (device.pairingKey.isNotBlank()) "可加入推送目标" else "未确认节点"}"
                 ) {
                     if (canPairNode) {
                         pairDiscoveredLanDevice(device)
@@ -1231,9 +1423,10 @@ class MainActivity : AppCompatActivity() {
                             title = device.name,
                             lines = listOf(
                                 "类型：${device.type}",
-                                "地址：${device.host}:${device.port}",
-                                "状态：已加入本机拓扑视图",
-                                "说明：该节点未提供配对密钥，暂不能加入推送目标"
+                                "地址：${device.host}:${device.joinPort}",
+                                "状态：未确认",
+                                "指纹：${device.joinFingerprint.ifBlank { "未提供" }}",
+                                "说明：该节点未提供入网公钥，暂不能请求加入"
                             )
                         )
                     }
@@ -1242,7 +1435,139 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
+    private fun showLanJoinRequest(requestId: String) {
+        val request = LanJoinCoordinator.getPending(requestId) ?: return
+        val caps = mutableListOf<String>().apply {
+            if (request.capabilities.optBoolean("topology")) add("拓扑")
+            if (request.capabilities.optBoolean("relay")) add("中继")
+            if (request.capabilities.optBoolean("sms")) add("短信")
+            if (request.capabilities.optBoolean("totp")) add("TOTP")
+            if (request.capabilities.optBoolean("clipboardImage")) add("图片剪贴板")
+            if (request.capabilities.optBoolean("clipboardText")) add("剪贴板")
+            if (request.capabilities.optBoolean("fileTransfer")) add("文件")
+        }.joinToString("、").ifBlank { "未声明" }
+        val subtitle = listOf(
+            "${request.host}:${request.joinPort}",
+            request.nodeType,
+            "指纹 ${request.fingerprint.ifBlank { "未提供" }}",
+            "能力 $caps",
+            "网络 ${request.networkId.ifBlank { "新节点" }}"
+        ).joinToString("\n")
+
+        showActionSheet(
+            title = "局域网加入请求：${request.nodeName}",
+            actions = listOf(
+                SheetAction(
+                    title = "基础同步",
+                    subtitle = subtitle + "\n允许短信验证码、TOTP、拓扑同步"
+                ) {
+                    LanJoinCoordinator.respond(requestId, accepted = true, template = "basic")
+                    Toast.makeText(this, "已允许 ${request.nodeName} 加入", Toast.LENGTH_SHORT).show()
+                },
+                SheetAction(
+                    title = "完整同步",
+                    subtitle = subtitle + "\n允许短信、通知、剪贴板、图片和文件"
+                ) {
+                    LanJoinCoordinator.respond(requestId, accepted = true, template = "full")
+                    Toast.makeText(this, "已允许 ${request.nodeName} 完整同步", Toast.LENGTH_SHORT).show()
+                },
+                SheetAction(
+                    title = "只加入拓扑",
+                    subtitle = subtitle + "\n仅参与拓扑显示和中继"
+                ) {
+                    LanJoinCoordinator.respond(requestId, accepted = true, template = "topology_only")
+                    Toast.makeText(this, "已允许 ${request.nodeName} 加入拓扑", Toast.LENGTH_SHORT).show()
+                },
+                SheetAction(
+                    title = "拒绝",
+                    subtitle = subtitle,
+                    destructive = true
+                ) {
+                    LanJoinCoordinator.respond(requestId, accepted = false)
+                    Toast.makeText(this, "已拒绝 ${request.nodeName}", Toast.LENGTH_SHORT).show()
+                }
+            )
+        )
+    }
+
+    private fun showFileTransferRequest(requestId: String) {
+        val request = FileTransferCoordinator.getPending(requestId) ?: return
+        if (!shownFileTransferRequests.add(requestId)) return
+        val expiresText = if (request.expiresAt > 0L) {
+            SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(request.expiresAt))
+        } else {
+            "未声明"
+        }
+        val hashText = request.sha256.take(16).ifBlank { "未声明" }
+        val detail = listOf(
+            "来源节点：${request.sourceDeviceName}",
+            "文件名称：${request.fileName}",
+            "文件大小：${formatFileSize(request.size)}",
+            "文件类型：${request.mime.ifBlank { "application/octet-stream" }}",
+            "Hash：$hashText",
+            "有效期：$expiresText"
+        ).joinToString("\n")
+
+        val (dialog, content) = createBottomSheet(
+            title = "文件接收请求",
+            message = detail
+        )
+        addSheetButton(content, "接收文件") {
+            shownFileTransferRequests.remove(requestId)
+            FileTransferCoordinator.respond(requestId, accepted = true)
+            dialog.dismiss()
+            Toast.makeText(this, "正在接收 ${request.fileName}", Toast.LENGTH_SHORT).show()
+        }
+        addSheetButton(content, "拒绝", outlined = true) {
+            shownFileTransferRequests.remove(requestId)
+            FileTransferCoordinator.respond(requestId, accepted = false)
+            dialog.dismiss()
+            Toast.makeText(this, "已拒绝文件", Toast.LENGTH_SHORT).show()
+        }
+        dialog.setOnCancelListener {
+            shownFileTransferRequests.remove(requestId)
+            FileTransferCoordinator.respond(requestId, accepted = false)
+        }
+        dialog.show()
+    }
+
     private fun pairDiscoveredLanDevice(device: LanDiscoveredDevice) {
+        if (device.pairingKey.isBlank() && device.joinPublicKey.isNotBlank()) {
+            lifecycleScope.launch {
+                try {
+                    val result = withContext(Dispatchers.IO) {
+                        LanJoinClient.requestJoin(this@MainActivity, device, "basic")
+                    }
+                    if (result.success && result.device != null) {
+                        refreshDeviceList()
+                        rebuildTopologyList()
+                        startServiceForAction(WebSocketService.ACTION_CONNECT) {
+                            putExtra(WebSocketService.EXTRA_DEVICE_ID, result.device.id)
+                        }
+                        broadcastTopologyChange("lan_join_accepted")
+                        Toast.makeText(
+                            this@MainActivity,
+                            getString(R.string.lan_device_paired, result.device.name),
+                            Toast.LENGTH_SHORT
+                        ).show()
+                        refreshConnectionSnapshot()
+                    } else {
+                        Toast.makeText(
+                            this@MainActivity,
+                            if (result.rejected) "入网请求被拒绝" else "入网失败：${result.error}",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
+                } catch (e: Exception) {
+                    Toast.makeText(
+                        this@MainActivity,
+                        "入网失败：${e.message ?: e.javaClass.simpleName}",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+            }
+            return
+        }
         val paired = DeviceStore.upsertDevice(
             context = this,
             host = device.host,
@@ -1950,6 +2275,18 @@ class MainActivity : AppCompatActivity() {
         return SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date(timestamp))
     }
 
+    private fun formatFileSize(size: Long): String {
+        if (size <= 0L) return "0 B"
+        val units = arrayOf("B", "KB", "MB", "GB")
+        var value = size.toDouble()
+        var index = 0
+        while (value >= 1024.0 && index < units.lastIndex) {
+            value /= 1024.0
+            index += 1
+        }
+        return if (index == 0) "$size ${units[index]}" else String.format(Locale.US, "%.1f %s", value, units[index])
+    }
+
     private fun getLastSyncStatusText(): String {
         val lastSyncAt = getLastSyncAt()
         return if (lastSyncAt > 0L) {
@@ -1998,6 +2335,8 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         totpUpdateJob?.cancel()
         runCatching { unregisterReceiver(downloadCompleteReceiver) }
+        runCatching { unregisterReceiver(lanJoinReceiver) }
+        runCatching { unregisterReceiver(fileTransferReceiver) }
         super.onDestroy()
     }
 }

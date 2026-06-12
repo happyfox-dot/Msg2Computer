@@ -10,8 +10,10 @@ object TopologyStore {
     private const val KEY_NODES = "nodes"
     private const val KEY_LINKS = "links"
     private const val KEY_SEEN_SEQ = "seen_seq"
+    private const val KEY_DELTA_BACKLOG = "delta_backlog"
     private const val ENTRY_TTL_MS = 24 * 60 * 60 * 1000L
     private const val DEFAULT_DELTA_TTL = 4
+    private const val DELTA_BACKLOG_LIMIT = 80
 
     fun applyDelta(context: Context, rawDelta: JSONObject): Boolean {
         val delta = normalizeDelta(rawDelta)
@@ -19,6 +21,11 @@ object TopologyStore {
 
         val identity = PhoneIdentityStore.get(context)
         val sourceId = delta.optString("sourceDeviceId", delta.optString("originDeviceId")).trim()
+        val networkId = delta.optString("networkId").trim()
+        if (networkId.isNotBlank() && networkId != LanTrustStore.getNetworkId(context)) return false
+        if (sourceId.isNotBlank() && sourceId != identity.id && !isTrustedSource(context, sourceId)) {
+            return false
+        }
         val seq = delta.optLong("seq", 0L)
         if (sourceId.isNotBlank() && sourceId != identity.id && seq > 0L) {
             val seen = loadSeenSeq(context)
@@ -26,6 +33,7 @@ object TopologyStore {
             if (seq <= lastSeq) return false
             seen.put(sourceId, seq)
             saveSeenSeq(context, seen)
+            rememberDelta(context, delta)
         }
 
         var changed = false
@@ -69,7 +77,8 @@ object TopologyStore {
         val nodesById = toObjectMap(loadArray(context, KEY_NODES), "id")
         val linksById = toObjectMap(loadArray(context, KEY_LINKS), "id")
 
-        val localHost = LanDiscovery.localTailscaleHost()
+        val localTsHost = LanDiscovery.localTailscaleHost()
+        val localHost = LanDiscovery.localLanHost().ifBlank { localTsHost }
         nodesById[identity.id] = JSONObject()
             .put("type", "ANDROID_PHONE")
             .put("id", identity.id)
@@ -78,7 +87,22 @@ object TopologyStore {
             .put("host", localHost)
             .put("port", LanDiscovery.NODE_RELAY_PORT)
             .put("pairingKey", identity.pairingKey)
-            .put("tsHost", localHost)
+            .put("tsHost", localTsHost)
+            .put("networkId", LanTrustStore.getNetworkId(context))
+            .put("autoPaired", false)
+            .put("trustSourceId", identity.id)
+            .put("trustLevel", "local")
+            .put("acceptedAt", now)
+            .put("capabilities", JSONObject()
+                .put("topology", true)
+                .put("relay", true)
+                .put("sms", true)
+                .put("totp", true)
+                .put("clipboardText", true)
+                .put("clipboardImage", true)
+                .put("clipboardFile", true)
+                .put("fileTransfer", true)
+                .put("joinRequest", true))
             .put("enabled", true)
             .put("connected", true)
             .put("status", "online")
@@ -100,12 +124,24 @@ object TopologyStore {
                 .put("port", device.port)
                 .put("pairingKey", device.pairingKey)
                 .put("altHosts", JSONArray(device.altHosts))
+                .put("networkId", device.networkId.ifBlank { LanTrustStore.getNetworkId(context) })
+                .put("autoPaired", device.autoPaired)
+                .put("trustSourceId", device.trustSourceId)
+                .put("trustLevel", device.trustLevel)
+                .put("acceptedAt", device.acceptedAt)
+                .put("capabilities", JSONObject(device.capabilities.ifBlank { "{}" }))
                 .put("enabled", device.enabled)
                 .put("allowSmsCodes", device.allowSmsCodes)
                 .put("allowSmsMessages", device.allowSmsMessages)
                 .put("allowNotifications", device.allowNotifications)
                 .put("allowTotp", device.allowTotp)
                 .put("allowClipboard", device.allowClipboard)
+                .put("allowClipboardText", device.allowClipboard)
+                .put("allowClipboardImage", device.allowClipboardImage)
+                .put("allowClipboardFile", device.allowClipboardFile)
+                .put("allowFileTransfer", device.allowFileTransfer)
+                .put("maxFileSizeMb", device.maxFileSizeMb)
+                .put("autoAcceptFiles", device.autoAcceptFiles)
                 .put("connected", false)
                 .put("status", if (device.enabled) "known" else "disabled")
                 .put("routable", device.enabled && device.host.isNotBlank() && device.pairingKey.isNotBlank())
@@ -129,6 +165,12 @@ object TopologyStore {
                 .put("allowNotifications", device.allowNotifications)
                 .put("allowTotp", device.allowTotp)
                 .put("allowClipboard", device.allowClipboard)
+                .put("allowClipboardText", device.allowClipboard)
+                .put("allowClipboardImage", device.allowClipboardImage)
+                .put("allowClipboardFile", device.allowClipboardFile)
+                .put("allowFileTransfer", device.allowFileTransfer)
+                .put("maxFileSizeMb", device.maxFileSizeMb)
+                .put("autoAcceptFiles", device.autoAcceptFiles)
                 .put("active", false)
                 .put("routable", device.enabled && device.host.isNotBlank() && device.pairingKey.isNotBlank())
                 .put("authority", "device_store")
@@ -148,12 +190,65 @@ object TopologyStore {
             .put("sourceDeviceName", identity.name)
             .put("sourceDeviceType", "ANDROID_PHONE")
             .put("originDeviceId", identity.id)
+            .put("networkId", LanTrustStore.getNetworkId(context))
             .put("seq", now)
             .put("ttl", ttl)
             .put("updatedAt", now)
             .put("nodes", JSONArray(nodesById.values))
             .put("links", JSONArray(linksById.values))
     }
+
+    fun rememberLocalDelta(context: Context, delta: JSONObject) {
+        val identity = PhoneIdentityStore.get(context)
+        if (delta.optString("type") != "topology_delta") return
+        if (delta.optString("sourceDeviceId") != identity.id) return
+        rememberDelta(context, delta)
+    }
+
+    private fun rememberDelta(context: Context, delta: JSONObject) {
+        if (delta.optString("type") != "topology_delta") return
+        val sourceId = delta.optString("sourceDeviceId", delta.optString("originDeviceId")).trim()
+        if (sourceId.isBlank()) return
+        val seq = delta.optLong("seq", 0L)
+        if (seq <= 0L) return
+        val backlog = loadArray(context, KEY_DELTA_BACKLOG)
+        val filtered = JSONArray()
+        for (i in 0 until backlog.length()) {
+            val item = backlog.optJSONObject(i) ?: continue
+            val itemSourceId = item.optString("sourceDeviceId", item.optString("originDeviceId")).trim()
+            if (itemSourceId != sourceId || item.optLong("seq", 0L) != seq) {
+                filtered.put(item)
+            }
+        }
+        filtered.put(JSONObject(delta.toString()))
+        val trimmed = JSONArray()
+        val start = (filtered.length() - DELTA_BACKLOG_LIMIT).coerceAtLeast(0)
+        for (i in start until filtered.length()) {
+            trimmed.put(filtered.optJSONObject(i))
+        }
+        saveArray(context, KEY_DELTA_BACKLOG, trimmed)
+    }
+
+    fun replayDeltasSince(context: Context, seenSeq: JSONObject?): List<JSONObject> {
+        val backlog = loadArray(context, KEY_DELTA_BACKLOG)
+        val currentNetworkId = LanTrustStore.getNetworkId(context)
+        val result = mutableListOf<JSONObject>()
+        for (i in 0 until backlog.length()) {
+            val item = backlog.optJSONObject(i) ?: continue
+            val networkId = item.optString("networkId").trim()
+            if (networkId.isNotBlank() && networkId != currentNetworkId) continue
+            val sourceId = item.optString("sourceDeviceId", item.optString("originDeviceId")).trim()
+            if (sourceId.isBlank()) continue
+            val lastSeen = seenSeq?.optLong(sourceId, 0L) ?: 0L
+            if (item.optLong("seq", 0L) > lastSeen) {
+                result.add(JSONObject(item.toString()))
+            }
+        }
+        return result.sortedBy { it.optLong("seq", 0L) }
+    }
+
+    fun seenSeqSnapshot(context: Context): JSONObject =
+        JSONObject(loadSeenSeq(context).toString())
 
     fun markDeviceState(
         context: Context,
@@ -177,12 +272,24 @@ object TopologyStore {
             .put("port", device.port)
             .put("pairingKey", device.pairingKey)
             .put("altHosts", JSONArray(device.altHosts))
+            .put("networkId", device.networkId.ifBlank { LanTrustStore.getNetworkId(context) })
+            .put("autoPaired", device.autoPaired)
+            .put("trustSourceId", device.trustSourceId)
+            .put("trustLevel", device.trustLevel)
+            .put("acceptedAt", device.acceptedAt)
+            .put("capabilities", JSONObject(device.capabilities.ifBlank { "{}" }))
             .put("enabled", enabled)
             .put("allowSmsCodes", device.allowSmsCodes)
             .put("allowSmsMessages", device.allowSmsMessages)
             .put("allowNotifications", device.allowNotifications)
             .put("allowTotp", device.allowTotp)
             .put("allowClipboard", device.allowClipboard)
+            .put("allowClipboardText", device.allowClipboard)
+            .put("allowClipboardImage", device.allowClipboardImage)
+            .put("allowClipboardFile", device.allowClipboardFile)
+            .put("allowFileTransfer", device.allowFileTransfer)
+            .put("maxFileSizeMb", device.maxFileSizeMb)
+            .put("autoAcceptFiles", device.autoAcceptFiles)
             .put("revoked", revoked)
             .put("connected", false)
             .put("status", when {
@@ -211,6 +318,12 @@ object TopologyStore {
             .put("allowNotifications", device.allowNotifications)
             .put("allowTotp", device.allowTotp)
             .put("allowClipboard", device.allowClipboard)
+            .put("allowClipboardText", device.allowClipboard)
+            .put("allowClipboardImage", device.allowClipboardImage)
+            .put("allowClipboardFile", device.allowClipboardFile)
+            .put("allowFileTransfer", device.allowFileTransfer)
+            .put("maxFileSizeMb", device.maxFileSizeMb)
+            .put("autoAcceptFiles", device.autoAcceptFiles)
             .put("revoked", revoked)
             .put("active", false)
             .put("routable", routable)
@@ -310,7 +423,26 @@ object TopologyStore {
             deviceType = type,
             routeUpdatedAt = node.optLong("updatedAt", 0L),
             altHosts = jsonArrayToList(node.optJSONArray("altHosts")) +
-                listOfNotNull(node.optString("tsHost").takeIf { it.isNotBlank() })
+                listOfNotNull(node.optString("tsHost").takeIf { it.isNotBlank() }),
+            networkId = node.optString("networkId"),
+            autoPaired = node.optBoolean("autoPaired", false),
+            trustSourceId = node.optString("trustSourceId"),
+            trustLevel = node.optString("trustLevel"),
+            acceptedAt = node.optLong("acceptedAt", 0L),
+            capabilities = node.optJSONObject("capabilities")?.toString().orEmpty(),
+            policyAllowSmsCodes = node.optBoolean("allowSmsCodes", true),
+            policyAllowSmsMessages = node.optBoolean("allowSmsMessages", true),
+            policyAllowNotifications = node.optBoolean("allowNotifications", true),
+            policyAllowTotp = node.optBoolean("allowTotp", true),
+            policyAllowClipboard = node.optBoolean(
+                "allowClipboardText",
+                node.optBoolean("allowClipboard", false)
+            ),
+            policyAllowClipboardImage = node.optBoolean("allowClipboardImage", false),
+            policyAllowClipboardFile = node.optBoolean("allowClipboardFile", false),
+            policyAllowFileTransfer = node.optBoolean("allowFileTransfer", false),
+            policyMaxFileSizeMb = node.optInt("maxFileSizeMb", 50),
+            policyAutoAcceptFiles = node.optBoolean("autoAcceptFiles", false)
         )
     }
 
@@ -337,6 +469,15 @@ object TopologyStore {
     private fun isDeviceType(type: String): Boolean {
         val value = type.uppercase(Locale.ROOT)
         return value.contains("PHONE") || value.contains("DESKTOP")
+    }
+
+    private fun isTrustedSource(context: Context, sourceId: String): Boolean {
+        val identity = PhoneIdentityStore.get(context)
+        if (sourceId == identity.id) return true
+        return DeviceStore.findDevice(context, sourceId)?.let {
+            it.enabled && it.pairingKey.isNotBlank() &&
+                (it.networkId.isBlank() || it.networkId == LanTrustStore.getNetworkId(context))
+        } == true
     }
 
     private fun toObjectMap(array: JSONArray, key: String): LinkedHashMap<String, JSONObject> {

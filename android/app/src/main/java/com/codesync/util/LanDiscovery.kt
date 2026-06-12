@@ -17,6 +17,11 @@ data class LanDiscoveredDevice(
     val host: String,
     val port: Int,
     val pairingKey: String,
+    val joinPort: Int = 19529,
+    val joinPublicKey: String = "",
+    val joinFingerprint: String = "",
+    val capabilities: String = "{}",
+    val networkId: String = "",
     val discoveredAt: Long = System.currentTimeMillis()
 )
 
@@ -45,6 +50,21 @@ object LanDiscovery {
             for (interfaceAddress in networkInterface.interfaceAddresses.orEmpty()) {
                 val host = interfaceAddress.address?.hostAddress ?: continue
                 if (isTailscaleAddress(host)) return host
+            }
+        }
+        return ""
+    }
+
+    fun localLanHost(): String {
+        val interfaces = runCatching { NetworkInterface.getNetworkInterfaces()?.toList() }
+            .getOrNull()
+            .orEmpty()
+        for (networkInterface in interfaces) {
+            if (!networkInterface.isUp || networkInterface.isLoopback) continue
+            for (interfaceAddress in networkInterface.interfaceAddresses.orEmpty()) {
+                val host = interfaceAddress.address?.hostAddress ?: continue
+                if (host.contains(":") || isTailscaleAddress(host)) continue
+                return host
             }
         }
         return ""
@@ -143,6 +163,11 @@ object LanDiscovery {
             .put("deviceType", "ANDROID_PHONE")
             .put("host", "")
             .put("port", NODE_RELAY_PORT)
+            .put("joinPort", NODE_RELAY_PORT)
+            .put("joinPublicKey", LanJoinCrypto.publicKeyBase64(context))
+            .put("joinFingerprint", LanJoinCrypto.fingerprint(context))
+            .put("capabilities", nodeCapabilities())
+            .put("networkId", LanTrustStore.getNetworkId(context))
             .put("topologyRole", "peer")
             .put("timestamp", System.currentTimeMillis())
         val bytes = payload.toString().toByteArray(Charsets.UTF_8)
@@ -176,6 +201,11 @@ object LanDiscovery {
             .put("deviceType", "ANDROID_PHONE")
             .put("host", "")
             .put("port", NODE_RELAY_PORT)
+            .put("joinPort", NODE_RELAY_PORT)
+            .put("joinPublicKey", LanJoinCrypto.publicKeyBase64(context))
+            .put("joinFingerprint", LanJoinCrypto.fingerprint(context))
+            .put("capabilities", nodeCapabilities())
+            .put("networkId", LanTrustStore.getNetworkId(context))
             .put("topologyRole", "peer")
             .put("timestamp", System.currentTimeMillis())
         val bytes = payload.toString().toByteArray(Charsets.UTF_8)
@@ -183,6 +213,18 @@ object LanDiscovery {
             socket.send(DatagramPacket(bytes, bytes.size, target, port))
         }
     }
+
+    private fun nodeCapabilities(): JSONObject =
+        JSONObject()
+            .put("topology", true)
+            .put("relay", true)
+            .put("sms", true)
+            .put("totp", true)
+            .put("clipboardText", true)
+            .put("clipboardImage", true)
+            .put("clipboardFile", true)
+            .put("fileTransfer", true)
+            .put("joinRequest", true)
 
     private fun parseDevice(payload: JSONObject, remoteAddress: String, localId: String): LanDiscoveredDevice? {
         if (payload.optString("protocol") != DISCOVERY_PROTOCOL) return null
@@ -200,6 +242,7 @@ object LanDiscovery {
 
         val host = remoteAddress.ifBlank { payload.optString("host", "").trim() }
         val port = payload.optInt("port", WS_PORT)
+        val joinPort = payload.optInt("joinPort", payload.optInt("relayPort", NODE_RELAY_PORT))
 
         if (host.isBlank()) return null
 
@@ -211,7 +254,12 @@ object LanDiscovery {
             type = deviceType,
             host = host,
             port = if (port > 0) port else WS_PORT,
-            pairingKey = pairingKey
+            pairingKey = pairingKey,
+            joinPort = if (joinPort > 0) joinPort else NODE_RELAY_PORT,
+            joinPublicKey = payload.optString("joinPublicKey").trim(),
+            joinFingerprint = payload.optString("joinFingerprint").trim(),
+            capabilities = payload.optJSONObject("capabilities")?.toString().orEmpty(),
+            networkId = payload.optString("networkId").trim()
         )
     }
 

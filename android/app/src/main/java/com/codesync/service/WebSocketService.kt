@@ -18,6 +18,7 @@ import com.codesync.util.ClipboardSyncState
 import com.codesync.util.CryptoUtil
 import com.codesync.util.DesktopDevice
 import com.codesync.util.DeviceStore
+import com.codesync.util.FileTransferRegistry
 import com.codesync.util.LanDiscovery
 import com.codesync.util.PhoneIdentityStore
 import com.codesync.util.SettingsStore
@@ -40,6 +41,7 @@ import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
@@ -67,6 +69,7 @@ class WebSocketService : Service() {
         const val ACTION_BROADCAST_TOPOLOGY = "com.codesync.BROADCAST_TOPOLOGY"
         const val ACTION_SEND_NOTIFICATION = "com.codesync.SEND_NOTIFICATION"
         const val ACTION_SEND_CLIPBOARD = "com.codesync.SEND_CLIPBOARD"
+        const val ACTION_SEND_FILE = "com.codesync.SEND_FILE"
 
         const val EXTRA_CODE = "code"
         const val EXTRA_SOURCE = "source"
@@ -86,6 +89,9 @@ class WebSocketService : Service() {
         const val EXTRA_DEVICE_IDS = "device_ids"
         const val EXTRA_RELAY_PAYLOAD = "relay_payload"
         const val EXTRA_TOPOLOGY_REASON = "topology_reason"
+        const val EXTRA_FILE_PATH = "file_path"
+        const val EXTRA_FILE_NAME = "file_name"
+        const val EXTRA_FILE_MIME = "file_mime"
 
         const val NOTIFICATION_ID = 1001
         const val CHANNEL_ID = "code_sync_service"
@@ -195,6 +201,7 @@ class WebSocketService : Service() {
             ACTION_SEND_SMS -> handleSendSms(intent)
             ACTION_SEND_NOTIFICATION -> handleSendNotification(intent)
             ACTION_SEND_CLIPBOARD -> handleSendClipboard(intent)
+            ACTION_SEND_FILE -> handleSendFile(intent)
             ACTION_SEND_TOTP_SEED -> handleSendTotpSeed(intent)
             ACTION_DELETE_TOTP_SEED -> handleDeleteTotpSeed(intent)
             ACTION_REVOKE_TOTP_ACCESS -> handleRevokeTotpAccess(intent)
@@ -298,11 +305,85 @@ class WebSocketService : Service() {
         enqueueAndDeliver(
             code = "",
             source = "剪贴板",
-            type = "clipboard",
+            type = "clipboard_text",
             label = "剪贴板",
             rawMessage = text,
             clipVersionTs = clipTs,
             clipVersionOrigin = clipOrigin
+        )
+    }
+
+    private fun handleSendFile(intent: Intent) {
+        if (!SettingsStore.isSyncClipboardFileEnabled(this)) {
+            stopIfNothingPending("文件发送未开启")
+            return
+        }
+        val filePath = intent.getStringExtra(EXTRA_FILE_PATH).orEmpty()
+        val file = File(filePath)
+        if (!file.isFile || file.length() <= 0L) {
+            stopIfNothingPending("文件无效")
+            return
+        }
+        val maxBytes = 512L * 1024L * 1024L
+        if (file.length() > maxBytes) {
+            stopIfNothingPending("文件超过发送上限")
+            return
+        }
+        val targetDevices = DeviceStore.getEnabledDevices(this)
+            .filter { it.allowFileTransfer }
+        if (targetDevices.isEmpty()) {
+            stopIfNothingPending("没有允许接收文件的推送目标")
+            return
+        }
+
+        holdForwardLocks()
+        val identity = PhoneIdentityStore.get(this)
+        val fileName = intent.getStringExtra(EXTRA_FILE_NAME).orEmpty().ifBlank { file.name }
+        val mime = intent.getStringExtra(EXTRA_FILE_MIME).orEmpty()
+            .ifBlank { FileTransferRegistry.guessMime(fileName) }
+        val host = LanDiscovery.localLanHost().ifBlank { LanDiscovery.localTailscaleHost() }
+        val manifest = FileTransferRegistry.registerOutgoingFile(
+            file = file,
+            name = fileName,
+            mime = mime,
+            identity = identity,
+            targetDeviceIds = targetDevices.map { it.id },
+            host = host,
+            relayPort = LanDiscovery.NODE_RELAY_PORT
+        )
+        val fileId = manifest.optString("fileId")
+        val payload = JSONObject()
+            .put("type", "file_transfer")
+            .put("code", "")
+            .put("source", "文件传输")
+            .put("label", fileName)
+            .put("rawMessage", "文件 $fileName")
+            .put("timestamp", System.currentTimeMillis())
+            .put("phoneId", identity.id)
+            .put("phoneName", identity.name)
+            .put("sourceDeviceId", identity.id)
+            .put("sourceDeviceName", identity.name)
+            .put("sourceDeviceType", "ANDROID_PHONE")
+            .put("originDeviceId", identity.id)
+            .put("originDeviceName", identity.name)
+            .put("originMessageId", fileId)
+            .put("relayMessageId", fileId)
+            .put("relayPath", JSONArray().put(identity.id))
+            .put("relayTtl", SMS_RELAY_TTL)
+            .put("relayPolicy", "source_selected_targets")
+            .put("targetDevices", buildTargetTopology(targetDevices))
+            .put("targetDeviceIds", JSONArray(targetDevices.map { it.id }))
+            .put("pushAuthority", "source_device")
+            .put("pushAuthorityDeviceId", identity.id)
+            .put("fileManifest", manifest)
+            .toString()
+
+        enqueuePayloadToDevices(
+            payload = payload,
+            targetDevices = targetDevices,
+            type = "file_transfer",
+            statusMessage = "正在同步文件到 ${targetDevices.size} 个设备节点",
+            msgId = fileId
         )
     }
 
@@ -396,6 +477,7 @@ class WebSocketService : Service() {
 
         val identity = PhoneIdentityStore.get(this)
         val delta = TopologyStore.buildDelta(this, reason = reason, ttl = ttl)
+        TopologyStore.rememberLocalDelta(this, delta)
         val relayMessageId = "topology-${identity.id}-${delta.optLong("seq", System.currentTimeMillis())}-${msgIdSeq.incrementAndGet()}"
         val payload = JSONObject(delta.toString())
             .put("originDeviceId", identity.id)
@@ -441,7 +523,7 @@ class WebSocketService : Service() {
         val msgId = "m-${phoneIdentity.id}-${System.currentTimeMillis()}-${msgIdSeq.incrementAndGet()}"
         // 剪贴板：originMessageId 与 LWW 版本绑定（clip-<origin>-<ts>），同一版本经
         // 多条路径/重复推送到达同一节点时，接收端用既有去重表即可收敛为一次处理
-        val originMessageId = if (type == "clipboard" && clipVersionTs > 0L) {
+        val originMessageId = if (isClipboardTextType(type) && clipVersionTs > 0L) {
             "clip-$clipVersionOrigin-$clipVersionTs"
         } else {
             msgId
@@ -463,7 +545,7 @@ class WebSocketService : Service() {
             .put("pushAuthorityDeviceId", phoneIdentity.id)
             .apply {
                 if (isUserMessageType(type)) {
-                    put("originDeviceId", if (type == "clipboard" && clipVersionOrigin.isNotBlank()) clipVersionOrigin else phoneIdentity.id)
+                    put("originDeviceId", if (isClipboardTextType(type) && clipVersionOrigin.isNotBlank()) clipVersionOrigin else phoneIdentity.id)
                     put("originDeviceName", phoneIdentity.name)
                     put("originMessageId", originMessageId)
                     put("relayMessageId", relayMessageId)
@@ -471,7 +553,7 @@ class WebSocketService : Service() {
                     put("relayTtl", SMS_RELAY_TTL)
                     put("relayPolicy", "source_selected_targets")
                 }
-                if (type == "clipboard" && clipVersionTs > 0L) {
+                if (isClipboardTextType(type) && clipVersionTs > 0L) {
                     put(
                         "clipVersion",
                         JSONObject().put("ts", clipVersionTs).put("origin", clipVersionOrigin)
@@ -501,6 +583,10 @@ class WebSocketService : Service() {
             return
         }
         val payloadType = payload.optString("type")
+        if (isTopologyPayloadType(payloadType)) {
+            stopIfNothingPending("topology relay skipped")
+            return
+        }
         if (!isRelaySupportedType(payloadType)) {
             stopIfNothingPending("该负载类型不支持节点中继")
             return
@@ -778,6 +864,12 @@ class WebSocketService : Service() {
                     .put("allowNotifications", device.allowNotifications)
                     .put("allowTotp", device.allowTotp)
                     .put("allowClipboard", device.allowClipboard)
+                    .put("allowClipboardText", device.allowClipboard)
+                    .put("allowClipboardImage", device.allowClipboardImage)
+                    .put("allowClipboardFile", device.allowClipboardFile)
+                    .put("allowFileTransfer", device.allowFileTransfer)
+                    .put("maxFileSizeMb", device.maxFileSizeMb)
+                    .put("autoAcceptFiles", device.autoAcceptFiles)
             )
         }
         return targets
@@ -824,7 +916,7 @@ class WebSocketService : Service() {
                 "websocket=${websocketTargets.size}, relay=${relayTargets.size}, " +
                 eligibleDevices.joinToString { "${it.name}/${it.type}/${it.host}:${it.port}" }
         )
-        relayTargets.forEach { deliverRelayToPhoneTarget(it, payload, msgId) }
+        relayTargets.forEach { deliverRelayToPhoneTarget(it, payload, msgId, type) }
         websocketTargets.forEach { connectDevice(it, registerOnly = false, force = force) }
     }
 
@@ -834,6 +926,35 @@ class WebSocketService : Service() {
                 it.type == "totp" || it.type == "totp_seed" || it.type == "totp_revoke"
             }
             pendingPayloads.removeAt(if (lowPriorityIndex >= 0) lowPriorityIndex else 0)
+        }
+    }
+
+    private fun deliverRelayToPhoneTarget(device: DesktopDevice, payload: String, msgId: String, type: String) {
+        serviceScope.launch {
+            val maxAttempts = if (isTopologyPayloadType(type)) 1 else 4
+            var success = false
+            for (attempt in 1..maxAttempts) {
+                success = sendRelayHttp(device, payload)
+                if (success) break
+                if (attempt < maxAttempts) {
+                    delay(
+                        when (attempt) {
+                            1 -> 2_000L
+                            2 -> 5_000L
+                            else -> 10_000L
+                        }
+                    )
+                }
+            }
+            if (success) {
+                DeviceStore.markDeviceSynced(this@WebSocketService, device.id)
+                ackDelivery(device.id, msgId)
+                updateConnectionState("relay delivered to ${device.name}")
+            } else {
+                failDelivery(device.id, msgId)
+                updateConnectionState("relay failed ${device.name}")
+            }
+            checkAllDoneAndStop()
         }
     }
 
@@ -888,10 +1009,8 @@ class WebSocketService : Service() {
                         .post(body)
                         .build()
                     relayHttpClient.newCall(request).execute().use { response ->
-                        if (!response.isSuccessful) {
-                            Log.w(TAG, "Relay HTTP rejected by ${device.name}@$host: ${response.code}")
-                        }
-                        return response.isSuccessful
+                        if (response.isSuccessful) return true
+                        Log.w(TAG, "Relay HTTP rejected by ${device.name}@$host: ${response.code}")
                     }
                 } catch (e: Exception) {
                     Log.w(TAG, "Relay HTTP unreachable for ${device.name}@$host: ${e.message}")
@@ -927,7 +1046,14 @@ class WebSocketService : Service() {
                 "app_notification" -> device.allowNotifications
                 "totp", "totp_seed", "totp_revoke" -> device.allowTotp
                 // 剪贴板不细分到每设备策略，仅受全局开关控制：所有启用设备都接收
-                "clipboard" -> device.allowClipboard && SettingsStore.isSyncClipboardEnabled(this)
+                "clipboard", "clipboard_text" ->
+                    device.allowClipboard && SettingsStore.isSyncClipboardEnabled(this)
+                "clipboard_image" ->
+                    device.allowClipboardImage && SettingsStore.isSyncClipboardImageEnabled(this)
+                "clipboard_file" ->
+                    device.allowClipboardFile && SettingsStore.isSyncClipboardFileEnabled(this)
+                "file_transfer" ->
+                    device.allowFileTransfer
                 else -> true
             }
         }
@@ -992,10 +1118,19 @@ class WebSocketService : Service() {
         return type == "sms" ||
             type == "sms_message" ||
             type == "app_notification" ||
-            type == "clipboard"
+            isClipboardTextType(type) ||
+            type == "clipboard_image" ||
+            type == "clipboard_file" ||
+            type == "file_transfer"
     }
 
+    private fun isClipboardTextType(type: String): Boolean =
+        type == "clipboard" || type == "clipboard_text"
+
     private fun deliveryStatusMessage(type: String, targetCount: Int): String {
+        if (type == "clipboard_text") return "正在同步剪贴板文本到 $targetCount 个设备节点"
+        if (type == "clipboard_image") return "正在同步剪贴板图片到 $targetCount 个设备节点"
+        if (type == "clipboard_file" || type == "file_transfer") return "正在同步文件到 $targetCount 个设备节点"
         return when (type) {
             "sms" -> "正在投递验证码到 $targetCount 个设备节点"
             "sms_message" -> "正在投递短信到 $targetCount 个设备节点"
@@ -1006,6 +1141,9 @@ class WebSocketService : Service() {
     }
 
     private fun relayStatusMessage(type: String, targetCount: Int): String {
+        if (type == "clipboard_text") return "正在中继剪贴板文本到 $targetCount 个设备节点"
+        if (type == "clipboard_image") return "正在中继剪贴板图片到 $targetCount 个设备节点"
+        if (type == "clipboard_file" || type == "file_transfer") return "正在中继文件到 $targetCount 个设备节点"
         return when (type) {
             "sms" -> "正在中继验证码到 $targetCount 个设备节点"
             "sms_message" -> "正在中继短信到 $targetCount 个设备节点"
@@ -1109,16 +1247,17 @@ class WebSocketService : Service() {
                 connection.phoneNonce = phoneNonce
                 // 注意：auth 消息走明文 ws://，不携带本机 relay 配对密钥；
                 // 密钥在鉴权成功、会话密钥建立后通过加密 node_info 上报（见 auth_ok 分支）
-                val authMsg = JSONObject()
-                    .put("type", "auth")
-                    .put("authVersion", 2)
-                    .put("phoneId", phoneIdentity.id)
-                    .put("phoneName", phoneIdentity.name)
-                    .put("phoneDeviceType", "ANDROID_PHONE")
-                    .put("phoneNonce", phoneNonce)
-                    .put("authToken", CryptoUtil.hmacSha256Base64(device.pairingKey, "${phoneIdentity.id}|$phoneNonce"))
-                    .toString()
-                webSocket.send(authMsg)
+        val authMsg = JSONObject()
+            .put("type", "auth")
+            .put("authVersion", 2)
+            .put("phoneId", phoneIdentity.id)
+            .put("phoneName", phoneIdentity.name)
+            .put("phoneDeviceType", "ANDROID_PHONE")
+            .put("phoneNonce", phoneNonce)
+            .put("requestTopology", connection.registerOnly || deviceHasPendingType(device.id, "topology_delta"))
+            .put("authToken", CryptoUtil.hmacSha256Base64(device.pairingKey, "${phoneIdentity.id}|$phoneNonce"))
+            .toString()
+        webSocket.send(authMsg)
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
@@ -1137,7 +1276,13 @@ class WebSocketService : Service() {
                             hostRotation.remove(device.id)
                             // 会话密钥就绪后第一时间加密上报本机 relay 信息（替代明文 auth 字段）
                             sendNodeInfo(webSocket, connection)
-                            sendStoredTopologyDelta(webSocket, connection)
+                            val hasPendingTopology = deviceHasPendingType(device.id, "topology_delta")
+                            if (connection.registerOnly || hasPendingTopology) {
+                                requestTopologySnapshot(webSocket, connection)
+                            }
+                            if (connection.registerOnly && !hasPendingTopology) {
+                                sendStoredTopologyDelta(webSocket, connection)
+                            }
                             DeviceStore.markDeviceSynced(this@WebSocketService, device.id)
                             Log.d(TAG, "Authenticated ${device.name}")
                             val delivered = flushPendingForDevice(device.id)
@@ -1180,6 +1325,19 @@ class WebSocketService : Service() {
                             val msgId = msg.optString("msgId")
                             if (msgId.isNotBlank()) {
                                 webSocket.send(JSONObject().put("type", "code_ack").put("msgId", msgId).toString())
+                            }
+                        }
+                        "topology_snapshot_request" -> {
+                            val sessionKey = connection.sessionKey
+                            val encryptedPayload = msg.optString("payload")
+                            if (!sessionKey.isNullOrBlank() && encryptedPayload.isNotBlank()) {
+                                runCatching { JSONObject(CryptoUtil.decrypt(encryptedPayload, sessionKey)) }
+                                    .onSuccess { request ->
+                                        val replayed = replayTopologyBacklog(webSocket, connection, request.optJSONObject("seenSeq"))
+                                        if (!replayed) {
+                                            sendStoredTopologyDelta(webSocket, connection, reason = "snapshot_response", remember = false)
+                                        }
+                                    }
                             }
                         }
                         "auth_fail" -> {
@@ -1250,6 +1408,17 @@ class WebSocketService : Service() {
                 .put("type", "node_info")
                 .put("nodePairingKey", identity.pairingKey)
                 .put("nodeRelayPort", LanDiscovery.NODE_RELAY_PORT)
+                .put("nodeRelayHost", LanDiscovery.localLanHost())
+                .put("capabilities", JSONObject()
+                    .put("topology", true)
+                    .put("relay", true)
+                    .put("sms", true)
+                    .put("totp", true)
+                    .put("clipboardText", true)
+                    .put("clipboardImage", true)
+                    .put("clipboardFile", true)
+                    .put("fileTransfer", true)
+                    .put("joinRequest", true))
                 .apply {
                     // 本机的 Tailscale IP（如有）：桌面端会把它随路由表分发给其它
                     // 手机节点作为备用 relay 地址，实现跨网段的节点直连
@@ -1268,10 +1437,36 @@ class WebSocketService : Service() {
         }
     }
 
-    private fun sendStoredTopologyDelta(webSocket: WebSocket, connection: DeviceConnection) {
+    private fun requestTopologySnapshot(webSocket: WebSocket, connection: DeviceConnection) {
         val sessionKey = connection.sessionKey ?: return
         try {
-            val delta = TopologyStore.buildDelta(this, reason = "android_auth")
+            val identity = PhoneIdentityStore.get(this)
+            val payload = JSONObject()
+                .put("type", "topology_snapshot_request")
+                .put("sourceDeviceId", identity.id)
+                .put("seenSeq", TopologyStore.seenSeqSnapshot(this))
+                .put("timestamp", System.currentTimeMillis())
+            webSocket.send(
+                JSONObject()
+                    .put("type", "topology_snapshot_request")
+                    .put("payload", CryptoUtil.encrypt(payload.toString(), sessionKey))
+                    .toString()
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "请求 topology snapshot 失败", e)
+        }
+    }
+
+    private fun sendStoredTopologyDelta(
+        webSocket: WebSocket,
+        connection: DeviceConnection,
+        reason: String = "android_auth",
+        remember: Boolean = true
+    ) {
+        val sessionKey = connection.sessionKey ?: return
+        try {
+            val delta = TopologyStore.buildDelta(this, reason = reason)
+            if (remember) TopologyStore.rememberLocalDelta(this, delta)
             webSocket.send(
                 JSONObject()
                     .put("type", "topology_delta")
@@ -1280,6 +1475,30 @@ class WebSocketService : Service() {
             )
         } catch (e: Exception) {
             Log.e(TAG, "发送 topology_delta 失败", e)
+        }
+    }
+
+    private fun replayTopologyBacklog(
+        webSocket: WebSocket,
+        connection: DeviceConnection,
+        seenSeq: JSONObject?
+    ): Boolean {
+        val sessionKey = connection.sessionKey ?: return false
+        val deltas = TopologyStore.replayDeltasSince(this, seenSeq)
+        if (deltas.isEmpty()) return false
+        return try {
+            deltas.forEach { delta ->
+                webSocket.send(
+                    JSONObject()
+                        .put("type", "topology_delta")
+                        .put("payload", CryptoUtil.encrypt(delta.toString(), sessionKey))
+                        .toString()
+                )
+            }
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "回放 topology delta 失败", e)
+            false
         }
     }
 
@@ -1301,10 +1520,6 @@ class WebSocketService : Service() {
             if (changed) {
                 updateConnectionState("已更新拓扑：${connection.device.name}")
                 notifyTotpSynced()
-                val ttl = delta.optInt("relayTtl", delta.optInt("ttl", SMS_RELAY_TTL))
-                if (ttl > 0 && DeviceStore.getEnabledDevices(this).any { it.id != connection.device.id }) {
-                    enqueueRelayPayload(delta.toString(), excludeDeviceId = connection.device.id)
-                }
             }
         } catch (e: Exception) {
             Log.e(TAG, "topology_delta 解析失败", e)
@@ -1441,7 +1656,20 @@ class WebSocketService : Service() {
                         ?: route?.optLong("updatedAt", 0L) ?: 0L,
                     altHosts = (jsonArrayToList(node.optJSONArray("altHosts")) +
                         listOfNotNull(node.optString("tsHost").trim().takeIf { it.isNotBlank() }))
-                        .distinct()
+                        .distinct(),
+                    policyAllowSmsCodes = node.optBoolean("allowSmsCodes", true),
+                    policyAllowSmsMessages = node.optBoolean("allowSmsMessages", true),
+                    policyAllowNotifications = node.optBoolean("allowNotifications", true),
+                    policyAllowTotp = node.optBoolean("allowTotp", true),
+                    policyAllowClipboard = node.optBoolean(
+                        "allowClipboardText",
+                        node.optBoolean("allowClipboard", false)
+                    ),
+                    policyAllowClipboardImage = node.optBoolean("allowClipboardImage", false),
+                    policyAllowClipboardFile = node.optBoolean("allowClipboardFile", false),
+                    policyAllowFileTransfer = node.optBoolean("allowFileTransfer", false),
+                    policyMaxFileSizeMb = node.optInt("maxFileSizeMb", 50),
+                    policyAutoAcceptFiles = node.optBoolean("autoAcceptFiles", false)
                 )
                 imported += 1
             }
@@ -1602,6 +1830,26 @@ class WebSocketService : Service() {
     private fun deviceHasPending(deviceId: String): Boolean {
         synchronized(pendingPayloads) {
             return pendingPayloads.any { deviceId in it.targetIds }
+        }
+    }
+
+    private fun deviceHasPendingType(deviceId: String, type: String): Boolean {
+        synchronized(pendingPayloads) {
+            return pendingPayloads.any { deviceId in it.targetIds && it.type == type }
+        }
+    }
+
+    private fun failDelivery(deviceId: String, msgId: String) {
+        synchronized(pendingPayloads) {
+            val iterator = pendingPayloads.iterator()
+            while (iterator.hasNext()) {
+                val pending = iterator.next()
+                if (pending.msgId == msgId || msgId.isBlank()) {
+                    pending.targetIds.remove(deviceId)
+                    if (pending.targetIds.isEmpty()) iterator.remove()
+                    if (msgId.isNotBlank()) break
+                }
+            }
         }
     }
 

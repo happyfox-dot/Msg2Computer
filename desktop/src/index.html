@@ -198,13 +198,39 @@
         </div>
 
         <div class="settings-group">
-          <h3 class="settings-group-title">剪贴板同步</h3>
+          <h3 class="settings-group-title">可信入网</h3>
           <label class="settings-item settings-checkbox">
-            <span class="settings-label">同步剪贴板</span>
-            <input type="checkbox" id="chk-sync-clipboard">
+            <span class="settings-label">允许其它设备请求加入本网络</span>
+            <input type="checkbox" id="chk-allow-lan-join">
           </label>
           <div class="settings-item">
-            <span class="settings-label settings-hint">开启后本机复制的内容会自动同步到已连接的节点，并接收其它节点同步过来的剪贴板。剪贴板可能含密码等敏感信息，请按需启用。</span>
+            <span class="settings-label settings-hint">关闭后，本机仍会出现在局域网发现中，但会拒绝新的入网确认请求。</span>
+          </div>
+        </div>
+
+        <div class="settings-group">
+          <h3 class="settings-group-title">剪贴板同步</h3>
+          <label class="settings-item settings-checkbox">
+            <span class="settings-label">同步文本剪贴板</span>
+            <input type="checkbox" id="chk-sync-clipboard-text">
+          </label>
+          <label class="settings-item settings-checkbox">
+            <span class="settings-label">同步图片剪贴板</span>
+            <input type="checkbox" id="chk-sync-clipboard-image">
+          </label>
+          <label class="settings-item settings-checkbox">
+            <span class="settings-label">接收文件/文件剪贴板</span>
+            <input type="checkbox" id="chk-sync-clipboard-file">
+          </label>
+          <div class="settings-item">
+            <span class="settings-label settings-hint">文本会自动同步；图片优先同步较小 PNG；文件默认关闭，开启后通过独立加密分片通道传输。</span>
+          </div>
+          <div class="settings-item">
+            <span class="settings-label">主动发送文件</span>
+            <div class="update-control">
+              <button id="btn-send-file" class="btn-action" type="button">选择文件发送</button>
+              <span id="file-transfer-status" class="settings-hint"></span>
+            </div>
           </div>
         </div>
 

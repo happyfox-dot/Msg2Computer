@@ -28,9 +28,20 @@ data class DesktopDevice(
     // 针对个别设备的显式关闭（旧默认 false 导致全局开关打开后剪贴板
     // 同步依然提示"没有启用的推送目标"）
     val allowClipboard: Boolean = true,
+    val allowClipboardImage: Boolean = false,
+    val allowClipboardFile: Boolean = false,
+    val allowFileTransfer: Boolean = false,
+    val maxFileSizeMb: Int = 50,
+    val autoAcceptFiles: Boolean = false,
     // 备用地址（如对端的 Tailscale 100.x IP）：主地址连不上时按序轮试，
     // 让设备跨网段（不在同一局域网）时仍可通过 Tailscale 虚拟网连接
-    val altHosts: List<String> = emptyList()
+    val altHosts: List<String> = emptyList(),
+    val networkId: String = "",
+    val autoPaired: Boolean = false,
+    val trustSourceId: String = "",
+    val trustLevel: String = "",
+    val acceptedAt: Long = 0L,
+    val capabilities: String = "{}"
 )
 
 object DeviceStore {
@@ -73,8 +84,22 @@ object DeviceStore {
                         allowSmsMessages = item.optBoolean("allowSmsMessages", true),
                         allowNotifications = item.optBoolean("allowNotifications", true),
                         allowTotp = item.optBoolean("allowTotp", true),
-                        allowClipboard = item.optBoolean("allowClipboard", true),
-                        altHosts = jsonArrayToList(item.optJSONArray("altHosts"))
+                        allowClipboard = item.optBoolean(
+                            "allowClipboardText",
+                            item.optBoolean("allowClipboard", true)
+                        ),
+                        allowClipboardImage = item.optBoolean("allowClipboardImage", false),
+                        allowClipboardFile = item.optBoolean("allowClipboardFile", false),
+                        allowFileTransfer = item.optBoolean("allowFileTransfer", false),
+                        maxFileSizeMb = item.optInt("maxFileSizeMb", 50).coerceIn(1, 512),
+                        autoAcceptFiles = item.optBoolean("autoAcceptFiles", false),
+                        altHosts = jsonArrayToList(item.optJSONArray("altHosts")),
+                        networkId = item.optString("networkId"),
+                        autoPaired = item.optBoolean("autoPaired", false),
+                        trustSourceId = item.optString("trustSourceId"),
+                        trustLevel = item.optString("trustLevel"),
+                        acceptedAt = item.optLong("acceptedAt", 0L),
+                        capabilities = item.optString("capabilities", "{}").ifBlank { "{}" }
                     )
                 )
             }
@@ -105,6 +130,22 @@ object DeviceStore {
         routePath: List<String> = emptyList(),
         routeUpdatedAt: Long = 0L,
         altHosts: List<String> = emptyList(),
+        networkId: String = "",
+        autoPaired: Boolean = false,
+        trustSourceId: String = "",
+        trustLevel: String = "",
+        acceptedAt: Long = 0L,
+        capabilities: String = "{}",
+        policyAllowSmsCodes: Boolean? = null,
+        policyAllowSmsMessages: Boolean? = null,
+        policyAllowNotifications: Boolean? = null,
+        policyAllowTotp: Boolean? = null,
+        policyAllowClipboard: Boolean? = null,
+        policyAllowClipboardImage: Boolean? = null,
+        policyAllowClipboardFile: Boolean? = null,
+        policyAllowFileTransfer: Boolean? = null,
+        policyMaxFileSizeMb: Int? = null,
+        policyAutoAcceptFiles: Boolean? = null,
         // 「启用」开关归本机用户所有：null（默认）表示本次调用不改写已存值，
         // 仅新建条目时取 true。拓扑同步（topology_sync/gossip）必须用默认值，
         // 否则用户在本机禁用的推送目标会被任何一次同步悄悄重新启用；
@@ -145,8 +186,19 @@ object DeviceStore {
                 allowNotifications = existing.allowNotifications,
                 allowTotp = existing.allowTotp,
                 allowClipboard = existing.allowClipboard,
+                allowClipboardImage = existing.allowClipboardImage,
+                allowClipboardFile = existing.allowClipboardFile,
+                allowFileTransfer = existing.allowFileTransfer,
+                maxFileSizeMb = existing.maxFileSizeMb,
+                autoAcceptFiles = existing.autoAcceptFiles,
                 // 备用地址不参与新鲜度比较：本次没带就保留旧值（主地址变化时剔除重复）
-                altHosts = altHosts.ifEmpty { existing.altHosts }.filter { it.isNotBlank() && it != host }.distinct()
+                altHosts = altHosts.ifEmpty { existing.altHosts }.filter { it.isNotBlank() && it != host }.distinct(),
+                networkId = networkId.ifBlank { existing.networkId },
+                autoPaired = autoPaired || existing.autoPaired,
+                trustSourceId = trustSourceId.ifBlank { existing.trustSourceId },
+                trustLevel = trustLevel.ifBlank { existing.trustLevel },
+                acceptedAt = acceptedAt.takeIf { it > 0L } ?: existing.acceptedAt,
+                capabilities = capabilities.ifBlank { existing.capabilities }.ifBlank { "{}" }
             )
         } else {
             DesktopDevice(
@@ -164,12 +216,23 @@ object DeviceStore {
                 routeNextHopName = routeNextHopName,
                 routePath = routePath,
                 routeUpdatedAt = routeUpdatedAt,
-                allowSmsCodes = true,
-                allowSmsMessages = true,
-                allowNotifications = true,
-                allowTotp = true,
-                allowClipboard = true,
-                altHosts = altHosts.filter { it.isNotBlank() && it != host }.distinct()
+                allowSmsCodes = policyAllowSmsCodes ?: true,
+                allowSmsMessages = policyAllowSmsMessages ?: true,
+                allowNotifications = policyAllowNotifications ?: true,
+                allowTotp = policyAllowTotp ?: true,
+                allowClipboard = policyAllowClipboard ?: true,
+                allowClipboardImage = policyAllowClipboardImage ?: false,
+                allowClipboardFile = policyAllowClipboardFile ?: false,
+                allowFileTransfer = policyAllowFileTransfer ?: false,
+                maxFileSizeMb = (policyMaxFileSizeMb ?: 50).coerceIn(1, 512),
+                autoAcceptFiles = policyAutoAcceptFiles ?: false,
+                altHosts = altHosts.filter { it.isNotBlank() && it != host }.distinct(),
+                networkId = networkId,
+                autoPaired = autoPaired,
+                trustSourceId = trustSourceId,
+                trustLevel = trustLevel,
+                acceptedAt = acceptedAt,
+                capabilities = capabilities.ifBlank { "{}" }
             )
         }
 
@@ -196,7 +259,12 @@ object DeviceStore {
         allowSmsMessages: Boolean,
         allowNotifications: Boolean,
         allowTotp: Boolean,
-        allowClipboard: Boolean
+        allowClipboard: Boolean,
+        allowClipboardImage: Boolean? = null,
+        allowClipboardFile: Boolean? = null,
+        allowFileTransfer: Boolean? = null,
+        maxFileSizeMb: Int? = null,
+        autoAcceptFiles: Boolean? = null
     ) {
         val devices = getDevices(context).map {
             if (it.id == id) {
@@ -206,6 +274,11 @@ object DeviceStore {
                     allowNotifications = allowNotifications,
                     allowTotp = allowTotp,
                     allowClipboard = allowClipboard,
+                    allowClipboardImage = allowClipboardImage ?: it.allowClipboardImage,
+                    allowClipboardFile = allowClipboardFile ?: it.allowClipboardFile,
+                    allowFileTransfer = allowFileTransfer ?: it.allowFileTransfer,
+                    maxFileSizeMb = (maxFileSizeMb ?: it.maxFileSizeMb).coerceIn(1, 512),
+                    autoAcceptFiles = autoAcceptFiles ?: it.autoAcceptFiles,
                     updatedAt = System.currentTimeMillis()
                 )
             } else {
@@ -250,7 +323,19 @@ object DeviceStore {
                     .put("allowNotifications", device.allowNotifications)
                     .put("allowTotp", device.allowTotp)
                     .put("allowClipboard", device.allowClipboard)
+                    .put("allowClipboardText", device.allowClipboard)
+                    .put("allowClipboardImage", device.allowClipboardImage)
+                    .put("allowClipboardFile", device.allowClipboardFile)
+                    .put("allowFileTransfer", device.allowFileTransfer)
+                    .put("maxFileSizeMb", device.maxFileSizeMb)
+                    .put("autoAcceptFiles", device.autoAcceptFiles)
                     .put("altHosts", JSONArray(device.altHosts))
+                    .put("networkId", device.networkId)
+                    .put("autoPaired", device.autoPaired)
+                    .put("trustSourceId", device.trustSourceId)
+                    .put("trustLevel", device.trustLevel)
+                    .put("acceptedAt", device.acceptedAt)
+                    .put("capabilities", device.capabilities)
             )
         }
         prefs(context).edit().putString(KEY_DEVICES, array.toString()).apply()

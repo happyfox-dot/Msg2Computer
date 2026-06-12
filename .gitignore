@@ -66,3 +66,10 @@ release_v*/
 # 发版时临时复制到仓库根目录的 ASCII 名产物
 /Msg2Computer-*.apk
 /Msg2Computer-*.exe
+
+# Linux.do monitor local state/browser profile
+scripts/linuxdo-topic-monitor.js
+scripts/start-linuxdo-topic-monitor.ps1
+scripts/stop-linuxdo-topic-monitor.ps1
+scripts/.linuxdo-*
+scripts/browser-profile/
