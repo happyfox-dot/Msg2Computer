@@ -30,15 +30,15 @@
         <item name="android:navigationBarColor">@android:color/transparent</item>
     </style>
 
-    <!-- 卡片：圆角 + 微弱描边，无重阴影，贴合深色界面。
+    <!-- 卡片：圆角 + 微弱描边 + 轻阴影，从深色背景里浮出来。
          内部 padding 由各卡片内的 LinearLayout 负责，这里不设 contentPadding 以免叠加。 -->
     <style name="CardSurface" parent="Widget.Material3.CardView.Elevated">
         <item name="android:layout_width">match_parent</item>
         <item name="android:layout_height">wrap_content</item>
         <item name="android:layout_marginBottom">12dp</item>
         <item name="cardBackgroundColor">@color/bg_surface</item>
-        <item name="cardCornerRadius">16dp</item>
-        <item name="cardElevation">0dp</item>
+        <item name="cardCornerRadius">18dp</item>
+        <item name="cardElevation">2dp</item>
         <item name="strokeColor">@color/outline</item>
         <item name="strokeWidth">1dp</item>
     </style>

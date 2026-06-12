@@ -99,7 +99,78 @@ async function main() {
   const downloadedPath = path.join(downloads, downloaded)
   if (sha256File(downloadedPath) !== sha256File(sourcePath)) throw new Error('hash mismatch')
 
-  console.log('file-transfer roundtrip: 1 passed, 0 failed')
+  // ===== 用例 2：relativePath 重建目录树（目录分享） =====
+  let dirManifest = null
+  const dirSource = path.join(tmp, 'tree.bin')
+  fs.writeFileSync(dirSource, crypto.randomBytes(64 * 1024 + 7))
+  const dirSender = createFileTransfer({
+    getIdentity: () => ({ id: senderId, name: 'Desktop A', type: 'WINDOWS_DESKTOP' }),
+    encryptBytes,
+    decryptBytes,
+    hmacBase64,
+    generateNonce: () => crypto.randomBytes(16).toString('base64'),
+    sendManifest: async (targets, payload) => {
+      dirManifest = payload.fileManifest
+      return targets.length
+    },
+    lookupPeerKey: id => id === receiverId ? key : null,
+    resolveSource: () => null,
+    httpGet: async () => null,
+    downloadDir: downloads,
+    tmpDir: incomingTmp,
+    maxChunkBytes: 256 * 1024
+  })
+  await dirSender.offerFile(dirSource, [receiverId], { relativePath: 'myfolder/sub/../..\\evil/tree.bin' })
+  if (!dirManifest || dirManifest.relativePath !== 'myfolder/sub/../..\\evil/tree.bin') {
+    throw new Error('relativePath missing in manifest')
+  }
+  const dirServeChunk = async ({ path: reqPath }) => {
+    const url = new URL(reqPath, 'http://127.0.0.1')
+    const prefix = url.pathname.startsWith('/file/proxy/')
+      ? url.pathname.split('/').slice(0, 4).join('/') + '/'
+      : '/file/'
+    const result = await dirSender.serveFileChunk({
+      fileId: decodeURIComponent(url.pathname.slice(prefix.length)),
+      from: url.searchParams.get('from'),
+      to: url.searchParams.get('to'),
+      senderId: url.searchParams.get('senderId'),
+      nonce: url.searchParams.get('nonce'),
+      authToken: url.searchParams.get('authToken')
+    })
+    return { status: result.status, body: result.body }
+  }
+  // 用例 3 一并验证：直连不可达（resolveSource 无 host）时经代理候选回退拉取
+  const proxyHits = []
+  const dirReceiver = createFileTransfer({
+    getIdentity: () => ({ id: receiverId, name: 'Phone B', type: 'ANDROID_PHONE' }),
+    encryptBytes,
+    decryptBytes,
+    hmacBase64,
+    generateNonce: () => crypto.randomBytes(16).toString('base64'),
+    sendManifest: async () => 0,
+    lookupPeerKey: () => null,
+    resolveSource: id => id === senderId
+      ? { id: senderId, name: 'Desktop A', host: '', port: 19529, pairingKey: key }
+      : null,
+    resolveRelayCandidates: () => [{ id: 'relay-c', host: '10.0.0.9', port: 19529, name: 'Relay C' }],
+    httpGet: async ({ host, path: reqPath }) => {
+      if (host !== '10.0.0.9' || !reqPath.startsWith(`/file/proxy/${senderId}/`)) return null
+      proxyHits.push(reqPath)
+      return dirServeChunk({ path: reqPath })
+    },
+    downloadDir: downloads,
+    tmpDir: incomingTmp,
+    maxChunkBytes: 256 * 1024
+  })
+  const dirPulled = await dirReceiver.startIncomingPull(dirManifest, { maxBytes: 10 * 1024 * 1024 })
+  if (!dirPulled) throw new Error('proxy/relativePath pull failed')
+  if (proxyHits.length === 0) throw new Error('proxy transport not used')
+  // 消毒后只保留 myfolder/sub/evil（.. 段被剔除，文件名取 manifest.name）
+  const treePath = path.join(downloads, 'myfolder', 'sub', 'evil', 'tree.bin')
+  if (!fs.existsSync(treePath)) throw new Error(`relativePath tree missing: ${treePath}`)
+  if (sha256File(treePath) !== sha256File(dirSource)) throw new Error('tree hash mismatch')
+
+  console.log('file-transfer roundtrip: 3 passed, 0 failed')
 }
 
 main().catch(error => {

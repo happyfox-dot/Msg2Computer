@@ -250,6 +250,13 @@ function setupSettings() {
       window.electronAPI.openExternal?.('https://github.com/happyfox-dot/Msg2Computer')
     })
   }
+  // 版本号动态取自主进程 app.getVersion()，避免 HTML 里硬编码导致与实际打包版本漂移
+  const versionEl = document.getElementById('app-version')
+  if (versionEl && window.electronAPI.getAppVersion) {
+    window.electronAPI.getAppVersion()
+      .then((v) => { if (v) versionEl.textContent = `v${v}` })
+      .catch(() => {})
+  }
   setupMessageSettings()
   setupFileTransferControls()
   setupLanJoinSettings()
@@ -283,11 +290,31 @@ function setupUpdateControl() {
   const statusText = document.getElementById('update-status-text')
   if (!btn || !window.electronAPI.checkForUpdate) return
 
+  // 检查失败时给一个「前往 GitHub 手动下载」兜底链接，避免用户卡在无去向的失败提示里。
+  // 链接按需创建一次，之后随状态显隐。
+  let fallbackLink = null
+  const ensureFallbackLink = () => {
+    if (fallbackLink) return fallbackLink
+    fallbackLink = document.createElement('a')
+    fallbackLink.href = '#'
+    fallbackLink.className = 'settings-link update-fallback-link'
+    fallbackLink.textContent = '手动下载'
+    fallbackLink.addEventListener('click', (e) => {
+      e.preventDefault()
+      window.electronAPI.openExternal?.('https://github.com/happyfox-dot/Msg2Computer/releases/latest')
+    })
+    btn.parentElement?.appendChild(fallbackLink)
+    return fallbackLink
+  }
+
   const applyState = (state) => {
     if (statusText) statusText.textContent = describeUpdateState(state)
     // 检查/下载进行中禁用按钮，避免重复触发
     const busy = state && (state.status === 'checking' || state.status === 'downloading')
     btn.disabled = !!busy
+    // 仅在出错时显示手动下载兜底
+    const link = (state && state.status === 'error') ? ensureFallbackLink() : fallbackLink
+    if (link) link.style.display = (state && state.status === 'error') ? 'inline' : 'none'
   }
 
   // 订阅主进程推送的实时更新状态（下载进度、下载完成等）
@@ -360,46 +387,86 @@ async function setupMessageSettings() {
 
 function setupFileTransferControls() {
   const button = document.getElementById('btn-send-file')
+  const folderButton = document.getElementById('btn-send-folder')
   const status = document.getElementById('file-transfer-status')
+  const transferList = document.getElementById('file-transfer-list')
   if (!button || !window.electronAPI.selectAndSendFile) return
 
   const setStatus = (text) => {
     if (status) status.textContent = text || ''
   }
 
-  button.addEventListener('click', async () => {
-    button.disabled = true
-    setStatus('选择文件…')
-    try {
-      const result = await window.electronAPI.selectAndSendFile()
-      if (result?.canceled) {
-        setStatus('')
-      } else if (result?.success) {
-        const count = Array.isArray(result.sent) ? result.sent.length : 0
-        setStatus(`已发送 ${count} 个文件`)
-        showNotification('文件已发送', `目标 ${result.targetIds?.length || 0} 个节点`)
-      } else {
-        setStatus(result?.error || '发送失败')
-        showNotification('文件发送失败', result?.error || '没有可用目标')
-      }
-    } catch (error) {
-      setStatus('发送失败')
-      showNotification('文件发送失败', error.message || '请重试')
-    } finally {
-      button.disabled = false
-      setTimeout(() => setStatus(''), 5000)
+  const handleSendResult = (result, kind) => {
+    if (result?.canceled) {
+      setStatus('')
+    } else if (result?.success) {
+      const count = Array.isArray(result.sent) ? result.sent.length : 0
+      setStatus(`已发送 ${count} 个文件`)
+      showNotification(`${kind}已发送`, `共 ${count} 个文件 → ${result.targetIds?.length || 0} 个节点`)
+    } else {
+      setStatus(result?.error || '发送失败')
+      showNotification(`${kind}发送失败`, result?.error || '没有可用目标')
     }
-  })
+  }
+
+  const bindSendButton = (element, invoke, kind) => {
+    if (!element || typeof invoke !== 'function') return
+    element.addEventListener('click', async () => {
+      element.disabled = true
+      setStatus('选择中…')
+      try {
+        handleSendResult(await invoke(), kind)
+      } catch (error) {
+        setStatus('发送失败')
+        showNotification(`${kind}发送失败`, error.message || '请重试')
+      } finally {
+        element.disabled = false
+        setTimeout(() => setStatus(''), 5000)
+      }
+    })
+  }
+
+  bindSendButton(button, () => window.electronAPI.selectAndSendFile(), '文件')
+  bindSendButton(folderButton, () => window.electronAPI.selectAndSendFolder?.(), '文件夹')
+
+  // 接收进度列表：每个 fileId 一行（文件名 + 进度条 + 百分比），完成后短暂停留
+  const transferRows = new Map()
+  const upsertTransferRow = (fileId, name, received, size, done) => {
+    if (!transferList || !fileId) return
+    let row = transferRows.get(fileId)
+    if (!row) {
+      const root = document.createElement('div')
+      root.className = 'file-transfer-row'
+      const label = document.createElement('div')
+      label.className = 'file-transfer-name'
+      const track = document.createElement('div')
+      track.className = 'file-transfer-track'
+      const bar = document.createElement('div')
+      bar.className = 'file-transfer-bar'
+      track.appendChild(bar)
+      root.appendChild(label)
+      root.appendChild(track)
+      transferList.appendChild(root)
+      row = { root, label, bar }
+      transferRows.set(fileId, row)
+    }
+    const percent = size > 0 ? Math.min(100, Math.round((received || 0) * 100 / size)) : 0
+    row.bar.style.width = `${done ? 100 : percent}%`
+    row.label.textContent = done ? `${name || '文件'} · 完成` : `${name || '文件'} · ${percent}%`
+    if (done) {
+      row.root.classList.add('done')
+      transferRows.delete(fileId)
+      setTimeout(() => row.root.remove(), 4000)
+    }
+  }
 
   window.electronAPI.onFileTransferProgress?.((progress) => {
     if (!progress || !progress.size) return
-    const percent = Math.min(100, Math.round((progress.received || 0) * 100 / progress.size))
-    setStatus(`接收 ${progress.name || '文件'} ${percent}%`)
+    upsertTransferRow(progress.fileId, progress.name, progress.received, progress.size, false)
   })
   window.electronAPI.onFileTransferComplete?.((result) => {
-    setStatus(`已接收 ${result?.name || '文件'}`)
+    upsertTransferRow(result?.fileId || result?.name || 'last', result?.name, 1, 1, true)
     showNotification('文件接收完成', result?.name || '')
-    setTimeout(() => setStatus(''), 5000)
   })
 }
 
@@ -1362,6 +1429,8 @@ function mergeTopologyViewNode(nodeMap, node) {
 
 function normalizeTopologyContentPolicy(policy = {}) {
   const allowClipboardText = policy.allowClipboardText !== false && policy.allowClipboard !== false
+  const hasClipboardImagePolicy = Object.prototype.hasOwnProperty.call(policy, 'allowClipboardImage') ||
+    Object.prototype.hasOwnProperty.call(policy, 'allowImages')
   return {
     allowSmsCodes: policy.allowSmsCodes !== false,
     allowSmsMessages: policy.allowSmsMessages !== false,
@@ -1369,7 +1438,9 @@ function normalizeTopologyContentPolicy(policy = {}) {
     allowTotp: policy.allowTotp !== false,
     allowClipboard: allowClipboardText,
     allowClipboardText,
-    allowClipboardImage: policy.allowClipboardImage === true,
+    allowClipboardImage: hasClipboardImagePolicy
+      ? policy.allowClipboardImage !== false && policy.allowImages !== false && policy.allowClipboard !== false
+      : policy.allowClipboard !== false,
     allowClipboardFile: policy.allowClipboardFile === true,
     allowFileTransfer: policy.allowFileTransfer === true
   }

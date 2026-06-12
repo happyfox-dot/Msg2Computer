@@ -44,7 +44,8 @@ object FileTransferRegistry {
         identity: PhoneIdentity,
         targetDeviceIds: List<String>,
         host: String,
-        relayPort: Int
+        relayPort: Int,
+        relativePath: String = ""
     ): JSONObject {
         pruneExpired()
         require(file.isFile && file.length() > 0L) { "invalid_file" }
@@ -77,6 +78,10 @@ object FileTransferRegistry {
             .put("targetDeviceIds", JSONArray(targets.toList()))
             .put("expiresAt", record.expiresAt)
             .put("inline", false)
+            .apply {
+                // 目录分享：相对路径（含文件名）随 manifest 下发，接收端消毒后重建目录树
+                if (relativePath.isNotBlank()) put("relativePath", relativePath)
+            }
     }
 
     fun serveChunk(

@@ -14,6 +14,8 @@ const messageRouter = require('./src/main/message-router')
 const topologyManager = require('./src/main/topology-manager')
 const totpStore = require('./src/main/totp-store')
 const relayClient = require('./src/main/relay-client')
+const busEnvelope = require('./src/main/bus-envelope')
+const { createContentBus } = require('./src/main/content-bus')
 const { registerDesktopIpc } = require('./src/main/desktop-ipc')
 const updater = require('./src/main/updater')
 const { createFileTransfer } = require('./src/main/file-transfer')
@@ -50,6 +52,7 @@ let topologyLsdb = {
   seenSeq: new Map()
 }
 let topologyDeltaBacklog = []
+let contentBus = null
 let topologyBroadcastSuppressionDepth = 0
 // 每条活跃连接对应的会话密钥（ws -> sessionKey base64），用于反向加密下发 TOTP 种子同步
 let phoneSessionKeys = new WeakMap()
@@ -722,8 +725,10 @@ function getNodeCapabilities() {
     totp: true,
     clipboardText: true,
     clipboardImage: true,
-    clipboardFile: false,
-    fileTransfer: false,
+    clipboardFile: true,
+    fileTransfer: true,
+    softBus: true,
+    p2pDirect: true,
     externalEvents: true,
     joinRequest: true
   }
@@ -765,10 +770,16 @@ function contentPolicyForJoinTemplate(template = 'basic') {
   return normalizePushContentPolicy({
     allowSmsCodes: true,
     allowSmsMessages: false,
-    allowNotifications: false,
+    // 与剪贴板 v2 同理：是否推送通知由手机端"发送通知"全局开关（默认关，
+    // 且需通知使用权）决定，per-device 位默认放行；旧默认 false 导致
+    // LAN 配对后通知永远没有可推送目标，用户极难发现。
+    allowNotifications: true,
     allowTotp: true,
-    allowClipboard: false,
-    allowClipboardText: false,
+    // 局域网可信环境：剪贴板文本默认放行（与 allowNotifications 同款修复，
+    // 实际是否同步仍由两端"剪贴板同步"全局开关把关）。图片/文件/传输涉及更大
+    // 数据量，保持默认关，由用户按需显式开启。
+    allowClipboard: true,
+    allowClipboardText: true,
     allowClipboardImage: false,
     allowClipboardFile: false,
     allowFileTransfer: false,
@@ -1116,6 +1127,48 @@ function canPushContentToNode(target, type) {
 
 function canReceiveContentType(type) {
   return messageRouter.canReceiveContentType(type, desktopMessageSettings, CODE_TYPES)
+}
+
+function topicToLegacyType(topic) {
+  return busEnvelope.legacyTypeForTopic(topic)
+}
+
+function canPushTopicToNode(target, topic) {
+  return canPushContentToNode(target, topicToLegacyType(topic))
+}
+
+function canReceiveBusTopic(topic) {
+  return canReceiveContentType(topicToLegacyType(topic))
+}
+
+function getContentBus() {
+  if (contentBus) return contentBus
+  contentBus = createContentBus({
+    getIdentity: getDesktopIdentity,
+    getNetworkId: ensureTrustedNetworkId,
+    getTargetNode: targetId => {
+      const resolved = resolveForwardTarget(targetId)
+      return resolved ? resolved.node : null
+    },
+    getTopologyRoutes: sourceId => {
+      const snapshot = getTopologySnapshot()
+      return snapshot.routeTables?.[sourceId] || []
+    },
+    hasActiveWs: targetId => {
+      const outbound = activeDesktopPeerConnections.get(targetId)
+      if (outbound && outbound.readyState === WebSocket.OPEN && outbound.__codebridgeSessionKey) return true
+      const inbound = activePhoneConnections.get(targetId)
+      return !!(inbound && Array.from(inbound).some(ws => ws.readyState === WebSocket.OPEN && phoneSessionKeys.get(ws)))
+    },
+    canPush: canPushTopicToNode,
+    canReceive: topic => canReceiveBusTopic(topic),
+    sendDirect: (target, envelope, route) => sendBusEnvelopeDirect(target, envelope, route),
+    sendWs: (target, envelope) => sendBusEnvelopeWs(target, envelope),
+    sendRelay: (target, envelope) => sendBusEnvelopeLegacyRelay(target, envelope),
+    onReceive: (envelope, context) => dispatchInboundBusEnvelope(envelope, context.lastHopDeviceId || ''),
+    log: message => console.log(message)
+  })
+  return contentBus
 }
 
 function loadOrCreatePairingKey() {
@@ -2256,13 +2309,47 @@ async function handleLanJoinRequest(body, remoteAddress = '') {
   }
 }
 
+function handleBusMessageRequest(body, remoteAddress = '') {
+  const parsed = parseBusTransportEnvelope(body, pairingKey)
+  if (!parsed) {
+    return { status: 403, body: { type: 'bus_ack', accepted: false, reason: 'invalid_bus_envelope' } }
+  }
+  const { senderId, envelope } = parsed
+  const routePath = Array.isArray(envelope.routePath) ? envelope.routePath : []
+  if (routePath.includes(getDesktopIdentity().id)) {
+    return { status: 202, body: { type: 'bus_ack', accepted: true, duplicate: true } }
+  }
+  if (!isKnownTrustedNode(senderId)) {
+    return { status: 403, body: { type: 'bus_ack', accepted: false, reason: 'untrusted_sender' } }
+  }
+  const accepted = getContentBus().receiveEnvelope(envelope, {
+    lastHopDeviceId: senderId,
+    remoteAddress
+  })
+  return {
+    status: accepted ? 200 : 202,
+    body: { type: 'bus_ack', accepted, messageId: envelope.messageId }
+  }
+}
+
 function startLanJoinServer() {
   if (lanJoinServer) return
   lanJoinServer = http.createServer(async (req, res) => {
     try {
       const parsedUrl = new URL(req.url || '/', 'http://127.0.0.1')
-      if (req.method === 'GET' && parsedUrl.pathname.startsWith('/file/')) {
+      if (req.method === 'GET' && (parsedUrl.pathname.startsWith('/file/proxy/') || parsedUrl.pathname.startsWith('/bus/file/proxy/'))) {
+        await handleFileProxyRequest(parsedUrl, res)
+        return
+      }
+      if (req.method === 'GET' && (parsedUrl.pathname.startsWith('/file/') || parsedUrl.pathname.startsWith('/bus/file/'))) {
         await handleFileChunkRequest(parsedUrl, res)
+        return
+      }
+      if (req.method === 'POST' && parsedUrl.pathname === '/bus/message') {
+        const raw = await readHttpRequestBody(req)
+        const body = raw ? JSON.parse(raw) : {}
+        const result = handleBusMessageRequest(body, req.socket?.remoteAddress || '')
+        sendJsonResponse(res, result.status || 200, result.body || {})
         return
       }
       if (req.method !== 'POST' || parsedUrl.pathname !== '/join') {
@@ -2285,8 +2372,16 @@ function startLanJoinServer() {
 }
 
 async function handleFileChunkRequest(parsedUrl, res) {
+  const fileId = decodeURIComponent(
+    parsedUrl.pathname.startsWith('/bus/file/')
+      ? parsedUrl.pathname.slice('/bus/file/'.length)
+      : parsedUrl.pathname.slice('/file/'.length)
+  )
+  await serveLocalFileChunk(fileId, parsedUrl, res)
+}
+
+async function serveLocalFileChunk(fileId, parsedUrl, res) {
   try {
-    const fileId = decodeURIComponent(parsedUrl.pathname.slice('/file/'.length))
     if (!fileId) {
       sendJsonResponse(res, 400, { error: 'missing_file_id' })
       return
@@ -2312,6 +2407,70 @@ async function handleFileChunkRequest(parsedUrl, res) {
   } catch (error) {
     console.error('File chunk request failed:', error)
     sendJsonResponse(res, 500, { error: error.message || 'file_chunk_failed' })
+  }
+}
+
+// 多跳分片代理：GET /file/proxy/{originId}/{fileId}?from=&to=&senderId=&nonce=&authToken=&hop=N
+// 鉴权与分片加密在请求方与源设备之间端到端完成，本节点只转发字节。
+// 源就是本机时直接服务；否则源可直达就转直连请求，不可直达且 hop 有余量
+// 时交给下一个可信节点继续代理（hop 递减防环）。
+async function handleFileProxyRequest(parsedUrl, res) {
+  try {
+    const prefix = parsedUrl.pathname.startsWith('/bus/file/proxy/') ? '/bus/file/proxy/' : '/file/proxy/'
+    const segments = parsedUrl.pathname.slice(prefix.length).split('/')
+    const originId = decodeURIComponent(segments[0] || '')
+    const fileId = decodeURIComponent(segments.slice(1).join('/') || '')
+    if (!originId || !fileId) {
+      sendJsonResponse(res, 400, { error: 'bad_proxy_path' })
+      return
+    }
+    if (originId === getDesktopIdentity().id) {
+      await serveLocalFileChunk(fileId, parsedUrl, res)
+      return
+    }
+    const hop = Math.min(4, Math.max(0, Number(parsedUrl.searchParams.get('hop') || 0)))
+    if (hop <= 0) {
+      sendJsonResponse(res, 502, { error: 'proxy_hop_exhausted' })
+      return
+    }
+    const baseQuery = ['from', 'to', 'senderId', 'nonce', 'authToken']
+      .map(key => {
+        const value = parsedUrl.searchParams.get(key)
+        return value === null ? '' : `${key}=${encodeURIComponent(value)}`
+      })
+      .filter(Boolean)
+      .join('&')
+    const requesterId = parsedUrl.searchParams.get('senderId') || ''
+    const origin = resolveFileSource(originId)
+    let forwardHost = origin && origin.host ? origin.host : ''
+    let forwardPort = origin ? origin.port : JOIN_PORT
+    let forwardPath = `/file/${encodeURIComponent(fileId)}?${baseQuery}`
+    if (!forwardHost) {
+      const next = resolveFileRelayCandidates(originId)
+        .find(cand => cand.id !== requesterId)
+      if (!next) {
+        sendJsonResponse(res, 502, { error: 'origin_unreachable' })
+        return
+      }
+      forwardHost = next.host
+      forwardPort = next.port
+      forwardPath = `/file/proxy/${encodeURIComponent(originId)}/${encodeURIComponent(fileId)}?${baseQuery}&hop=${hop - 1}`
+    }
+    const resp = await httpGetBinary({ host: forwardHost, port: forwardPort, path: forwardPath, timeoutMs: 20000 })
+    if (!resp) {
+      sendJsonResponse(res, 502, { error: 'proxy_forward_failed' })
+      return
+    }
+    if (resp.status === 206) {
+      sendBinaryResponse(res, 206, resp.body, { 'Accept-Ranges': 'bytes' })
+    } else {
+      sendJsonResponse(res, resp.status >= 100 && resp.status <= 599 ? resp.status : 502, { error: 'proxy_upstream_status' })
+    }
+  } catch (error) {
+    console.error('File proxy request failed:', error)
+    try {
+      sendJsonResponse(res, 500, { error: 'proxy_error' })
+    } catch (_) {}
   }
 }
 
@@ -3108,11 +3267,127 @@ function requestTopologySnapshot(ws, sessionKey) {
   })
 }
 
-function postJsonToNode(host, port, body, timeoutMs = 3500) {
+function postJsonToNode(host, port, body, optionsOrTimeout = 3500) {
+  const options = typeof optionsOrTimeout === 'number'
+    ? { timeoutMs: optionsOrTimeout }
+    : (optionsOrTimeout || {})
   return relayClient.postJsonToNode(host, port, body, {
-    timeoutMs,
+    timeoutMs: options.timeoutMs || 3500,
+    path: options.path || '/relay',
     normalizeHost: normalizeNetworkHost
   })
+}
+
+// codebridge_bus 重放窗口：sentAt 纳入 HMAC，超窗整包拒收。与 relay 的
+// relaySentAt 不同，bus 协议没有旧版发送端，sentAt 缺失直接拒绝而非跳过。
+const BUS_REPLAY_WINDOW_MS = 5 * 60 * 1000
+
+function buildBusTransportEnvelope(envelope, peerKey) {
+  const identity = getDesktopIdentity()
+  const payload = encryptMessage(JSON.stringify(envelope), peerKey)
+  if (!payload) return null
+  const nonce = generateNonce()
+  const sentAt = Date.now()
+  return {
+    type: 'codebridge_bus',
+    version: 1,
+    senderId: identity.id,
+    nonce,
+    sentAt,
+    payload,
+    authToken: hmacBase64(peerKey, `${identity.id}|${nonce}|${sentAt}|${payload}`)
+  }
+}
+
+function parseBusTransportEnvelope(body, peerKey) {
+  if (!body || body.type !== 'codebridge_bus') return null
+  const senderId = String(body.senderId || '').trim()
+  const nonce = String(body.nonce || '').trim()
+  const payload = String(body.payload || '').trim()
+  const authToken = String(body.authToken || '').trim()
+  if (!senderId || !nonce || !payload || !authToken) return null
+  const sentAt = Number(body.sentAt || 0)
+  if (!Number.isFinite(sentAt) || sentAt <= 0 || Math.abs(Date.now() - sentAt) > BUS_REPLAY_WINDOW_MS) return null
+  const expected = hmacBase64(peerKey, `${senderId}|${nonce}|${sentAt}|${payload}`)
+  if (!timingSafeEqual(expected, authToken)) return null
+  const plain = decryptMessage(payload, peerKey)
+  if (!plain) return null
+  const envelope = JSON.parse(plain)
+  return busEnvelope.isEnvelope(envelope) ? { senderId, envelope } : null
+}
+
+function timingSafeEqual(a, b) {
+  const left = Buffer.from(String(a || ''), 'utf8')
+  const right = Buffer.from(String(b || ''), 'utf8')
+  return left.length === right.length && crypto.timingSafeEqual(left, right)
+}
+
+async function sendBusEnvelopeDirect(target, envelope, route = {}) {
+  if (!target || !target.pairingKey) return false
+  const transportEnvelope = buildBusTransportEnvelope(envelope, target.pairingKey)
+  if (!transportEnvelope) return false
+  const hosts = route.host
+    ? [route.host]
+    : [target.lastIP || target.host, target.tsHost]
+      .map(normalizeNetworkHost)
+      .filter(Boolean)
+      .filter((host, index, arr) => arr.indexOf(host) === index)
+  const port = Number(route.port || target.relayPort || target.port) || JOIN_PORT
+  for (const host of hosts) {
+    const ok = await postJsonToNode(host, port, transportEnvelope, { path: '/bus/message', timeoutMs: 3500 })
+    if (ok) return true
+  }
+  return false
+}
+
+function sendBusEnvelopeWs(target, envelope) {
+  const targetId = String(target?.id || target?.phoneId || '').trim()
+  if (!targetId) return false
+  const outbound = activeDesktopPeerConnections.get(targetId)
+  if (outbound && outbound.readyState === WebSocket.OPEN && outbound.__codebridgeSessionKey) {
+    const encrypted = encryptMessage(JSON.stringify(envelope), outbound.__codebridgeSessionKey)
+    if (encrypted) {
+      try {
+        outbound.send(JSON.stringify({ type: 'bus_message', msgId: envelope.messageId, payload: encrypted }))
+        return true
+      } catch (e) {
+        console.error('bus WS send failed:', e)
+      }
+    }
+  }
+  const inboundConnections = activePhoneConnections.get(targetId)
+  if (inboundConnections) {
+    for (const ws of inboundConnections) {
+      const sessionKey = phoneSessionKeys.get(ws)
+      if (!sessionKey || ws.readyState !== WebSocket.OPEN) continue
+      const encrypted = encryptMessage(JSON.stringify(envelope), sessionKey)
+      if (!encrypted) continue
+      try {
+        ws.send(JSON.stringify({ type: 'bus_message', msgId: envelope.messageId, payload: encrypted }))
+        return true
+      } catch (e) {
+        console.error('bus inbound WS send failed:', e)
+      }
+    }
+  }
+  return false
+}
+
+async function sendBusEnvelopeLegacyRelay(target, envelope) {
+  const payload = busEnvelope.toLegacyPayload(envelope)
+  if (String(target?.deviceType || target?.type || '').includes('PHONE')) {
+    return sendRelayEnvelopeToPhone(target, payload, { skipBus: true })
+  }
+  return sendVerifyCodeToDesktopNode(target.id, JSON.stringify(payload), envelope.messageId)
+}
+
+function dispatchInboundBusEnvelope(envelope, lastHopDeviceId = '') {
+  if (!busEnvelope.isEnvelope(envelope)) return false
+  const payload = busEnvelope.toLegacyPayload(envelope)
+  if (hasRecentDelivery(lastHopDeviceId, envelope.messageId, payload)) return true
+  rememberDelivery(lastHopDeviceId, envelope.messageId, payload)
+  dispatchInboundCodeData(payload, lastHopDeviceId)
+  return true
 }
 
 async function sendTopologyDeltaRelayToPhone(phone, delta) {
@@ -3813,6 +4088,7 @@ let clipboardWatchTimer = null
 // 上一次本机剪贴板内容快照：用于检测变化。
 let lastClipboardText = ''
 let lastClipboardImageHash = ''
+let lastClipboardFileSignature = ''
 
 // 剪贴板 LWW（last-writer-wins）寄存器状态：网络中剪贴板是一个单值寄存器，
 // 每次复制产生新版本 (ts, origin)。节点只应用比已知版本更新的内容——
@@ -3867,9 +4143,11 @@ function startClipboardSyncWatcher() {
     lastClipboardText = clipboard.readText() || ''
     const image = clipboard.readImage()
     lastClipboardImageHash = image && !image.isEmpty() ? hashBuffer(image.toPNG()).slice(0, 24) : ''
+    lastClipboardFileSignature = getClipboardFileSignature(readClipboardFilePaths())
   } catch (_) {
     lastClipboardText = ''
     lastClipboardImageHash = ''
+    lastClipboardFileSignature = ''
   }
   clipboardWatchTimer = setInterval(pollClipboardForSync, CLIPBOARD_POLL_INTERVAL_MS)
 }
@@ -3882,7 +4160,11 @@ function stopClipboardSyncWatcher() {
 }
 
 function pollClipboardForSync() {
-  if (desktopMessageSettings.syncClipboardText !== true && desktopMessageSettings.syncClipboardImage !== true) return
+  if (
+    desktopMessageSettings.syncClipboardText !== true &&
+    desktopMessageSettings.syncClipboardImage !== true &&
+    desktopMessageSettings.syncClipboardFile !== true
+  ) return
   let text = ''
   if (desktopMessageSettings.syncClipboardText === true) {
     try {
@@ -3902,6 +4184,10 @@ function pollClipboardForSync() {
 
   if (desktopMessageSettings.syncClipboardImage === true) {
     pollClipboardImageForSync()
+  }
+
+  if (desktopMessageSettings.syncClipboardFile === true) {
+    pollClipboardFilesForSync()
   }
 }
 
@@ -3923,11 +4209,152 @@ function pollClipboardImageForSync() {
   lastClipboardImageHash = shortHash
   if (shortHash === clipboardImageSyncState.hash) return
   if (png.length > CLIPBOARD_INLINE_IMAGE_MAX_BYTES) {
-    console.warn(`剪贴板图片过大，跳过 inline 同步：${formatBytes(png.length)}`)
+    // 大图回退：不整包 inline 进 relay 消息，转 manifest + 分片拉取
+    //（与文件传输同通道），接收端拉完写剪贴板。版本先行登记，
+    // 避免轮询期间把同一张图重复 offer。
+    const clipTs = Date.now()
+    rememberClipImageVersion(clipTs, getDesktopIdentity().id, shortHash)
+    offerClipboardImageAsFile(png, clipTs, shortHash).catch(error => {
+      console.error('剪贴板大图 manifest 同步失败:', error.message)
+    })
     return
   }
   rememberClipImageVersion(Date.now(), getDesktopIdentity().id, shortHash)
   broadcastClipboardImageToNodes(png, hash)
+}
+
+function getDefaultClipboardImageTargetIds() {
+  const ids = []
+  for (const phone of getAuthorizedPhones()) {
+    if (phone.enabled === false || phone.revoked === true) continue
+    if (!phone.pairingKey || !(phone.lastIP || phone.host)) continue
+    if (canPushContentToNode(phone, CODE_TYPES.CLIPBOARD_IMAGE)) ids.push(phone.id)
+  }
+  for (const peer of getPairedDesktopPeers()) {
+    if (peer.enabled === false || !peer.pairingKey) continue
+    if (canPushContentToNode(peer, CODE_TYPES.CLIPBOARD_IMAGE)) ids.push(peer.id)
+  }
+  return Array.from(new Set(ids))
+}
+
+// 大图剪贴板发送侧：PNG 先暂存本地（offer 有效期内充当分片源），再按
+// clipboard_image 类型 offer。payloadExtra 带 clipVersion 供接收端 LWW 排序。
+async function offerClipboardImageAsFile(pngBuffer, clipTs, shortHash) {
+  const targets = getDefaultClipboardImageTargetIds()
+  if (targets.length === 0) {
+    console.warn('剪贴板大图同步跳过：没有启用图片剪贴板的推送目标')
+    return
+  }
+  const outDir = path.join(app.getPath('userData'), 'clipboard-images-out')
+  let filePath
+  try {
+    fs.mkdirSync(outDir, { recursive: true })
+    for (const entry of fs.readdirSync(outDir)) {
+      const full = path.join(outDir, entry)
+      try {
+        // 超过 offer 有效期（30 分钟）的暂存图已不可能再被拉取
+        if (Date.now() - fs.statSync(full).mtimeMs > 30 * 60 * 1000) fs.unlinkSync(full)
+      } catch (_) {}
+    }
+    filePath = path.join(outDir, `clipboard-${clipTs}-${shortHash}.png`)
+    fs.writeFileSync(filePath, pngBuffer)
+  } catch (e) {
+    console.error('剪贴板大图暂存失败:', e.message)
+    return
+  }
+  const identity = getDesktopIdentity()
+  await initFileTransfer().offerFile(filePath, targets, {
+    type: CODE_TYPES.CLIPBOARD_IMAGE,
+    source: '剪贴板图片',
+    rawPrefix: '剪贴板图片',
+    payloadExtra: {
+      clipVersion: { ts: clipTs, origin: identity.id, hash: shortHash, kind: 'image' }
+    }
+  })
+}
+
+function readClipboardFilePaths() {
+  if (process.platform !== 'win32') return []
+  const decodeUtf16Paths = buffer => {
+    if (!buffer || buffer.length < 4) return []
+    return buffer.toString('utf16le')
+      .split('\u0000')
+      .map(item => item.trim())
+      .filter(Boolean)
+  }
+  const decodeAnsiPaths = buffer => {
+    if (!buffer || buffer.length < 2) return []
+    return buffer.toString('utf8')
+      .split('\u0000')
+      .map(item => item.trim())
+      .filter(Boolean)
+  }
+
+  try {
+    const paths = decodeUtf16Paths(clipboard.readBuffer('FileNameW'))
+    if (paths.length > 0) return paths
+  } catch (_) {}
+
+  try {
+    return decodeAnsiPaths(clipboard.readBuffer('FileName'))
+  } catch (_) {
+    return []
+  }
+}
+
+function getClipboardFileSignature(filePaths) {
+  if (!Array.isArray(filePaths) || filePaths.length === 0) return ''
+  const parts = []
+  for (const filePath of filePaths) {
+    try {
+      const normalized = path.resolve(String(filePath || ''))
+      const stat = fs.statSync(normalized)
+      if (!stat.isFile()) continue
+      parts.push(`${normalized}|${stat.size}|${Math.round(stat.mtimeMs)}`)
+    } catch (_) {}
+  }
+  return parts.join('\n')
+}
+
+async function pollClipboardFilesForSync() {
+  const filePaths = readClipboardFilePaths()
+  const signature = getClipboardFileSignature(filePaths)
+  if (!signature) {
+    lastClipboardFileSignature = ''
+    return
+  }
+  if (signature === lastClipboardFileSignature) return
+  lastClipboardFileSignature = signature
+
+  const targets = getDefaultClipboardFileTargetIds()
+  if (targets.length === 0) {
+    console.warn('Clipboard file sync skipped: no file-transfer targets are enabled')
+    return
+  }
+
+  const transfer = initFileTransfer()
+  const maxBytes = Math.max(1, Number(desktopMessageSettings.maxFileSizeMb || 50)) * 1024 * 1024
+  for (const filePath of filePaths) {
+    let stat = null
+    try {
+      stat = fs.statSync(filePath)
+    } catch (error) {
+      console.warn(`Clipboard file sync skipped unreadable file: ${filePath}`, error.message)
+      continue
+    }
+    if (!stat.isFile()) continue
+    if (stat.size <= 0 || stat.size > maxBytes) {
+      console.warn(`Clipboard file sync skipped ${filePath}: ${formatBytes(stat.size)} exceeds ${formatBytes(maxBytes)}`)
+      continue
+    }
+    transfer.offerFile(filePath, targets, {
+      type: CODE_TYPES.CLIPBOARD_FILE,
+      source: '剪贴板文件',
+      rawPrefix: '剪贴板文件'
+    }).catch(error => {
+      console.error(`Clipboard file sync failed for ${filePath}:`, error.message)
+    })
+  }
 }
 
 // 把一条剪贴板状态推送给已配对节点（本机新复制的广播与收到后的 gossip 扩散共用）。
@@ -3993,7 +4420,10 @@ function broadcastClipboardToNodes(text, options = {}) {
     relayMessageId: originMessageId,
     clipVersion: { ts: clipTs, origin: clipOrigin },
     relayPath,
-    relayTtl: USER_MESSAGE_RELAY_TTL,
+    // gossip 续传携带并衰减入站 TTL（options.ttl），原发（本机新复制/上线补推）
+    // 不传 options.ttl 时用满 TTL。绝不每跳重置——否则 TTL 安全网失效，
+    // 风暴边界退化为去重表（详见 Android rewriteClipboardGossipTargets 注释）。
+    relayTtl: Number.isFinite(Number(options.ttl)) ? Math.max(0, Number(options.ttl)) : USER_MESSAGE_RELAY_TTL,
     targetDeviceIds
   }
 
@@ -4098,7 +4528,11 @@ function broadcastClipboardImageToNodes(pngBuffer, sha256, options = {}) {
     fileManifest: manifest,
     dataBase64: pngBuffer.toString('base64'),
     relayPath,
-    relayTtl: USER_MESSAGE_RELAY_TTL,
+    // gossip 续传携带衰减后的入站 TTL（options.ttl）；原发（本机新复制/上线补推）
+    // 不传 ttl，用满 TTL。避免每跳重置导致 TTL 安全网失效（见剪贴板文本同款修复）。
+    relayTtl: Number.isFinite(Number(options.ttl))
+      ? Math.max(0, Number(options.ttl))
+      : USER_MESSAGE_RELAY_TTL,
     targetDeviceIds
   }
 
@@ -4188,11 +4622,17 @@ function gossipClipboardState(codeData) {
   const text = codeData.rawMessage || ''
   if (!text) return
   const version = codeData.clipVersion || {}
+  // 续传 TTL = 入站 TTL − 1（衰减）；入站无 TTL（旧负载）时退化为满 TTL。
+  // LWW 版本守卫已保证每个版本每节点最多 gossip 一次，TTL 是第二道边界。
+  const inboundTtl = Number(codeData.relayTtl ?? codeData.ttl)
+  const nextTtl = Number.isFinite(inboundTtl) ? Math.max(0, inboundTtl - 1) : USER_MESSAGE_RELAY_TTL
+  if (nextTtl <= 0) return
   broadcastClipboardToNodes(text, {
     ts: Number(version.ts) || Number(codeData.timestamp) || clipboardSyncState.ts,
     origin: String(version.origin || codeData.originDeviceId || ''),
     originDeviceName: codeData.originDeviceName || codeData.sourceDeviceName || '',
     relayPath: Array.isArray(codeData.relayPath) ? codeData.relayPath : [],
+    ttl: nextTtl,
     exclude: new Set(
       [String(codeData.lastHopDeviceId || ''), String(codeData.lastRelayDeviceId || '')].filter(Boolean)
     )
@@ -4261,8 +4701,16 @@ function pushClipboardStateToDesktopPeer(ws, sessionKey, peerId) {
 
 // 通过 relay HTTP 把一条用户消息负载发给单台手机（拓扑 relay 的同款信封格式）。
 // 剪贴板推送与桌面续传共用：每次发送独立打 relaySentAt 时间戳供对端做重放窗口校验。
-async function sendRelayEnvelopeToPhone(phone, basePayload) {
+async function sendRelayEnvelopeToPhone(phone, basePayload, options = {}) {
   if (!phone || !phone.pairingKey || !(phone.lastIP || phone.host)) return false
+  if (options.skipBus !== true && nodeSupportsSoftBus(phone)) {
+    const envelope = busEnvelope.fromLegacyPayload(basePayload, {
+      identity: getDesktopIdentity(),
+      networkId: ensureTrustedNetworkId()
+    })
+    const ok = await sendBusEnvelopeDirect(phone, envelope).catch(() => false)
+    if (ok) return true
+  }
   const identity = getDesktopIdentity()
   const stampedPayload = {
     ...basePayload,
@@ -4468,6 +4916,22 @@ function connectDesktopPeer(peer, options = {}) {
         if (plain) {
           const requestPayload = JSON.parse(plain)
           handleTopologySnapshotRequest(ws, ws.__codebridgeSessionKey, requestPayload)
+        }
+        return
+      }
+
+      if (message.type === 'bus_message') {
+        const msgId = typeof message.msgId === 'string' ? message.msgId : ''
+        const plain = decryptMessage(message.payload, ws.__codebridgeSessionKey)
+        if (!plain) return
+        const envelope = JSON.parse(plain)
+        if (busEnvelope.isEnvelope(envelope)) {
+          if (msgId && hasRecentDelivery(peer.id, msgId, busEnvelope.toLegacyPayload(envelope))) {
+            ws.send(JSON.stringify({ type: 'code_ack', msgId }))
+            return
+          }
+          getContentBus().receiveEnvelope(envelope, { lastHopDeviceId: peer.id })
+          if (msgId) ws.send(JSON.stringify({ type: 'code_ack', msgId }))
         }
         return
       }
@@ -5317,6 +5781,22 @@ function startWebSocketServer() {
           return
         }
 
+        if (message.type === 'bus_message') {
+          const msgId = typeof message.msgId === 'string' ? message.msgId : ''
+          const plain = decryptMessage(message.payload, connectionSessionKey)
+          if (!plain) return
+          const envelope = JSON.parse(plain)
+          if (busEnvelope.isEnvelope(envelope)) {
+            if (msgId && hasRecentDelivery(connectionPhoneId, msgId, busEnvelope.toLegacyPayload(envelope))) {
+              ws.send(JSON.stringify({ type: 'code_ack', msgId }))
+              return
+            }
+            getContentBus().receiveEnvelope(envelope, { lastHopDeviceId: connectionPhoneId })
+            if (msgId) ws.send(JSON.stringify({ type: 'code_ack', msgId }))
+          }
+          return
+        }
+
         if (message.type === 'verify_code') {
           const msgId = typeof message.msgId === 'string' ? message.msgId : ''
           // 手机端 ACK 丢失后会重连重发同一 msgId：重复消息只补 ACK，不再次弹泡/写剪贴板
@@ -5480,31 +5960,69 @@ function lookupPeerPairingKey(deviceId) {
   return null
 }
 
-// 拉取时按 originDeviceId 解析源设备的可达地址 + 共享密钥
+// 拉取时按 originDeviceId 解析源设备的可达地址 + 共享密钥。
+// host 可为空：直连不可达时由 resolveFileRelayCandidates 提供代理通道（多跳）。
 function resolveFileSource(originDeviceId) {
   const id = String(originDeviceId || '')
   if (!id) return null
   const phone = authorizedPhones.get(id)
-  if (phone && phone.pairingKey && (phone.lastIP || phone.host)) {
+  if (phone && phone.pairingKey) {
     return {
       id,
       name: phone.name || 'Android Phone',
-      host: normalizeNetworkHost(phone.lastIP || phone.host),
+      host: normalizeNetworkHost(phone.lastIP || phone.host || ''),
       port: Number(phone.relayPort || phone.port) || JOIN_PORT,
       pairingKey: phone.pairingKey
     }
   }
   const peer = pairedDesktopPeers.get(id)
-  if (peer && peer.pairingKey && (peer.host || peer.tsHost)) {
+  if (peer && peer.pairingKey) {
     return {
       id,
       name: peer.name || 'Desktop PC',
-      host: normalizeNetworkHost(peer.host || peer.tsHost),
+      host: normalizeNetworkHost(peer.host || peer.tsHost || ''),
       port: Number(peer.relayPort || JOIN_PORT) || JOIN_PORT,
       pairingKey: peer.pairingKey
     }
   }
   return null
+}
+
+// 源不可直达时的分片代理候选：通向源的拓扑 next hop 优先，其后是其它
+// 可达的可信节点。排除源自身与本机。
+function resolveFileRelayCandidates(originId) {
+  const exclude = String(originId || '')
+  const identity = getDesktopIdentity()
+  const candidates = []
+  const seen = new Set([exclude, identity.id])
+  const add = (id, host, port, name) => {
+    const normalizedHost = normalizeNetworkHost(host || '')
+    if (!id || !normalizedHost || seen.has(id)) return
+    seen.add(id)
+    candidates.push({ id, host: normalizedHost, port: Number(port) || JOIN_PORT, name: name || id })
+  }
+  try {
+    const snapshot = getTopologySnapshot()
+    const routes = snapshot.routeTables?.[identity.id] || []
+    for (const route of routes) {
+      if (String(route.destinationId || route.to || '') !== exclude) continue
+      const hopId = String(route.nextHopId || route.via || '')
+      if (!hopId || hopId === exclude) continue
+      const hop = authorizedPhones.get(hopId) || pairedDesktopPeers.get(hopId)
+      if (hop && hop.enabled !== false && hop.revoked !== true) {
+        add(hopId, hop.lastIP || hop.host || hop.tsHost, hop.relayPort || JOIN_PORT, hop.name)
+      }
+    }
+  } catch (_) {}
+  for (const phone of getAuthorizedPhones()) {
+    if (phone.enabled === false || phone.revoked === true) continue
+    add(phone.id, phone.lastIP || phone.host, phone.relayPort || JOIN_PORT, phone.name)
+  }
+  for (const peer of getPairedDesktopPeers()) {
+    if (peer.enabled === false) continue
+    add(peer.id, peer.host || peer.tsHost, peer.relayPort || JOIN_PORT, peer.name)
+  }
+  return candidates.slice(0, 6)
 }
 
 let fileTransfer = null
@@ -5528,13 +6046,14 @@ function initFileTransfer() {
     sendManifest: async (targetIds, basePayload) => broadcastFileManifestToNodes(targetIds, basePayload),
     lookupPeerKey: lookupPeerPairingKey,
     resolveSource: resolveFileSource,
+    resolveRelayCandidates: resolveFileRelayCandidates,
     httpGet: httpGetBinary,
     downloadDir,
     tmpDir,
-    onComplete: ({ name, path: finalPath, sourceName }) => {
+    onComplete: ({ fileId, name, path: finalPath, sourceName }) => {
       showNotification('📁 文件接收完成', `${name}\n来源设备: ${sourceName || '未知'}`)
       if (mainWindow) {
-        mainWindow.webContents.send('file-transfer-complete', { name, path: finalPath, sourceName })
+        mainWindow.webContents.send('file-transfer-complete', { fileId, name, path: finalPath, sourceName })
       }
     },
     onProgress: ({ fileId, name, received, size }) => {
@@ -5554,46 +6073,18 @@ function initFileTransfer() {
 // 手机走 relay HTTP），但只发 manifest 不发本体。targetIds 限定为 offer 的目标。
 async function broadcastFileManifestToNodes(targetIds, basePayload) {
   const targets = new Set((Array.isArray(targetIds) ? targetIds : []).map(String))
-  const originMessageId = basePayload.originMessageId
   const relayPath = [getDesktopIdentity().id]
   const payload = {
     ...basePayload,
     relayPath,
     relayTtl: USER_MESSAGE_RELAY_TTL
   }
-  let delivered = 0
-
-  // 桌面对端：WS verify_code
-  const peerPlain = JSON.stringify(payload)
-  for (const [peerId, ws] of activeDesktopPeerConnections.entries()) {
-    if (!targets.has(peerId)) continue
-    if (!ws || ws.readyState !== WebSocket.OPEN) continue
-    const peer = pairedDesktopPeers.get(peerId)
-    if (!peer || peer.enabled === false) continue
-    if (!canPushContentToNode(peer, CODE_TYPES.FILE_TRANSFER)) continue
-    const sessionKey = ws.__codebridgeSessionKey
-    if (!sessionKey) continue
-    const encrypted = encryptMessage(peerPlain, sessionKey)
-    if (!encrypted) continue
-    try {
-      ws.send(JSON.stringify({ type: 'verify_code', msgId: originMessageId, payload: encrypted }))
-      delivered += 1
-    } catch (e) {
-      console.error('文件 manifest 同步到桌面对端失败:', e)
-    }
-  }
-
-  // 手机节点：relay HTTP
-  for (const phone of getAuthorizedPhones()) {
-    if (!targets.has(phone.id)) continue
-    if (phone.enabled === false || phone.revoked === true) continue
-    if (!canPushContentToNode(phone, CODE_TYPES.FILE_TRANSFER)) continue
-    if (!phone.pairingKey || !(phone.lastIP || phone.host)) continue
-    const ok = await sendRelayEnvelopeToPhone(phone, payload).catch(() => false)
-    if (ok) delivered += 1
-  }
-
-  return delivered
+  const result = await getContentBus().publish(busEnvelope.TOPICS.FILE_MANIFEST, payload, {
+    targetNodeIds: Array.from(targets),
+    ttl: USER_MESSAGE_RELAY_TTL,
+    routePath: relayPath
+  })
+  return result.delivered
 }
 
 function handleVerifyCode(codeData) {
@@ -5708,7 +6199,11 @@ function handleVerifyCode(codeData) {
       gossipClipboardState(codeData)
     }
   } else if (codeInfo.type === CODE_TYPES.CLIPBOARD_IMAGE) {
-    if (applyRemoteClipboardImage(codeInfo, codeData)) {
+    const imageManifest = codeInfo.fileManifest || (codeData && codeData.fileManifest) || {}
+    if (imageManifest.inline === false && imageManifest.fileId) {
+      // 大图（>inline 上限）：分片拉取后写剪贴板，见 handleIncomingClipboardImageManifest
+      handleIncomingClipboardImageManifest(codeInfo, codeData, imageManifest)
+    } else if (applyRemoteClipboardImage(codeInfo, codeData)) {
       gossipClipboardImageState(codeData)
     }
   } else if (codeInfo.type === CODE_TYPES.FILE_TRANSFER || codeInfo.type === CODE_TYPES.CLIPBOARD_FILE) {
@@ -5718,9 +6213,60 @@ function handleVerifyCode(codeData) {
   }
 }
 
+// 大图剪贴板（>inline 上限）：manifest + 分片拉取，完成后写本机剪贴板。
+// 与文件传输不同：不弹确认框（已受 syncClipboardImage 接收开关把关）、
+// 不落下载目录、应用后即删。拉取前先做 LWW 预检，避免下载旧版本。
+function handleIncomingClipboardImageManifest(codeInfo, codeData, manifest) {
+  if (manifest.mime !== 'image/png') return
+  const maxBytes = Math.max(1, Number(desktopMessageSettings.maxFileSizeMb || 50)) * 1024 * 1024
+  const size = Number(manifest.size || 0)
+  if (size <= 0 || size > maxBytes) return
+  const version = (codeData && codeData.clipVersion) || {}
+  const ts = Number(version.ts) || Number(codeInfo.timestamp) || 0
+  const origin = String(version.origin || codeInfo.originDeviceId || codeInfo.sourceDeviceId || '')
+  const shortHash = String(manifest.sha256 || '').slice(0, 24)
+  if (shortHash && shortHash === clipboardImageSyncState.hash) return
+  if (!isNewerClipImageVersion(ts, origin)) return
+  const inDir = path.join(app.getPath('userData'), 'clipboard-images-in')
+  initFileTransfer().startIncomingPull(manifest, {
+    maxBytes,
+    targetDir: inDir,
+    onComplete: ({ path: finalPath }) => {
+      try {
+        const buffer = fs.readFileSync(finalPath)
+        const image = nativeImage.createFromBuffer(buffer)
+        if (!image.isEmpty()) {
+          const appliedHash = shortHash || hashBuffer(buffer).slice(0, 24)
+          rememberClipImageVersion(ts, origin, appliedHash)
+          // 先同步本地快照再写剪贴板，防轮询把这次远端写入当成本机新复制
+          lastClipboardImageHash = appliedHash
+          clipboard.writeImage(image)
+          showCodeBubble(codeInfo)
+          showNotification('🖼️ 剪贴板图片同步', `${manifest.name || 'clipboard.png'}\n来源设备: ${codeInfo.sourceDeviceName}`)
+        }
+      } catch (e) {
+        console.error('剪贴板大图应用失败:', e.message)
+      }
+      try { fs.unlinkSync(finalPath) } catch (_) {}
+    }
+  }).catch(err => {
+    console.error('剪贴板大图拉取失败:', err)
+  })
+}
+
 // 收到 file_transfer / clipboard_file 的 manifest 后的接收决策与拉取启动。
 // manifest 本身是小 JSON（走 relay 通道已鉴权/去重）；本体走 file-transfer.js
 // 的分片 GET 拉取。这里负责策略闸门与（必要时）用户确认。
+// 带 batchId 的 manifest 同批只确认一次，结论对整批生效（含确认后才到达的）。
+const fileBatchDecisions = new Map() // batchId -> { status, queue, expiresAt }
+
+function pruneFileBatchDecisions() {
+  const now = Date.now()
+  for (const [batchId, entry] of fileBatchDecisions) {
+    if (now > entry.expiresAt) fileBatchDecisions.delete(batchId)
+  }
+}
+
 function handleIncomingFileManifest(codeInfo, codeData) {
   const manifest = codeInfo.fileManifest || (codeData && codeData.fileManifest) || null
   if (!manifest || !manifest.fileId || manifest.inline === true) return
@@ -5745,18 +6291,57 @@ function handleIncomingFileManifest(codeInfo, codeData) {
     beginPull()
     return
   }
-  // 非自动接收：弹原生确认框。用户同意后才回连拉取。
+
+  const batchId = String((codeData && codeData.batchId) || codeInfo.batchId || '')
+  if (!batchId) {
+    // 非批量：弹原生确认框。用户同意后才回连拉取。
+    dialog.showMessageBox(mainWindow || undefined, {
+      type: 'question',
+      buttons: ['接收', '拒绝'],
+      defaultId: 0,
+      cancelId: 1,
+      title: '文件传输请求',
+      message: `${sourceName} 想发送文件`,
+      detail: `${manifest.name || '文件'}（${formatBytes(size)}）\n来自: ${sourceName}`
+    }).then(result => {
+      if (result.response === 0) beginPull()
+    }).catch(err => {
+      console.error('文件接收确认对话框失败:', err)
+    })
+    return
+  }
+
+  pruneFileBatchDecisions()
+  const existing = fileBatchDecisions.get(batchId)
+  if (existing) {
+    if (existing.status === 'accepted') beginPull()
+    else if (existing.status === 'pending') existing.queue.push(beginPull)
+    // rejected：同批余下文件静默丢弃
+    return
+  }
+  const entry = {
+    status: 'pending',
+    queue: [beginPull],
+    expiresAt: Date.now() + 10 * 60 * 1000
+  }
+  fileBatchDecisions.set(batchId, entry)
+  const batchCount = Number((codeData && codeData.batchCount) || codeInfo.batchCount) || 0
+  const batchTotalBytes = Number((codeData && codeData.batchTotalBytes) || codeInfo.batchTotalBytes) || 0
+  const countText = batchCount > 1 ? `${batchCount} 个文件` : '文件'
   dialog.showMessageBox(mainWindow || undefined, {
     type: 'question',
-    buttons: ['接收', '拒绝'],
+    buttons: ['全部接收', '全部拒绝'],
     defaultId: 0,
     cancelId: 1,
     title: '文件传输请求',
-    message: `${sourceName} 想发送文件`,
-    detail: `${manifest.name || '文件'}（${formatBytes(size)}）\n来自: ${sourceName}`
+    message: `${sourceName} 想发送 ${countText}`,
+    detail: `${manifest.name || '文件'}${batchCount > 1 ? ` 等 ${countText}` : ''}（共 ${formatBytes(batchTotalBytes || size)}）\n来自: ${sourceName}\n本次选择对整批文件生效`
   }).then(result => {
-    if (result.response === 0) beginPull()
+    entry.status = result.response === 0 ? 'accepted' : 'rejected'
+    const queued = entry.queue.splice(0)
+    if (entry.status === 'accepted') queued.forEach(fn => fn())
   }).catch(err => {
+    fileBatchDecisions.delete(batchId)
     console.error('文件接收确认对话框失败:', err)
   })
 }
@@ -5806,11 +6391,16 @@ function gossipClipboardImageState(codeData) {
   const buffer = Buffer.from(dataBase64, 'base64')
   if (!buffer.length || buffer.length > CLIPBOARD_INLINE_IMAGE_MAX_BYTES) return
   const version = codeData.clipVersion || {}
+  // gossip 续传：携带入站 TTL−1，让 TTL 一路衰减（不再每跳重置）。LWW 版本守卫
+  // 已保证每个版本每节点最多应用/gossip 一次，TTL 是第二道边界。
+  const inboundTtl = Number(codeData.relayTtl ?? codeData.ttl)
+  const nextTtl = Number.isFinite(inboundTtl) ? Math.max(0, inboundTtl - 1) : undefined
   broadcastClipboardImageToNodes(buffer, manifest.sha256 || hashBuffer(buffer), {
     ts: Number(version.ts) || Number(codeData.timestamp) || clipboardImageSyncState.ts,
     origin: String(version.origin || codeData.originDeviceId || ''),
     originDeviceName: codeData.originDeviceName || codeData.sourceDeviceName || '',
     relayPath: Array.isArray(codeData.relayPath) ? codeData.relayPath : [],
+    ttl: nextTtl,
     exclude: new Set(
       [String(codeData.lastHopDeviceId || ''), String(codeData.lastRelayDeviceId || '')].filter(Boolean)
     )
@@ -5898,6 +6488,17 @@ function resolveForwardTarget(targetId) {
 // 处理 verify_code，见 connectDesktopPeer 的消息分支）。都没有则尝试唤起
 // 对端连接（本条消息放弃，后续消息可用）。
 function sendVerifyCodeToDesktopNode(targetId, payloadPlain, msgId) {
+  const peer = pairedDesktopPeers.get(targetId)
+  if (peer && nodeSupportsSoftBus(peer)) {
+    const payload = runCatchingJson(payloadPlain)
+    if (payload) {
+      const envelope = busEnvelope.fromLegacyPayload(payload, {
+        identity: getDesktopIdentity(),
+        networkId: ensureTrustedNetworkId()
+      })
+      if (sendBusEnvelopeWs(peer, envelope)) return true
+    }
+  }
   const outbound = activeDesktopPeerConnections.get(targetId)
   if (outbound && outbound.readyState === WebSocket.OPEN && outbound.__codebridgeSessionKey) {
     const encrypted = encryptMessage(payloadPlain, outbound.__codebridgeSessionKey)
@@ -5926,11 +6527,23 @@ function sendVerifyCodeToDesktopNode(targetId, payloadPlain, msgId) {
       }
     }
   }
-  const peer = pairedDesktopPeers.get(targetId)
   if (peer && peer.enabled !== false) {
     connectDesktopPeer(peer, { showNotification: false })
   }
   return false
+}
+
+function runCatchingJson(text) {
+  try {
+    return JSON.parse(text)
+  } catch (_) {
+    return null
+  }
+}
+
+function nodeSupportsSoftBus(node = {}) {
+  const caps = node.capabilities && typeof node.capabilities === 'object' ? node.capabilities : {}
+  return caps.softBus === true || caps.p2pDirect === true
 }
 
 function forwardMessageToNode(targetId, payload, messageKey) {
@@ -6053,6 +6666,30 @@ function getDefaultFileTransferTargetIds() {
   return Array.from(new Set(ids))
 }
 
+function getDefaultClipboardFileTargetIds() {
+  const ids = []
+  for (const phone of getAuthorizedPhones()) {
+    if (phone.enabled === false || phone.revoked === true) continue
+    if (!phone.pairingKey || !(phone.lastIP || phone.host)) continue
+    if (
+      canPushContentToNode(phone, CODE_TYPES.CLIPBOARD_FILE) ||
+      canPushContentToNode(phone, CODE_TYPES.FILE_TRANSFER)
+    ) {
+      ids.push(phone.id)
+    }
+  }
+  for (const peer of getPairedDesktopPeers()) {
+    if (peer.enabled === false || !peer.pairingKey) continue
+    if (
+      canPushContentToNode(peer, CODE_TYPES.CLIPBOARD_FILE) ||
+      canPushContentToNode(peer, CODE_TYPES.FILE_TRANSFER)
+    ) {
+      ids.push(peer.id)
+    }
+  }
+  return Array.from(new Set(ids))
+}
+
 async function selectAndSendFile(targetIds = []) {
   try {
     const result = await dialog.showOpenDialog(mainWindow || undefined, {
@@ -6069,9 +6706,8 @@ async function selectAndSendFile(targetIds = []) {
     if (targets.length === 0) {
       return { success: false, error: '没有启用文件传输的推送目标' }
     }
-    const transfer = initFileTransfer()
     const maxBytes = Math.max(1, Number(desktopMessageSettings.maxFileSizeMb || 50)) * 1024 * 1024
-    const sent = []
+    const eligible = []
     const skipped = []
     for (const filePath of result.filePaths) {
       let stat = null
@@ -6089,9 +6725,9 @@ async function selectAndSendFile(targetIds = []) {
         skipped.push({ filePath, reason: `文件大小超出上限 ${formatBytes(maxBytes)}` })
         continue
       }
-      const offer = await transfer.offerFile(filePath, targets)
-      if (offer) sent.push({ filePath, ...offer })
+      eligible.push({ filePath, size: stat.size })
     }
+    const sent = await offerFileBatch(eligible.map(item => ({ abs: item.filePath, size: item.size })), targets)
     return {
       success: sent.length > 0,
       targetIds: targets,
@@ -6101,6 +6737,114 @@ async function selectAndSendFile(targetIds = []) {
     }
   } catch (error) {
     return { success: false, error: error.message || '文件发送失败' }
+  }
+}
+
+// 把一组文件按同一 batchId 依次 offer（接收端同批只确认一次）。
+// item.rel 存在时作为目录分享的相对路径随 manifest 下发。
+async function offerFileBatch(items, targets) {
+  const transfer = initFileTransfer()
+  const batchId = items.length > 1 ? `batch-${getDesktopIdentity().id}-${Date.now()}` : ''
+  const batchTotalBytes = items.reduce((sum, item) => sum + (item.size || 0), 0)
+  const sent = []
+  for (const item of items) {
+    const options = {}
+    if (item.rel) options.relativePath = item.rel
+    if (batchId) {
+      options.payloadExtra = { batchId, batchCount: items.length, batchTotalBytes }
+    }
+    const offer = await transfer.offerFile(item.abs, targets, options)
+    if (offer) sent.push({ filePath: item.abs, ...offer })
+  }
+  return sent
+}
+
+const MAX_FOLDER_FILES = 500
+
+// 递归收集文件夹内可发送的文件（不跟随符号链接，超限/不可读记入 skipped）
+function walkFolderFiles(rootDir, maxBytes) {
+  const files = []
+  const skipped = []
+  const walk = dir => {
+    if (files.length >= MAX_FOLDER_FILES) return
+    let entries = []
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true })
+    } catch (error) {
+      skipped.push({ filePath: dir, reason: error.message })
+      return
+    }
+    for (const entry of entries) {
+      if (files.length >= MAX_FOLDER_FILES) {
+        skipped.push({ filePath: path.join(dir, entry.name), reason: `超出单次 ${MAX_FOLDER_FILES} 个文件上限` })
+        return
+      }
+      const full = path.join(dir, entry.name)
+      if (entry.isSymbolicLink()) continue
+      if (entry.isDirectory()) {
+        walk(full)
+        continue
+      }
+      if (!entry.isFile()) continue
+      let stat = null
+      try {
+        stat = fs.statSync(full)
+      } catch (error) {
+        skipped.push({ filePath: full, reason: error.message })
+        continue
+      }
+      if (stat.size <= 0 || stat.size > maxBytes) {
+        skipped.push({ filePath: full, reason: `文件大小超出上限 ${formatBytes(maxBytes)}` })
+        continue
+      }
+      files.push({
+        abs: full,
+        rel: path.relative(rootDir, full).split(path.sep).join('/'),
+        size: stat.size
+      })
+    }
+  }
+  walk(rootDir)
+  return { files, skipped }
+}
+
+async function selectAndSendFolder(targetIds = []) {
+  try {
+    const result = await dialog.showOpenDialog(mainWindow || undefined, {
+      title: '选择要同步的文件夹',
+      properties: ['openDirectory']
+    })
+    if (result.canceled || result.filePaths.length === 0) {
+      return { success: false, canceled: true }
+    }
+    const requestedTargets = Array.isArray(targetIds)
+      ? targetIds.map(id => String(id || '').trim()).filter(Boolean)
+      : []
+    const targets = requestedTargets.length > 0 ? Array.from(new Set(requestedTargets)) : getDefaultFileTransferTargetIds()
+    if (targets.length === 0) {
+      return { success: false, error: '没有启用文件传输的推送目标' }
+    }
+    const rootDir = result.filePaths[0]
+    const rootName = path.basename(rootDir) || 'folder'
+    const maxBytes = Math.max(1, Number(desktopMessageSettings.maxFileSizeMb || 50)) * 1024 * 1024
+    const { files, skipped } = walkFolderFiles(rootDir, maxBytes)
+    if (files.length === 0) {
+      return { success: false, error: '文件夹内没有可发送的文件', skipped }
+    }
+    const sent = await offerFileBatch(
+      files.map(item => ({ abs: item.abs, size: item.size, rel: `${rootName}/${item.rel}` })),
+      targets
+    )
+    return {
+      success: sent.length > 0,
+      targetIds: targets,
+      folder: rootDir,
+      sent,
+      skipped,
+      error: sent.length > 0 ? '' : '没有文件被发送'
+    }
+  } catch (error) {
+    return { success: false, error: error.message || '文件夹发送失败' }
   }
 }
 
@@ -6145,19 +6889,26 @@ registerDesktopIpc(ipcMain, {
       ...(updates || {})
     })
     savePairingKey()
-    if (desktopMessageSettings.syncClipboardText === true || desktopMessageSettings.syncClipboardImage === true) {
+    if (
+      desktopMessageSettings.syncClipboardText === true ||
+      desktopMessageSettings.syncClipboardImage === true ||
+      desktopMessageSettings.syncClipboardFile === true
+    ) {
       try {
         lastClipboardText = clipboard.readText() || ''
         const image = clipboard.readImage()
         lastClipboardImageHash = image && !image.isEmpty() ? hashBuffer(image.toPNG()).slice(0, 24) : ''
+        lastClipboardFileSignature = getClipboardFileSignature(readClipboardFilePaths())
       } catch (_) {
         lastClipboardText = ''
         lastClipboardImageHash = ''
+        lastClipboardFileSignature = ''
       }
     }
     return normalizeMessageSettings(desktopMessageSettings)
   },
   fileSelectAndSend: targetIds => selectAndSendFile(targetIds),
+  fileSelectAndSendFolder: targetIds => selectAndSendFolder(targetIds),
   getLanJoinSettings: () => ({
     allowLanJoinRequests: allowLanJoinRequests !== false,
     networkId: ensureTrustedNetworkId()
@@ -6190,6 +6941,7 @@ registerDesktopIpc(ipcMain, {
   },
   checkForUpdate: () => updater.checkForUpdate(true),
   getUpdateState: () => updater.getUpdateState(),
+  getAppVersion: () => app.getVersion(),
   storageGetAllTotps: () => getTotpSeedRecords(),
   storageAddTotp: totp => addLocalTotpSeed(totp),
   storageUpdateTotp: (id, updates) => updateTotpSeed(id, updates),

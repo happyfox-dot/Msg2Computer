@@ -42,7 +42,7 @@ object ApkUpdater {
 
     data class UpdateInfo(
         val versionName: String,   // 解析自 tag_name，去掉前缀 v
-        val versionCode: Long,     // 从 versionName 推算（major*10000+minor*100+patch）
+        val versionCode: Long,     // 从 versionName 推算（major*1_000_000+minor*1_000+patch）
         val notes: String,
         val apkUrl: String?,       // 匹配到的 .apk 资产直链，可能为空
         val pageUrl: String        // release 页面，兜底用浏览器打开
@@ -92,14 +92,15 @@ object ApkUpdater {
         }
     }
 
-    /** 把 1.0.27 形式的版本号折算成可比较的整数：major*10000 + minor*100 + patch。*/
+    /** 把 1.0.27 形式的版本号折算成可比较的整数：major*1_000_000 + minor*1_000 + patch。
+     *  乘子留足 3 位余量，minor/patch 取到 999 都不会进位串台。 */
     private fun parseVersionCode(versionName: String): Long {
         return try {
             val parts = versionName.split(".")
             val major = parts.getOrNull(0)?.toLongOrNull() ?: 0
             val minor = parts.getOrNull(1)?.toLongOrNull() ?: 0
             val patch = parts.getOrNull(2)?.toLongOrNull() ?: 0
-            major * 10000 + minor * 100 + patch
+            major * 1_000_000 + minor * 1_000 + patch
         } catch (_: Exception) {
             0
         }

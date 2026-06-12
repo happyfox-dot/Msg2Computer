@@ -24,7 +24,10 @@ class NotificationRelayService : NotificationListenerService() {
         if (!SettingsStore.isSendNotificationsEnabled(this)) return
         if (sbn.packageName == packageName) return
         if (sbn.isOngoing) return
-        if (DeviceStore.getEnabledDevices(this).isEmpty()) return
+        if (DeviceStore.getEnabledDevices(this).none { it.allowNotifications }) {
+            WebSocketService.reportExternalStatus(this, "收到通知，但没有启用“应用通知”的推送目标")
+            return
+        }
 
         val notification = sbn.notification ?: return
         val title = extractText(notification, Notification.EXTRA_TITLE)

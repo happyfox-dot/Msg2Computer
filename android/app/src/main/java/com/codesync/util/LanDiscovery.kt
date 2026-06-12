@@ -224,6 +224,8 @@ object LanDiscovery {
             .put("clipboardImage", true)
             .put("clipboardFile", true)
             .put("fileTransfer", true)
+            .put("softBus", true)
+            .put("p2pDirect", true)
             .put("joinRequest", true)
 
     private fun parseDevice(payload: JSONObject, remoteAddress: String, localId: String): LanDiscoveredDevice? {

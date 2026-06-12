@@ -126,10 +126,15 @@ object LanJoinClient {
             else -> JSONObject()
                 .put("allowSmsCodes", true)
                 .put("allowSmsMessages", false)
-                .put("allowNotifications", false)
+                // 通知是否推送由发送端"发送通知"全局开关（默认关）决定，
+                // per-device 位默认放行，避免 LAN 配对后通知永远没有目标
+                .put("allowNotifications", true)
                 .put("allowTotp", true)
-                .put("allowClipboard", false)
-                .put("allowClipboardText", false)
+                // 局域网可信环境：剪贴板文本默认放行（实际是否同步仍由两端
+                // "剪贴板同步"全局开关把关）。图片/文件/传输涉及更大数据量，
+                // 保持默认关，由用户按需显式开启。
+                .put("allowClipboard", true)
+                .put("allowClipboardText", true)
                 .put("allowClipboardImage", false)
                 .put("allowClipboardFile", false)
                 .put("allowFileTransfer", false)
@@ -168,8 +173,10 @@ object LanJoinClient {
             .put("totp", true)
             .put("clipboardText", true)
             .put("clipboardImage", true)
-            .put("clipboardFile", false)
-            .put("fileTransfer", false)
+            .put("clipboardFile", true)
+            .put("fileTransfer", true)
+            .put("softBus", true)
+            .put("p2pDirect", true)
             .put("joinRequest", true)
 
     fun applyContentPolicy(context: Context, deviceId: String, policy: JSONObject?) {
@@ -179,11 +186,15 @@ object LanJoinClient {
             id = deviceId,
             allowSmsCodes = policy.optBoolean("allowSmsCodes", true),
             allowSmsMessages = policy.optBoolean("allowSmsMessages", false),
-            allowNotifications = policy.optBoolean("allowNotifications", false),
+            // 缺省 true 与 DeviceStore/TopologyStore 的默认一致；显式 false 仍生效
+            allowNotifications = policy.optBoolean("allowNotifications", true),
             allowTotp = policy.optBoolean("allowTotp", true),
+            // 缺省 true 与 DeviceStore/TopologyStore 默认一致；显式 false 仍生效。
+            // 局域网可信环境下，对端未声明剪贴板策略时默认放行，避免同一设备经
+            // 不同入网路径（扫码 ON / LAN join / gossip OFF）得到相反默认值
             allowClipboard = policy.optBoolean(
                 "allowClipboardText",
-                policy.optBoolean("allowClipboard", false)
+                policy.optBoolean("allowClipboard", true)
             ),
             allowClipboardImage = policy.optBoolean(
                 "allowClipboardImage",

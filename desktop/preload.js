@@ -12,6 +12,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getMessageSettings: () => ipcRenderer.invoke('get-message-settings'),
   setMessageSettings: (updates) => ipcRenderer.invoke('set-message-settings', updates),
   selectAndSendFile: (targetIds) => ipcRenderer.invoke('file-select-and-send', targetIds),
+  selectAndSendFolder: (targetIds) => ipcRenderer.invoke('file-select-and-send-folder', targetIds),
   getLanJoinSettings: () => ipcRenderer.invoke('get-lan-join-settings'),
   setLanJoinSettings: (updates) => ipcRenderer.invoke('set-lan-join-settings', updates),
   isWindowVisible: () => ipcRenderer.invoke('is-window-visible'),
@@ -22,6 +23,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   openExternal: (url) => ipcRenderer.invoke('open-external', url),
   checkForUpdate: () => ipcRenderer.invoke('check-for-update'),
   getUpdateState: () => ipcRenderer.invoke('get-update-state'),
+  getAppVersion: () => ipcRenderer.invoke('get-app-version'),
   onUpdateStatus: (callback) => {
     ipcRenderer.on('update-status', (event, data) => callback(data))
   },

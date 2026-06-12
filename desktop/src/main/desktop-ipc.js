@@ -12,6 +12,7 @@ function registerDesktopIpc(ipcMain, handlers) {
   handle('get-message-settings', () => handlers.getMessageSettings())
   handle('set-message-settings', (event, updates) => handlers.setMessageSettings(updates))
   handle('file-select-and-send', (event, targetIds) => handlers.fileSelectAndSend(targetIds))
+  handle('file-select-and-send-folder', (event, targetIds) => handlers.fileSelectAndSendFolder(targetIds))
   handle('get-lan-join-settings', () => handlers.getLanJoinSettings())
   handle('set-lan-join-settings', (event, updates) => handlers.setLanJoinSettings(updates))
   handle('scan-lan-devices', () => handlers.scanLanDevices())
@@ -28,6 +29,7 @@ function registerDesktopIpc(ipcMain, handlers) {
 
   handle('check-for-update', () => handlers.checkForUpdate())
   handle('get-update-state', () => handlers.getUpdateState())
+  handle('get-app-version', () => handlers.getAppVersion())
 
   handle('storage-get-all-totps', () => handlers.storageGetAllTotps())
   handle('storage-add-totp', (event, totp) => handlers.storageAddTotp(totp))

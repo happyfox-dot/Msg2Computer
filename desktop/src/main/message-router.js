@@ -18,6 +18,8 @@ function normalizeMessageSettings(settings = {}) {
 
 function normalizePushContentPolicy(policy = {}) {
   const legacyClipboard = policy.allowClipboard !== false
+  const hasPolicyFlag = key => Object.prototype.hasOwnProperty.call(policy, key)
+  const hasExplicitClipboardImagePolicy = hasPolicyFlag('allowClipboardImage') || hasPolicyFlag('allowImages')
   const maxFileSizeMb = Number.isFinite(Number(policy.maxFileSizeMb))
     ? Math.max(1, Math.min(512, Math.round(Number(policy.maxFileSizeMb))))
     : 50
@@ -31,7 +33,9 @@ function normalizePushContentPolicy(policy = {}) {
     // 全局开关打开后剪贴板同步依然永远没有可推送目标（用户极难发现）。
     allowClipboard: legacyClipboard,
     allowClipboardText: policy.allowClipboardText !== false && legacyClipboard,
-    allowClipboardImage: policy.allowClipboardImage === true,
+    allowClipboardImage: hasExplicitClipboardImagePolicy
+      ? policy.allowClipboardImage !== false && policy.allowImages !== false && legacyClipboard
+      : legacyClipboard,
     allowClipboardFile: policy.allowClipboardFile === true,
     allowFileTransfer: policy.allowFileTransfer === true,
     allowExternalEvents: policy.allowExternalEvents !== false,

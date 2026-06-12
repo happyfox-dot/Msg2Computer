@@ -64,6 +64,18 @@ function timingSafeStrEqual(a, b) {
   return crypto.timingSafeEqual(bufA, bufB)
 }
 
+// relativePath 的目录部分（最后一段是文件名，由 manifest.name 决定）。
+// 逐段消毒并丢弃 ".."/"."，杜绝远端构造路径穿越。
+function safeRelativeDir(relativePath) {
+  return String(relativePath || '')
+    .split(/[\\/]+/)
+    .slice(0, -1)
+    .map(part => sanitizeFileName(part))
+    .filter(part => part && part !== '.' && part !== '..')
+    .slice(0, 8)
+    .join(path.sep)
+}
+
 // 流式算 sha256 + size，不把整文件读进内存
 function hashFile(absPath) {
   return new Promise((resolve, reject) => {
@@ -115,6 +127,7 @@ function createFileTransfer(deps = {}) {
     sendManifest, // async (targetIds, basePayload) => deliveredCount
     lookupPeerKey, // (deviceId) => pairingKeyB64 | null   服务分片时验签+加密用
     resolveSource, // (originDeviceId) => {host, port, pairingKey, id, name} | null  拉取时用
+    resolveRelayCandidates = () => [], // (originId) => [{id, host, port, name}] 源不可直达时的代理节点
     httpGet, // async ({host, port, path, timeoutMs}) => {status, body:Buffer} | null
     downloadDir,
     tmpDir,
@@ -168,7 +181,7 @@ function createFileTransfer(deps = {}) {
   // ===== 发送侧 =====
 
   // offerFile：登记一份本机文件待传，并向 targetIds 广播 manifest。
-  async function offerFile(absPath, targetIds) {
+  async function offerFile(absPath, targetIds, options = {}) {
     const identity = getIdentity()
     let stat
     try {
@@ -213,12 +226,19 @@ function createFileTransfer(deps = {}) {
       expiresAt,
       inline: false
     }
+    // 目录分享：相对路径（含文件名）随 manifest 下发，接收端消毒后重建目录树
+    if (options.relativePath) manifest.relativePath = String(options.relativePath)
+    const payloadType = String(options.type || 'file_transfer')
+    const source = String(options.source || (payloadType === 'clipboard_file' ? '剪贴板文件' : '文件传输'))
+    const rawPrefix = String(options.rawPrefix || (payloadType === 'clipboard_file' ? '剪贴板文件' : '文件'))
+    // 调用方附加字段（如剪贴板大图的 clipVersion）先铺底，骨架字段不允许被覆盖
     const basePayload = {
-      type: 'file_transfer',
+      ...(options.payloadExtra && typeof options.payloadExtra === 'object' ? options.payloadExtra : {}),
+      type: payloadType,
       code: '',
-      source: '文件传输',
+      source,
       label: name,
-      rawMessage: `文件 ${name}`,
+      rawMessage: `${rawPrefix} ${name}`,
       timestamp: ts,
       phoneId: identity.id,
       phoneName: identity.name,
@@ -306,11 +326,15 @@ function createFileTransfer(deps = {}) {
 
   // startIncomingPull：收到 manifest 且决定接收后，逐片回连源设备拉取。
   // maxBytes：接收方策略上限（maxFileSizeMb 换算），超限直接拒绝。
+  // targetDir / onComplete 可按调用覆盖（剪贴板大图：不落下载目录、
+  // 完成后写剪贴板而非弹"文件接收完成"通知）。
   async function startIncomingPull(manifest, options = {}) {
     const fileId = String(manifest.fileId || '')
     if (!fileId) return false
     if (incomingTransfers.has(fileId)) return false // 已在传
 
+    const saveDir = String(options.targetDir || downloadDir)
+    const completeHook = typeof options.onComplete === 'function' ? options.onComplete : onComplete
     const size = Number(manifest.size || 0)
     const chunkSize = Math.min(Number(manifest.chunkSize) || maxChunkBytes, maxChunkBytes)
     const maxBytes = Number(options.maxBytes) || Infinity
@@ -319,7 +343,10 @@ function createFileTransfer(deps = {}) {
       return false
     }
     const source = resolveSource(manifest.originDeviceId)
-    if (!source || !source.pairingKey || !source.host) {
+    // 源没有直达地址时不再立即失败：还可以经可信节点代理拉取（多跳场景）
+    const relayCandidates = (resolveRelayCandidates(manifest.originDeviceId) || [])
+      .filter(cand => cand && cand.host)
+    if (!source || !source.pairingKey || (!source.host && relayCandidates.length === 0)) {
       onError({ phase: 'pull', fileId, error: '找不到源设备的可达地址或密钥' })
       return false
     }
@@ -329,7 +356,7 @@ function createFileTransfer(deps = {}) {
     const tmpPath = path.join(tmpDir, `${fileId}.part`)
     try {
       fs.mkdirSync(tmpDir, { recursive: true })
-      fs.mkdirSync(downloadDir, { recursive: true })
+      fs.mkdirSync(saveDir, { recursive: true })
     } catch (_) {}
 
     const record = {
@@ -357,26 +384,49 @@ function createFileTransfer(deps = {}) {
     }
 
     try {
-      let offset = 0
+      const fileIdEnc = encodeURIComponent(fileId)
+      const originIdEnc = encodeURIComponent(String(manifest.originDeviceId || ''))
+      // 拉取通道：直连源设备优先，其后是可信节点代理（多跳场景，代理只
+      // 转发字节，鉴权与分片加密仍在本机与源设备之间端到端完成）。
+      // 锁定首个可用通道；中途失败重试两次后顺延切换。
+      // 通道：直连源设备优先，其后是可信节点代理（多跳）。每个分片都从首个
+      // 通道重新尝试——不再用单调递增的索引锁定通道，否则某片偶发失败切到 proxy
+      // 后，即使直连随后恢复也永远回不去。direct 恢复即自动用回 direct。
+      const transports = []
+      if (source.host) {
+        transports.push({ kind: 'direct', host: source.host, port: source.port, label: `direct:${source.host}` })
+      }
+      for (const cand of relayCandidates) {
+        transports.push({ kind: 'proxy', host: cand.host, port: cand.port, label: `proxy:${cand.id}` })
+      }
+      const fetchChunk = async (offset, to) => {
+        for (const transport of transports) {
+          for (let attempt = 0; attempt < 2; attempt++) {
+            // nonce 每次请求重新生成：上一通道可能已把 nonce 送达源设备
+            const nonce = generateNonce()
+            const authToken = hmacBase64(source.pairingKey, `${identity.id}|${nonce}|${fileId}|${offset}-${to}`)
+            const query =
+              `from=${offset}&to=${to}` +
+              `&senderId=${encodeURIComponent(identity.id)}` +
+              `&nonce=${encodeURIComponent(nonce)}` +
+              `&authToken=${encodeURIComponent(authToken)}`
+            const reqPath = transport.kind === 'direct'
+              ? `/file/${fileIdEnc}?${query}`
+              : `/file/proxy/${originIdEnc}/${fileIdEnc}?${query}&hop=3`
+            const resp = await httpGet({ host: transport.host, port: transport.port, path: reqPath, timeoutMs: 20000 })
+            if (resp && resp.status === 206 && Buffer.isBuffer(resp.body)) return resp
+          }
+          log(`分片通道不可用 ${transport.label}，尝试下一通道`)
+        }
+        return null
+      }
+
+      let offset = record.received
       while (offset < size && record.active) {
         const to = Math.min(offset + chunkSize - 1, size - 1)
-        const nonce = generateNonce()
-        const authToken = hmacBase64(source.pairingKey, `${identity.id}|${nonce}|${fileId}|${offset}-${to}`)
-        const query =
-          `from=${offset}&to=${to}` +
-          `&senderId=${encodeURIComponent(identity.id)}` +
-          `&nonce=${encodeURIComponent(nonce)}` +
-          `&authToken=${encodeURIComponent(authToken)}`
-        const reqPath = `/file/${encodeURIComponent(fileId)}?${query}`
-
-        const resp = await httpGet({
-          host: source.host,
-          port: source.port,
-          path: reqPath,
-          timeoutMs: 20000
-        })
-        if (!resp || resp.status !== 206 || !Buffer.isBuffer(resp.body)) {
-          throw new Error(`分片拉取失败 status=${resp ? resp.status : 'none'} @${offset}`)
+        const resp = await fetchChunk(offset, to)
+        if (!resp) {
+          throw new Error(`分片拉取失败（所有通道均不可达）@${offset}`)
         }
         const plain = decryptBytes(resp.body, source.pairingKey)
         if (!plain) throw new Error(`分片解密失败 @${offset}`)
@@ -412,8 +462,11 @@ function createFileTransfer(deps = {}) {
       return false
     }
 
-    // 移动到下载目录，重名加序号
-    const finalPath = uniqueDownloadPath(name)
+    // 移动到目标目录（目录分享按消毒后的 relativePath 重建子目录），重名加序号
+    const relativeDir = safeRelativeDir(manifest.relativePath)
+    const finalDir = relativeDir ? path.join(saveDir, relativeDir) : saveDir
+    try { fs.mkdirSync(finalDir, { recursive: true }) } catch (_) {}
+    const finalPath = uniqueDownloadPath(name, finalDir)
     try {
       fs.renameSync(tmpPath, finalPath)
     } catch (e) {
@@ -428,22 +481,22 @@ function createFileTransfer(deps = {}) {
       }
     }
     incomingTransfers.delete(fileId)
-    onComplete({ fileId, name, path: finalPath, size, sourceName: source.name || manifest.originDeviceName || '' })
+    completeHook({ fileId, name, path: finalPath, size, sourceName: source.name || manifest.originDeviceName || '' })
     log(`文件接收完成 ${name} → ${finalPath}`)
     return true
   }
 
-  function uniqueDownloadPath(name) {
+  function uniqueDownloadPath(name, dir = downloadDir) {
     const safe = sanitizeFileName(name)
-    let candidate = path.join(downloadDir, safe)
+    let candidate = path.join(dir, safe)
     if (!fs.existsSync(candidate)) return candidate
     const ext = path.extname(safe)
     const stem = safe.slice(0, safe.length - ext.length)
     for (let i = 1; i < 10000; i++) {
-      candidate = path.join(downloadDir, `${stem} (${i})${ext}`)
+      candidate = path.join(dir, `${stem} (${i})${ext}`)
       if (!fs.existsSync(candidate)) return candidate
     }
-    return path.join(downloadDir, `${stem}-${Date.now()}${ext}`)
+    return path.join(dir, `${stem}-${Date.now()}${ext}`)
   }
 
   function cancelAll() {

@@ -1,10 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- 背景层次 -->
-    <color name="bg_window">#14141B</color>
-    <color name="bg_surface">#1E1E28</color>
-    <color name="bg_surface_variant">#2A2A38</color>
-    <color name="outline">#3A3A48</color>
+    <!-- 背景层次：window 最暗，surface 比背景明显提亮一档，卡片才能从背景里浮出来 -->
+    <color name="bg_window">#12121A</color>
+    <color name="bg_surface">#21212E</color>
+    <color name="bg_surface_variant">#2C2C3C</color>
+    <color name="outline">#3D3D4D</color>
 
     <!-- 主题色 -->
     <color name="primary">#7C8AFF</color>

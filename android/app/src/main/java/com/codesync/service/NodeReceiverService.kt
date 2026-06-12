@@ -19,6 +19,7 @@ import androidx.core.app.NotificationCompat
 import com.codesync.MainActivity
 import com.codesync.R
 import com.codesync.util.ClipboardSyncState
+import com.codesync.util.ContentBus
 import com.codesync.util.CryptoUtil
 import com.codesync.util.DeviceStore
 import com.codesync.util.FileTransferCoordinator
@@ -70,6 +71,10 @@ class NodeReceiverService : Service() {
         // 中继消息时间窗：超出视为重放（去重表只有 200 条，旧消息滚出后可被整包重放）。
         // 容差要覆盖多跳转发延迟与节点间时钟偏差；TOTP 本身要求时钟同步，±5 分钟足够
         private const val RELAY_REPLAY_WINDOW_MS = 5 * 60 * 1000L
+        // relay nonce 去重：与时间窗配合堵住"窗口内整包重放"。每条 relay 帧带随机 nonce，
+        // 仅内存留存（窗口期外的旧 nonce 必被时间窗拦截，无需跨重启持久化）。
+        private const val RELAY_NONCE_TTL_MS = RELAY_REPLAY_WINDOW_MS
+        private const val RELAY_NONCE_LIMIT_PER_SENDER = 300
     }
 
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -153,7 +158,11 @@ class NodeReceiverService : Service() {
                     writeHttpResponse(socket, 400)
                     return
                 }
-                if (request.method == "GET" && request.path.startsWith("/file/")) {
+                if (request.method == "GET" && (request.path.startsWith("/file/proxy/") || request.path.startsWith("/bus/file/proxy/"))) {
+                    handleFileProxyRequest(socket, request)
+                    return
+                }
+                if (request.method == "GET" && (request.path.startsWith("/file/") || request.path.startsWith("/bus/file/"))) {
                     handleFileChunkRequest(socket, request)
                     return
                 }
@@ -161,6 +170,9 @@ class NodeReceiverService : Service() {
                     val json = JSONObject(request.body)
                     if (json.optString("type") == "join_request") {
                         val response = handleJoinRequest(json, socket.inetAddress?.hostAddress.orEmpty())
+                        writeJsonHttpResponse(socket, response.first, response.second)
+                    } else if (json.optString("type") == "codebridge_bus") {
+                        val response = handleBusEnvelope(json)
                         writeJsonHttpResponse(socket, response.first, response.second)
                     } else {
                         writeHttpResponse(socket, handleRelayEnvelope(json))
@@ -176,7 +188,10 @@ class NodeReceiverService : Service() {
     }
 
     private fun handleFileChunkRequest(socket: Socket, request: HttpRequest) {
-        val fileId = request.path.removePrefix("/file/").trim()
+        val fileId = request.path
+            .removePrefix("/bus/file/")
+            .removePrefix("/file/")
+            .trim()
         if (fileId.isBlank()) {
             writeHttpResponse(socket, 400)
             return
@@ -200,6 +215,54 @@ class NodeReceiverService : Service() {
             )
         } else {
             writeHttpResponse(socket, result.status)
+        }
+    }
+
+    // 多跳分片代理：GET /file/proxy/{originId}/{fileId}?from=&to=&senderId=&nonce=&authToken=&hop=N
+    // 鉴权与分片加密在请求方与源设备之间端到端完成，本节点只转发字节。
+    // 源就是本机时直接服务；否则源可直达就转直连请求，不可直达且 hop 有余量
+    // 时交给下一个可信节点继续代理（hop 递减防环）。
+    private fun handleFileProxyRequest(socket: Socket, request: HttpRequest) {
+        val segments = request.path
+            .removePrefix("/bus/file/proxy/")
+            .removePrefix("/file/proxy/")
+            .split("/", limit = 2)
+        val originId = segments.getOrNull(0).orEmpty().trim()
+        val fileId = segments.getOrNull(1).orEmpty().trim()
+        if (originId.isBlank() || fileId.isBlank()) {
+            writeHttpResponse(socket, 400)
+            return
+        }
+        if (originId == PhoneIdentityStore.get(this).id) {
+            handleFileChunkRequest(socket, request.copy(path = "/file/$fileId"))
+            return
+        }
+        val hop = (request.query["hop"]?.toIntOrNull() ?: 0).coerceIn(0, 4)
+        if (hop <= 0) {
+            writeHttpResponse(socket, 502)
+            return
+        }
+        val requesterId = request.query["senderId"].orEmpty()
+        val baseQuery = listOf("from", "to", "senderId", "nonce", "authToken")
+            .mapNotNull { key -> request.query[key]?.let { "$key=${urlEncode(it)}" } }
+            .joinToString("&")
+        val origin = DeviceStore.findDevice(this, originId)
+        val forwardUrl = if (origin != null && origin.host.isNotBlank()) {
+            "http://${origin.host}:${LanDiscovery.NODE_RELAY_PORT}/file/${urlEncode(fileId)}?$baseQuery"
+        } else {
+            val next = DeviceStore.getEnabledDevices(this)
+                .firstOrNull { it.id != originId && it.id != requesterId && it.host.isNotBlank() }
+            if (next == null) {
+                writeHttpResponse(socket, 502)
+                return
+            }
+            "http://${next.host}:${LanDiscovery.NODE_RELAY_PORT}/file/proxy/${urlEncode(originId)}/${urlEncode(fileId)}?$baseQuery&hop=${hop - 1}"
+        }
+        val bytes = runCatching { httpGetBytes(forwardUrl) }.getOrNull()
+        if (bytes != null) {
+            writeBinaryHttpResponse(socket, 206, bytes, "", 0L)
+        } else {
+            writeHttpResponse(socket, 502)
         }
     }
 
@@ -411,6 +474,14 @@ class NodeReceiverService : Service() {
         val plain = CryptoUtil.decrypt(encryptedPayload, identity.pairingKey)
         val payload = JSONObject(plain)
 
+        // nonce 去重：authToken 已过，登记该 (senderId, nonce)。重放帧的 nonce 在
+        // 窗口期内重复 → 拒绝。补齐 bus 路径已有的强重放校验，堵住「relaySentAt 缺失
+        // 且 originMessageId 滚出 200 条去重表后整包重放」的口子。
+        if (isReplayedRelayNonce(senderId, nonce)) {
+            Log.w(TAG, "Relay nonce replay from $senderId, dropped")
+            return 202
+        }
+
         // 时间窗校验：relaySentAt 在加密负载内（GCM 防篡改），由发送方每跳重新打戳。
         // 旧版发送端没有该字段（=0）时跳过，保持互通
         val sentAt = payload.optLong("relaySentAt", 0L)
@@ -463,7 +534,20 @@ class NodeReceiverService : Service() {
                         rewriteClipboardGossipTargets(payload)
                     }
                 } else if (payloadType == "clipboard_image") {
-                    if (applyRemoteClipboardImage(payload)) {
+                    val imageManifest = payload.optJSONObject("fileManifest")
+                    if (imageManifest != null && !imageManifest.optBoolean("inline", true)) {
+                        // 大图（>inline 上限）：分片拉取后写剪贴板。relay 续传用的是
+                        // 拉取前的原始 payload（见下方 ttl 分支），无需 gossip 改写
+                        serviceScope.launch {
+                            if (pullRemoteClipboardImage(payload)) {
+                                notifyUserMessageRelay(payload)
+                                WebSocketService.reportExternalStatus(
+                                    this@NodeReceiverService,
+                                    receivedStatusMessage(payloadType, sourceName)
+                                )
+                            }
+                        }
+                    } else if (applyRemoteClipboardImage(payload)) {
                         notifyUserMessageRelay(payload)
                         WebSocketService.reportExternalStatus(this, receivedStatusMessage(payloadType, sourceName))
                         rewriteClipboardImageGossipTargets(payload)
@@ -512,6 +596,42 @@ class NodeReceiverService : Service() {
             }
         }
         return 200
+    }
+
+    private fun handleBusEnvelope(transport: JSONObject): Pair<Int, JSONObject> {
+        val parsed = ContentBus.parseTransportEnvelope(this, transport)
+            ?: return 403 to JSONObject()
+                .put("type", "bus_ack")
+                .put("accepted", false)
+                .put("reason", "invalid_bus_envelope")
+        val senderId = parsed.first
+        val envelope = parsed.second
+        val identity = PhoneIdentityStore.get(this)
+        val trusted = senderId == identity.id || DeviceStore.findDevice(this, senderId) != null
+        if (!trusted) {
+            return 403 to JSONObject()
+                .put("type", "bus_ack")
+                .put("accepted", false)
+                .put("reason", "untrusted_sender")
+        }
+
+        val legacyPayload = ContentBus.legacyPayloadFromEnvelope(envelope)
+        // 转回 relay 信封时补打 relaySentAt（缺失时 handleRelayEnvelope 会跳过重放窗口校验）
+        legacyPayload.put("relaySentAt", System.currentTimeMillis())
+        val encryptedPayload = CryptoUtil.encrypt(legacyPayload.toString(), identity.pairingKey)
+        val nonce = CryptoUtil.generateNonce()
+        val relay = JSONObject()
+            .put("type", "codebridge_relay")
+            .put("version", 1)
+            .put("senderId", senderId)
+            .put("nonce", nonce)
+            .put("payload", encryptedPayload)
+            .put("authToken", CryptoUtil.hmacSha256Base64(identity.pairingKey, "$senderId|$nonce|$encryptedPayload"))
+        val status = handleRelayEnvelope(relay)
+        return status to JSONObject()
+            .put("type", "bus_ack")
+            .put("accepted", status in 200..299)
+            .put("messageId", envelope.optString("messageId"))
     }
 
     private fun jsonArrayContains(array: JSONArray, value: String): Boolean {
@@ -596,6 +716,31 @@ class NodeReceiverService : Service() {
     // 同步整读整写一遍，且查重与记录非原子。
     private val recentRelayIds = LinkedHashSet<String>()
     private var recentIdsLoaded = false
+
+    // senderId -> (nonce -> firstSeenAt)。仅在 authToken 校验通过后登记，
+    // 避免攻击者用无效帧刷爆表。窗口期外的 nonce 由时间窗兜底，无需持久化。
+    private val recentRelayNonces = HashMap<String, LinkedHashMap<String, Long>>()
+
+    /** 原子地查重并登记 relay nonce，返回 true 表示重放（应拒绝）。 */
+    private fun isReplayedRelayNonce(senderId: String, nonce: String): Boolean {
+        if (senderId.isBlank() || nonce.isBlank()) return true
+        val now = System.currentTimeMillis()
+        synchronized(recentRelayNonces) {
+            val seen = recentRelayNonces.getOrPut(senderId) {
+                object : LinkedHashMap<String, Long>(RELAY_NONCE_LIMIT_PER_SENDER + 1, 0.75f, true) {
+                    override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Long>?): Boolean =
+                        size > RELAY_NONCE_LIMIT_PER_SENDER
+                }
+            }
+            val iterator = seen.entries.iterator()
+            while (iterator.hasNext()) {
+                if (now - iterator.next().value > RELAY_NONCE_TTL_MS) iterator.remove()
+            }
+            if (seen.containsKey(nonce)) return true
+            seen[nonce] = now
+        }
+        return false
+    }
 
     /** 原子地查重并登记，返回 false 表示该消息已处理过。 */
     private fun markRelayMessageSeen(id: String): Boolean {
@@ -799,26 +944,62 @@ class NodeReceiverService : Service() {
         val mime = manifest.optString("mime", "application/octet-stream").ifBlank { "application/octet-stream" }
         val expectedHash = manifest.optString("sha256").lowercase(Locale.ROOT)
         val downloadsRoot = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: filesDir
-        val dir = File(downloadsRoot, "CodeBridge").apply { mkdirs() }
+        // 目录分享：relativePath 重建相对目录（逐段消毒，杜绝路径穿越）
+        val dir = relativeSubDir(File(downloadsRoot, "CodeBridge"), manifest.optString("relativePath"))
+            .apply { mkdirs() }
         val partFile = File(dir, "$fileId.part")
         val digest = MessageDigest.getInstance("SHA-256")
+
+        // 拉取通道：直连源设备优先，其后是可信节点代理（多跳场景，代理只
+        // 转发字节，鉴权与分片加密仍在本机与源设备之间端到端完成）。
+        val routes = mutableListOf<Pair<String, String>>() // label to url 前缀（不含 query）
+        if (source.host.isNotBlank()) {
+            routes.add("direct" to "http://${source.host}:${source.port}/file/${urlEncode(fileId)}")
+        }
+        DeviceStore.getEnabledDevices(this)
+            .filter { it.id != source.id && it.host.isNotBlank() }
+            .take(5)
+            .forEach { device ->
+                routes.add(
+                    "proxy:${device.name}" to
+                        "http://${device.host}:${LanDiscovery.NODE_RELAY_PORT}/file/proxy/${urlEncode(source.id)}/${urlEncode(fileId)}"
+                )
+            }
+        if (routes.isEmpty()) {
+            Log.w(TAG, "文件拉取失败：源不可直达且没有可用代理节点")
+            return null
+        }
+        var routeIndex = 0
+        val progressNotificationId = "pull-$fileId".hashCode()
+        var lastProgressAt = 0L
 
         return try {
             FileOutputStream(partFile).use { output ->
                 var offset = 0L
                 while (offset < size) {
                     val to = minOf(offset + chunkSize - 1, size - 1)
-                    val nonce = CryptoUtil.generateNonce()
-                    val authToken = CryptoUtil.hmacSha256Base64(
-                        transferKey,
-                        "${identity.id}|$nonce|$fileId|$offset-$to"
-                    )
-                    val query = "from=$offset&to=$to" +
-                        "&senderId=${urlEncode(identity.id)}" +
-                        "&nonce=${urlEncode(nonce)}" +
-                        "&authToken=${urlEncode(authToken)}"
-                    val url = "http://${source.host}:${source.port}/file/${urlEncode(fileId)}?$query"
-                    val encrypted = httpGetBytes(url)
+                    var encrypted: ByteArray? = null
+                    while (routeIndex < routes.size) {
+                        val (label, urlBase) = routes[routeIndex]
+                        // nonce 每次请求重新生成：上一通道可能已把 nonce 送达源设备
+                        val nonce = CryptoUtil.generateNonce()
+                        val authToken = CryptoUtil.hmacSha256Base64(
+                            transferKey,
+                            "${identity.id}|$nonce|$fileId|$offset-$to"
+                        )
+                        val query = "from=$offset&to=$to" +
+                            "&senderId=${urlEncode(identity.id)}" +
+                            "&nonce=${urlEncode(nonce)}" +
+                            "&authToken=${urlEncode(authToken)}"
+                        val url = if (label == "direct") "$urlBase?$query" else "$urlBase?$query&hop=3"
+                        encrypted = runCatching { httpGetBytes(url) }.getOrNull()
+                        if (encrypted != null) break
+                        Log.w(TAG, "分片通道不可用 $label，切换下一通道")
+                        routeIndex += 1
+                    }
+                    if (encrypted == null) {
+                        throw IllegalStateException("分片拉取失败（所有通道均不可达）@$offset")
+                    }
                     val plain = CryptoUtil.decryptBytes(encrypted, transferKey)
                     val expectedLen = (to - offset + 1).toInt()
                     if (plain.size != expectedLen) {
@@ -827,6 +1008,12 @@ class NodeReceiverService : Service() {
                     output.write(plain)
                     digest.update(plain)
                     offset += plain.size
+                    // 进度通知（节流 ≥500ms，末片必发）
+                    val now = System.currentTimeMillis()
+                    if (now - lastProgressAt >= 500 || offset >= size) {
+                        lastProgressAt = now
+                        notifyFileTransferProgress(progressNotificationId, name, offset, size)
+                    }
                 }
             }
             val actualHash = digest.digest().joinToString("") { "%02x".format(it) }
@@ -836,6 +1023,7 @@ class NodeReceiverService : Service() {
                 )
             ) {
                 partFile.delete()
+                getSystemService(NotificationManager::class.java).cancel(progressNotificationId)
                 Log.w(TAG, "文件 hash 校验失败 expected=${expectedHash.take(12)} actual=${actualHash.take(12)}")
                 return null
             }
@@ -844,13 +1032,41 @@ class NodeReceiverService : Service() {
                 partFile.copyTo(finalFile, overwrite = true)
                 partFile.delete()
             }
+            getSystemService(NotificationManager::class.java).cancel(progressNotificationId)
             DeviceStore.markDeviceSynced(this, source.id)
             ReceivedFile(name = finalFile.name, file = finalFile, size = size, mime = mime, sourceName = source.name)
         } catch (e: Exception) {
             runCatching { partFile.delete() }
+            getSystemService(NotificationManager::class.java).cancel(progressNotificationId)
             Log.e(TAG, "文件拉取失败: ${e.message}", e)
             null
         }
+    }
+
+    /** relativePath 含文件名（最后一段丢弃），其余各段消毒后映射为子目录。 */
+    private fun relativeSubDir(baseDir: File, relativePath: String): File {
+        var dir = baseDir
+        relativePath.split('/', '\\')
+            .dropLast(1)
+            .filter { it.isNotBlank() }
+            .map { sanitizeFileName(it) }
+            .filter { it != "." && it != ".." }
+            .take(8)
+            .forEach { dir = File(dir, it) }
+        return dir
+    }
+
+    private fun notifyFileTransferProgress(notificationId: Int, name: String, received: Long, total: Long) {
+        val percent = if (total > 0) ((received * 100) / total).toInt().coerceIn(0, 100) else 0
+        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setContentTitle("正在接收 $name")
+            .setContentText("$percent% · ${formatBytes(received)} / ${formatBytes(total)}")
+            .setProgress(100, percent, false)
+            .setOnlyAlertOnce(true)
+            .setOngoing(true)
+            .build()
+        getSystemService(NotificationManager::class.java).notify(notificationId, notification)
     }
 
     private fun resolveFileSource(payload: JSONObject, manifest: JSONObject): FileSource? {
@@ -861,11 +1077,11 @@ class NodeReceiverService : Service() {
             .trim()
         if (sourceId.isBlank()) return null
         val device = DeviceStore.findDevice(this, sourceId)
+        // host 可为空：直连不可达时由 pullIncomingFileTransfer 的代理通道兜底（多跳）
         val host = device?.host.orEmpty()
             .ifBlank { manifest.optString("host") }
             .ifBlank { payload.optString("sourceHost") }
             .trim()
-        if (host.isBlank()) return null
         val port = manifest.optInt(
             "relayPort",
             payload.optInt("relayPort", LanDiscovery.NODE_RELAY_PORT)
@@ -980,6 +1196,27 @@ class NodeReceiverService : Service() {
      * 上一跳不认识的节点。刷新 TTL 是安全的：LWW 保证每个节点对同一版本最多
      * 应用/扩散一次，洪泛必然收敛。
      */
+    // 大图剪贴板：LWW 预检 → 分片拉取 → 写剪贴板。与文件传输不同：不弹确认框
+    //（已受 shouldReceiveContent 的图片剪贴板开关把关），不留存下载目录，应用后即删。
+    private fun pullRemoteClipboardImage(payload: JSONObject): Boolean {
+        val manifest = payload.optJSONObject("fileManifest") ?: return false
+        if (manifest.optString("mime") != "image/png") return false
+        val version = payload.optJSONObject("clipVersion")
+        val shortHash = manifest.optString("sha256").take(24)
+        val ts = (version?.optLong("ts", 0L) ?: 0L).takeIf { it > 0L }
+            ?: payload.optLong("timestamp", 0L)
+        val origin = version?.optString("origin").orEmpty()
+            .ifBlank { payload.optString("originDeviceId", payload.optString("sourceDeviceId")) }
+        if (!isNewerClipboardImageVersion(ts, origin, shortHash)) return false
+        val received = pullIncomingFileTransfer(payload) ?: return false
+        val bytes = runCatching { received.file.readBytes() }.getOrNull()
+        runCatching { received.file.delete() }
+        if (bytes == null || bytes.isEmpty()) return false
+        if (!writeClipboardImage(bytes, ts, shortHash)) return false
+        rememberClipboardImageVersion(ts, origin, shortHash)
+        return true
+    }
+
     private fun applyRemoteClipboardImage(payload: JSONObject): Boolean {
         val manifest = payload.optJSONObject("fileManifest") ?: return false
         if (manifest.optString("mime") != "image/png") return false
@@ -1071,22 +1308,23 @@ class NodeReceiverService : Service() {
         }
     }
 
+    // gossip 改写只扩展目标到本机授权邻居，绝不重置 relayTtl：入站 TTL 必须
+    // 一路衰减（转发在 enqueueRelayPayload 里 -1），否则网状拓扑下 TTL 安全网失效，
+    // 唯一防线退化为去重表，去重表滚动淘汰后旧版本会被重新处理并再次 gossip → 风暴。
     private fun rewriteClipboardGossipTargets(payload: JSONObject) {
         val targets = DeviceStore.getEnabledDevices(this)
             .filter { it.allowClipboard }
             .map { it.id }
         if (targets.isEmpty()) return
         payload.put("targetDeviceIds", JSONArray(targets))
-        payload.put("relayTtl", 4)
     }
 
     private fun rewriteClipboardImageGossipTargets(payload: JSONObject) {
         val targets = DeviceStore.getEnabledDevices(this)
-            .filter { it.allowClipboardImage }
+            .filter { it.allowClipboardImage || it.allowClipboard }
             .map { it.id }
         if (targets.isEmpty()) return
         payload.put("targetDeviceIds", JSONArray(targets))
-        payload.put("relayTtl", 4)
     }
 
     private fun writeHttpResponse(socket: Socket, code: Int) {

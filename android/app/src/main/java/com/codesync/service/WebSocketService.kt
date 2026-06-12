@@ -11,10 +11,12 @@ import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import android.util.Base64
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.codesync.MainActivity
 import com.codesync.util.ClipboardSyncState
+import com.codesync.util.ContentBus
 import com.codesync.util.CryptoUtil
 import com.codesync.util.DesktopDevice
 import com.codesync.util.DeviceStore
@@ -42,6 +44,7 @@ import okhttp3.WebSocketListener
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.security.MessageDigest
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
@@ -92,9 +95,13 @@ class WebSocketService : Service() {
         const val EXTRA_FILE_PATH = "file_path"
         const val EXTRA_FILE_NAME = "file_name"
         const val EXTRA_FILE_MIME = "file_mime"
+        const val EXTRA_RELATIVE_PATH = "file_relative_path"
+        const val EXTRA_BATCH_ID = "file_batch_id"
+        const val EXTRA_BATCH_COUNT = "file_batch_count"
 
         const val NOTIFICATION_ID = 1001
         const val CHANNEL_ID = "code_sync_service"
+        private const val MAX_INLINE_CLIPBOARD_IMAGE_BYTES = 180 * 1024
         const val CONNECTION_STATE_ACTION = "com.codesync.CONNECTION_STATE"
         // 收到桌面节点下发的 TOTP 种子并存库后，发此本地广播通知界面刷新列表
         const val TOTP_SYNCED_ACTION = "com.codesync.TOTP_SYNCED"
@@ -314,6 +321,12 @@ class WebSocketService : Service() {
     }
 
     private fun handleSendFile(intent: Intent) {
+        val requestedType = intent.getStringExtra(EXTRA_CONTENT_TYPE).orEmpty()
+        if (requestedType == "clipboard_image") {
+            handleSendClipboardImage(intent)
+            return
+        }
+
         if (!SettingsStore.isSyncClipboardFileEnabled(this)) {
             stopIfNothingPending("文件发送未开启")
             return
@@ -341,6 +354,9 @@ class WebSocketService : Service() {
         val fileName = intent.getStringExtra(EXTRA_FILE_NAME).orEmpty().ifBlank { file.name }
         val mime = intent.getStringExtra(EXTRA_FILE_MIME).orEmpty()
             .ifBlank { FileTransferRegistry.guessMime(fileName) }
+        val relativePath = intent.getStringExtra(EXTRA_RELATIVE_PATH).orEmpty()
+        val batchId = intent.getStringExtra(EXTRA_BATCH_ID).orEmpty()
+        val batchCount = intent.getIntExtra(EXTRA_BATCH_COUNT, 0)
         val host = LanDiscovery.localLanHost().ifBlank { LanDiscovery.localTailscaleHost() }
         val manifest = FileTransferRegistry.registerOutgoingFile(
             file = file,
@@ -349,7 +365,8 @@ class WebSocketService : Service() {
             identity = identity,
             targetDeviceIds = targetDevices.map { it.id },
             host = host,
-            relayPort = LanDiscovery.NODE_RELAY_PORT
+            relayPort = LanDiscovery.NODE_RELAY_PORT,
+            relativePath = relativePath
         )
         val fileId = manifest.optString("fileId")
         val payload = JSONObject()
@@ -376,6 +393,13 @@ class WebSocketService : Service() {
             .put("pushAuthority", "source_device")
             .put("pushAuthorityDeviceId", identity.id)
             .put("fileManifest", manifest)
+            .apply {
+                // 同批文件带相同 batchId：接收端只确认一次，结论对整批生效
+                if (batchId.isNotBlank()) {
+                    put("batchId", batchId)
+                    put("batchCount", batchCount)
+                }
+            }
             .toString()
 
         enqueuePayloadToDevices(
@@ -383,6 +407,161 @@ class WebSocketService : Service() {
             targetDevices = targetDevices,
             type = "file_transfer",
             statusMessage = "正在同步文件到 ${targetDevices.size} 个设备节点",
+            msgId = fileId
+        )
+    }
+
+    private fun handleSendClipboardImage(intent: Intent) {
+        if (!SettingsStore.isSyncClipboardImageEnabled(this)) {
+            stopIfNothingPending("图片剪贴板同步未开启")
+            return
+        }
+        val filePath = intent.getStringExtra(EXTRA_FILE_PATH).orEmpty()
+        val file = File(filePath)
+        if (!file.isFile || file.length() <= 0L) {
+            stopIfNothingPending("图片剪贴板无效")
+            return
+        }
+        if (file.length() > MAX_INLINE_CLIPBOARD_IMAGE_BYTES) {
+            // 大图回退：manifest + 分片拉取（与文件传输同通道），接收端拉完写剪贴板
+            handleSendClipboardImageAsFile(intent, file)
+            return
+        }
+        val targetDevices = targetDevicesForType("clipboard_image")
+        if (targetDevices.isEmpty()) {
+            stopIfNothingPending("没有允许接收图片剪贴板的推送目标")
+            return
+        }
+
+        holdForwardLocks()
+        val identity = PhoneIdentityStore.get(this)
+        val bytes = file.readBytes()
+        val fullHash = sha256Hex(bytes)
+        val shortHash = fullHash.take(24)
+        val clipTs = System.currentTimeMillis()
+        val fileName = intent.getStringExtra(EXTRA_FILE_NAME).orEmpty()
+            .ifBlank { "clipboard-$clipTs.png" }
+        val msgId = "clip-img-${identity.id}-$clipTs-$shortHash"
+        val manifest = JSONObject()
+            .put("fileId", msgId)
+            .put("name", fileName)
+            .put("mime", "image/png")
+            .put("size", bytes.size)
+            .put("sha256", fullHash)
+            .put("originDeviceId", identity.id)
+            .put("originDeviceName", identity.name)
+            .put("targetDeviceIds", JSONArray(targetDevices.map { it.id }))
+            .put("expiresAt", clipTs + 10 * 60 * 1000L)
+            .put("inline", true)
+
+        val payload = JSONObject()
+            .put("type", "clipboard_image")
+            .put("code", "")
+            .put("source", "剪贴板图片")
+            .put("label", fileName)
+            .put("rawMessage", "剪贴板图片 ${formatBytes(bytes.size.toLong())}")
+            .put("timestamp", clipTs)
+            .put("phoneId", identity.id)
+            .put("phoneName", identity.name)
+            .put("sourceDeviceId", identity.id)
+            .put("sourceDeviceName", identity.name)
+            .put("sourceDeviceType", "ANDROID_PHONE")
+            .put("originDeviceId", identity.id)
+            .put("originDeviceName", identity.name)
+            .put("originMessageId", msgId)
+            .put("relayMessageId", msgId)
+            .put("relayPath", JSONArray().put(identity.id))
+            .put("relayTtl", SMS_RELAY_TTL)
+            .put("relayPolicy", "source_selected_targets")
+            .put("targetDevices", buildTargetTopology(targetDevices))
+            .put("targetDeviceIds", JSONArray(targetDevices.map { it.id }))
+            .put("pushAuthority", "source_device")
+            .put("pushAuthorityDeviceId", identity.id)
+            .put(
+                "clipVersion",
+                JSONObject()
+                    .put("ts", clipTs)
+                    .put("origin", identity.id)
+                    .put("hash", shortHash)
+                    .put("kind", "image")
+            )
+            .put("fileManifest", manifest)
+            .put("dataBase64", Base64.encodeToString(bytes, Base64.NO_WRAP))
+            .toString()
+
+        enqueuePayloadToDevices(
+            payload = payload,
+            targetDevices = targetDevices,
+            type = "clipboard_image",
+            statusMessage = "正在同步剪贴板图片到 ${targetDevices.size} 个设备节点",
+            msgId = msgId
+        )
+    }
+
+    // 大图剪贴板（>inline 上限）：登记为分片源并广播 manifest（inline=false），
+    // payload 带 clipVersion 供接收端 LWW 排序。源文件须在 offer 有效期内保留。
+    private fun handleSendClipboardImageAsFile(intent: Intent, file: File) {
+        val targetDevices = targetDevicesForType("clipboard_image")
+        if (targetDevices.isEmpty()) {
+            stopIfNothingPending("没有允许接收图片剪贴板的推送目标")
+            return
+        }
+
+        holdForwardLocks()
+        val identity = PhoneIdentityStore.get(this)
+        val clipTs = System.currentTimeMillis()
+        val fileName = intent.getStringExtra(EXTRA_FILE_NAME).orEmpty().ifBlank { file.name }
+        val host = LanDiscovery.localLanHost().ifBlank { LanDiscovery.localTailscaleHost() }
+        val manifest = FileTransferRegistry.registerOutgoingFile(
+            file = file,
+            name = fileName,
+            mime = "image/png",
+            identity = identity,
+            targetDeviceIds = targetDevices.map { it.id },
+            host = host,
+            relayPort = LanDiscovery.NODE_RELAY_PORT
+        )
+        val fileId = manifest.optString("fileId")
+        val shortHash = manifest.optString("sha256").take(24)
+        val payload = JSONObject()
+            .put("type", "clipboard_image")
+            .put("code", "")
+            .put("source", "剪贴板图片")
+            .put("label", fileName)
+            .put("rawMessage", "剪贴板图片 ${formatBytes(file.length())}")
+            .put("timestamp", clipTs)
+            .put("phoneId", identity.id)
+            .put("phoneName", identity.name)
+            .put("sourceDeviceId", identity.id)
+            .put("sourceDeviceName", identity.name)
+            .put("sourceDeviceType", "ANDROID_PHONE")
+            .put("originDeviceId", identity.id)
+            .put("originDeviceName", identity.name)
+            .put("originMessageId", fileId)
+            .put("relayMessageId", fileId)
+            .put("relayPath", JSONArray().put(identity.id))
+            .put("relayTtl", SMS_RELAY_TTL)
+            .put("relayPolicy", "source_selected_targets")
+            .put("targetDevices", buildTargetTopology(targetDevices))
+            .put("targetDeviceIds", JSONArray(targetDevices.map { it.id }))
+            .put("pushAuthority", "source_device")
+            .put("pushAuthorityDeviceId", identity.id)
+            .put(
+                "clipVersion",
+                JSONObject()
+                    .put("ts", clipTs)
+                    .put("origin", identity.id)
+                    .put("hash", shortHash)
+                    .put("kind", "image")
+            )
+            .put("fileManifest", manifest)
+            .toString()
+
+        enqueuePayloadToDevices(
+            payload = payload,
+            targetDevices = targetDevices,
+            type = "clipboard_image",
+            statusMessage = "正在同步剪贴板图片（大图）到 ${targetDevices.size} 个设备节点",
             msgId = fileId
         )
     }
@@ -978,6 +1157,29 @@ class WebSocketService : Service() {
         if (hosts.isEmpty()) return false
         return try {
             val identity = PhoneIdentityStore.get(this)
+            if (deviceSupportsSoftBus(device)) {
+                val busEnvelope = runCatching {
+                    ContentBus.envelopeFromLegacyPayload(this, JSONObject(payload))
+                }.getOrNull()
+                if (busEnvelope != null) {
+                    val busTransport = ContentBus.wrapTransportEnvelope(this, busEnvelope, device.pairingKey)
+                    for (host in hosts) {
+                        try {
+                            val body = busTransport.toString()
+                                .toRequestBody("application/json; charset=utf-8".toMediaType())
+                            val request = Request.Builder()
+                                .url("http://${formatHttpHost(host)}:${device.port}/bus/message")
+                                .post(body)
+                                .build()
+                            relayHttpClient.newCall(request).execute().use { response ->
+                                if (response.isSuccessful) return true
+                            }
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Bus HTTP unreachable for ${device.name}@$host: ${e.message}")
+                        }
+                    }
+                }
+            }
             // 发送时间戳放在加密负载内（GCM 保证完整性）：接收端拒绝超出
             // 时间窗的消息，堵住「去重表滚出 200 条后整包重放」的口子。
             // 放负载里而不是改 HMAC 公式，新旧版本可以互通。
@@ -1023,6 +1225,11 @@ class WebSocketService : Service() {
         }
     }
 
+    private fun deviceSupportsSoftBus(device: DesktopDevice): Boolean {
+        val caps = runCatching { JSONObject(device.capabilities.ifBlank { "{}" }) }.getOrNull() ?: return false
+        return caps.optBoolean("softBus", false) || caps.optBoolean("p2pDirect", false)
+    }
+
     /** 目标设备的候选地址列表：主地址优先，其后是 altHosts（如 Tailscale IP）。 */
     private fun candidateHosts(device: DesktopDevice): List<String> {
         return (listOf(device.host) + device.altHosts)
@@ -1049,7 +1256,8 @@ class WebSocketService : Service() {
                 "clipboard", "clipboard_text" ->
                     device.allowClipboard && SettingsStore.isSyncClipboardEnabled(this)
                 "clipboard_image" ->
-                    device.allowClipboardImage && SettingsStore.isSyncClipboardImageEnabled(this)
+                    (device.allowClipboardImage || device.allowClipboard) &&
+                        SettingsStore.isSyncClipboardImageEnabled(this)
                 "clipboard_file" ->
                     device.allowClipboardFile && SettingsStore.isSyncClipboardFileEnabled(this)
                 "file_transfer" ->
@@ -1418,6 +1626,8 @@ class WebSocketService : Service() {
                     .put("clipboardImage", true)
                     .put("clipboardFile", true)
                     .put("fileTransfer", true)
+                    .put("softBus", true)
+                    .put("p2pDirect", true)
                     .put("joinRequest", true))
                 .apply {
                     // 本机的 Tailscale IP（如有）：桌面端会把它随路由表分发给其它
@@ -1682,6 +1892,27 @@ class WebSocketService : Service() {
         }
     }
 
+    private fun sha256Hex(bytes: ByteArray): String {
+        return MessageDigest.getInstance("SHA-256")
+            .digest(bytes)
+            .joinToString("") { "%02x".format(it) }
+    }
+
+    private fun formatBytes(size: Long): String {
+        val units = arrayOf("B", "KB", "MB", "GB")
+        var value = size.toDouble()
+        var index = 0
+        while (value >= 1024.0 && index < units.lastIndex) {
+            value /= 1024.0
+            index += 1
+        }
+        return if (index == 0) {
+            "$size ${units[index]}"
+        } else {
+            String.format(Locale.US, "%.1f %s", value, units[index])
+        }
+    }
+
     private fun lastAcceptedLsdbSeq(sourceId: String): Long =
         getSharedPreferences(LSDB_SEQ_PREFS, Context.MODE_PRIVATE).getLong(sourceId, 0L)
 
@@ -1796,8 +2027,20 @@ class WebSocketService : Service() {
         if (!connection.authenticated) return false
 
         return try {
-            val encrypted = CryptoUtil.encrypt(payload, sessionKey)
-            val messageType = if (isTopologyPayloadType(payloadType)) payloadType else "verify_code"
+            val useBus = deviceSupportsSoftBus(connection.device) && !isTopologyPayloadType(payloadType)
+            val outboundPayload = if (useBus) {
+                ContentBus.envelopeFromLegacyPayload(this, JSONObject(payload)).toString()
+            } else {
+                payload
+            }
+            val encrypted = CryptoUtil.encrypt(outboundPayload, sessionKey)
+            val messageType = if (useBus) {
+                "bus_message"
+            } else if (isTopologyPayloadType(payloadType)) {
+                payloadType
+            } else {
+                "verify_code"
+            }
             val message = JSONObject()
                 .put("type", messageType)
                 .put("msgId", msgId)

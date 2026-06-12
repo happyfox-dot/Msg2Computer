@@ -1,9 +1,42 @@
 * { margin: 0; padding: 0; box-sizing: border-box; }
 
+/* ========== 设计令牌 ==========
+   颜色/圆角/间距集中定义，避免散落的 hex/rgba 字面量；改主题只动这里。 */
+:root {
+  /* 主题色 */
+  --accent: #7c8aff;
+  --accent-soft: rgba(124, 138, 255, 0.16);
+  --accent-strong: rgba(124, 138, 255, 0.32);
+  --success: #5cdb8b;
+  --success-soft: rgba(92, 219, 139, 0.16);
+  --warning: #e0b060;
+  --danger: #e06060;
+
+  /* 文字层次 */
+  --text-1: #ececf2;
+  --text-2: #b4b8c4;
+  --text-3: #888d9a;
+
+  /* 表面层次（半透明白叠加，贴合玻璃拟态背景） */
+  --surface-1: rgba(255, 255, 255, 0.045);
+  --surface-2: rgba(255, 255, 255, 0.07);
+  --surface-3: rgba(255, 255, 255, 0.10);
+  --border-1: rgba(255, 255, 255, 0.09);
+  --border-2: rgba(255, 255, 255, 0.16);
+
+  /* 圆角 */
+  --radius-sm: 6px;
+  --radius-md: 9px;
+  --radius-lg: 12px;
+
+  /* 阴影 */
+  --shadow-card: 0 2px 10px rgba(0, 0, 0, 0.18);
+}
+
 body {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
   background: rgba(30, 30, 40, 0.92);
-  color: #e0e0e0;
+  color: var(--text-2);
   border-radius: 12px;
   overflow: hidden;
   user-select: none;
@@ -105,12 +138,12 @@ body {
 }
 
 .tab-icon {
-  font-size: 16px;
+  font-size: 17px;
   line-height: 1;
 }
 
 .tab-label {
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 500;
   white-space: nowrap;
 }
@@ -496,6 +529,7 @@ body {
 .phone-row:hover {
   background: rgba(255,255,255,0.08);
   border-color: rgba(255,255,255,0.15);
+  box-shadow: var(--shadow-card);
 }
 
 .phone-main { min-width: 0; }
@@ -514,7 +548,7 @@ body {
   border-radius: 4px;
   background: rgba(255,255,255,0.08);
   color: #aaa;
-  font-size: 9px;
+  font-size: 10px;
   font-weight: 500;
 }
 .phone-connected .phone-status { color: #5cdb8b; background: rgba(92,219,139,0.15); }
@@ -639,6 +673,7 @@ body {
 .code-item:hover {
   background: rgba(255,255,255,0.1);
   border-color: rgba(255,255,255,0.2);
+  box-shadow: var(--shadow-card);
 }
 .code-item.new-code {
   animation: pulseIn 0.5s ease-out;
@@ -949,6 +984,11 @@ body {
   opacity: 0.5;
   cursor: default;
 }
+/* 检查失败时按需显示的「手动下载」兜底链接 */
+.update-fallback-link {
+  font-size: 11px;
+  display: none;
+}
 
 /* ========== 复制反馈 ========== */
 .copy-feedback {
@@ -985,12 +1025,51 @@ body {
 .status-disconnected { color: #e06060; }
 
 /* ========== 滚动条 ========== */
-::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar { width: 8px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb {
-  background: rgba(255,255,255,0.12);
-  border-radius: 2px;
+  background: rgba(255,255,255,0.14);
+  border-radius: 4px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(255,255,255,0.18);
+  background: rgba(255,255,255,0.24);
+  background-clip: padding-box;
+}
+
+/* 文件接收进度列表（设置页"主动发送文件"下方） */
+.file-transfer-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 8px;
+}
+.file-transfer-row {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.file-transfer-name {
+  font-size: 12px;
+  color: rgba(255,255,255,0.75);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.file-transfer-track {
+  height: 5px;
+  border-radius: 3px;
+  background: rgba(255,255,255,0.10);
+  overflow: hidden;
+}
+.file-transfer-bar {
+  height: 100%;
+  width: 0;
+  border-radius: 3px;
+  background: #5cdb8b;
+  transition: width 0.2s ease;
+}
+.file-transfer-row.done .file-transfer-bar {
+  background: #4aa3ff;
 }

@@ -7,20 +7,25 @@
 }
 
 .btn-action {
-  padding: 6px 9px;
-  border: none;
-  border-radius: 6px;
-  background: rgba(100, 120, 255, 0.15);
-  color: #a8b8ff;
+  padding: 7px 12px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm, 6px);
+  background: var(--accent-soft, rgba(124, 138, 255, 0.16));
+  color: #c2cbff;
   font-size: 12px;
+  font-weight: 500;
   cursor: pointer;
-  transition: all 0.2s;
+  transition: background 0.15s, color 0.15s, transform 0.08s;
   -webkit-app-region: no-drag;
 }
 
 .btn-action:hover {
-  background: rgba(100, 120, 255, 0.25);
-  color: #c0d0ff;
+  background: var(--accent-strong, rgba(124, 138, 255, 0.32));
+  color: #e0e5ff;
+}
+
+.btn-action:active {
+  transform: translateY(1px);
 }
 
 .auto-monitor-label {

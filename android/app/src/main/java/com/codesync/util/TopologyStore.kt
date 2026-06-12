@@ -102,6 +102,8 @@ object TopologyStore {
                 .put("clipboardImage", true)
                 .put("clipboardFile", true)
                 .put("fileTransfer", true)
+                .put("softBus", true)
+                .put("p2pDirect", true)
                 .put("joinRequest", true))
             .put("enabled", true)
             .put("connected", true)
@@ -434,9 +436,12 @@ object TopologyStore {
             policyAllowSmsMessages = node.optBoolean("allowSmsMessages", true),
             policyAllowNotifications = node.optBoolean("allowNotifications", true),
             policyAllowTotp = node.optBoolean("allowTotp", true),
+            // 缺字段时默认 true，与 DeviceStore 新建默认一致（局域网可信环境下
+            // 剪贴板默认放行，由两端全局总开关把关）。避免同一设备经 gossip 学习
+            // 得到 false、经扫码新建得到 true 的分叉（剪贴板"有时同步有时不同步"根因）
             policyAllowClipboard = node.optBoolean(
                 "allowClipboardText",
-                node.optBoolean("allowClipboard", false)
+                node.optBoolean("allowClipboard", true)
             ),
             policyAllowClipboardImage = node.optBoolean("allowClipboardImage", false),
             policyAllowClipboardFile = node.optBoolean("allowClipboardFile", false),

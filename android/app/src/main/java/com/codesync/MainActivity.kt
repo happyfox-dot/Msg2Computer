@@ -13,6 +13,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
+import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import android.provider.Settings
 import android.text.InputType
@@ -87,6 +88,8 @@ class MainActivity : AppCompatActivity() {
     // 应用内更新：DownloadManager 的下载 id 与待安装的版本号；下载完成由系统广播触发安装
     private var pendingUpdateDownloadId: Long = -1L
     private var pendingUpdateVersionName: String = ""
+    // 安装失败兜底用的 release 页面地址（下载完成时一并记下，便于失败时跳浏览器手动下载）
+    private var pendingUpdatePageUrl: String = ""
     // 等待「安装未知应用」授权后继续下载的更新信息（去设置页授权 → onResume 续流程）
     private var pendingUpdateInfo: ApkUpdater.UpdateInfo? = null
 
@@ -103,8 +106,16 @@ class MainActivity : AppCompatActivity() {
         uri?.let { handleImageFromGallery(it) }
     }
 
-    private val pickFileLauncher = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
-        uri?.let { handleFileForTransfer(it) }
+    private val pickFileLauncher = registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris: List<Uri>? ->
+        if (!uris.isNullOrEmpty()) {
+            // 同批文件带相同 batchId：接收端只确认一次
+            val batchId = if (uris.size > 1) "batch-${java.util.UUID.randomUUID()}" else ""
+            uris.forEach { handleFileForTransfer(it, batchId, uris.size) }
+        }
+    }
+
+    private val pickFolderLauncher = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri: Uri? ->
+        uri?.let { handleFolderForTransfer(it) }
     }
 
     private val connectionReceiver = object : BroadcastReceiver() {
@@ -220,11 +231,16 @@ class MainActivity : AppCompatActivity() {
         syncMessagePolicySwitches()
         refreshConnectionSnapshot()
 
-        // 从「安装未知应用」设置页返回：已授权则继续下载，未授权则放弃（可重新手动检查）
+        // 从「安装未知应用」设置页返回：已授权则继续下载，未授权则明确告知已取消
+        // （原先静默放弃，用户以为没反应；现在给一条 toast 引导重试）
         pendingUpdateInfo?.let { info ->
             pendingUpdateInfo = null
             if (ApkUpdater.canInstallPackages(this)) {
                 startUpdateDownload(info)
+            } else {
+                Toast.makeText(
+                    this, R.string.update_install_permission_denied, Toast.LENGTH_LONG
+                ).show()
             }
         }
     }
@@ -479,6 +495,7 @@ class MainActivity : AppCompatActivity() {
         }
         pendingUpdateDownloadId = downloadId
         pendingUpdateVersionName = info.versionName
+        pendingUpdatePageUrl = info.pageUrl
         Toast.makeText(this, R.string.update_downloading, Toast.LENGTH_SHORT).show()
     }
 
@@ -486,7 +503,9 @@ class MainActivity : AppCompatActivity() {
     private fun handleUpdateDownloadComplete(downloadId: Long) {
         pendingUpdateDownloadId = -1L
         val versionName = pendingUpdateVersionName
+        val pageUrl = pendingUpdatePageUrl
         pendingUpdateVersionName = ""
+        pendingUpdatePageUrl = ""
         if (versionName.isEmpty()) return
 
         val dm = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
@@ -496,9 +515,32 @@ class MainActivity : AppCompatActivity() {
                 DownloadManager.STATUS_SUCCESSFUL
         } ?: false
 
-        if (!successful || !ApkUpdater.installApk(this, ApkUpdater.apkFile(this, versionName))) {
+        if (!successful) {
+            // 下载本身失败（网络中断 / 存储不足等）：提示重试即可
             Toast.makeText(this, R.string.update_download_failed, Toast.LENGTH_LONG).show()
+            return
         }
+
+        if (!ApkUpdater.installApk(this, ApkUpdater.apkFile(this, versionName))) {
+            // 下载成功但拉不起安装器：最常见是签名不一致，系统直接拒绝。
+            // 给出手动下载兜底，避免用户卡在毫无去向的「下载失败」里。
+            showInstallFailedDialog(pageUrl)
+        }
+    }
+
+    /** 安装未能启动时的兜底：解释原因并提供「前往 GitHub 手动下载」。 */
+    private fun showInstallFailedDialog(pageUrl: String) {
+        val fallbackUrl = pageUrl.ifBlank {
+            "https://github.com/happyfox-dot/Msg2Computer/releases/latest"
+        }
+        androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle(R.string.update_install_failed_title)
+            .setMessage(R.string.update_install_failed_message)
+            .setPositiveButton(R.string.update_open_github) { _, _ ->
+                runCatching { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(fallbackUrl))) }
+            }
+            .setNegativeButton(R.string.cancel, null)
+            .show()
     }
 
     /** 把开关状态同步为「短信自动转发」偏好，而非常驻连接开关。 */
@@ -562,6 +604,9 @@ class MainActivity : AppCompatActivity() {
         binding.btnSendFile.setOnClickListener {
             sendSelectedFile()
         }
+        binding.btnSendFolder.setOnClickListener {
+            sendSelectedFolder()
+        }
     }
 
     /** 读取当前剪贴板内容并投递到启用的设备节点（仅前台可读，符合系统限制）。 */
@@ -570,13 +615,19 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, R.string.clipboard_sync_disabled, Toast.LENGTH_SHORT).show()
             return
         }
+        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+        val item = clipboard.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)
+        val uri = item?.uri
+        val uriMime = uri?.let { contentResolver.getType(it).orEmpty() }.orEmpty()
+        if (uri != null && uriMime.startsWith("image/")) {
+            sendClipboardImage(uri)
+            return
+        }
         if (DeviceStore.getEnabledDevices(this).none { it.allowClipboard }) {
             Toast.makeText(this, R.string.clipboard_no_target, Toast.LENGTH_SHORT).show()
             return
         }
-        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
-        val text = clipboard.primaryClip?.takeIf { it.itemCount > 0 }
-            ?.getItemAt(0)?.coerceToText(this)?.toString()?.trim().orEmpty()
+        val text = item?.coerceToText(this)?.toString()?.trim().orEmpty()
         if (text.isBlank()) {
             Toast.makeText(this, R.string.clipboard_empty, Toast.LENGTH_SHORT).show()
             return
@@ -586,6 +637,38 @@ class MainActivity : AppCompatActivity() {
         }
         Toast.makeText(this, R.string.clipboard_sent, Toast.LENGTH_SHORT).show()
         refreshConnectionSnapshot()
+    }
+
+    private fun sendClipboardImage(uri: Uri) {
+        if (!SettingsStore.isSyncClipboardImageEnabled(this)) {
+            Toast.makeText(this, "图片剪贴板同步未开启", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (DeviceStore.getEnabledDevices(this).none { it.allowClipboardImage || it.allowClipboard }) {
+            Toast.makeText(this, "没有启用图片剪贴板的推送目标", Toast.LENGTH_SHORT).show()
+            return
+        }
+        lifecycleScope.launch {
+            val prepared = withContext(Dispatchers.IO) {
+                runCatching { prepareClipboardImagePng(uri) }
+            }
+            prepared.onSuccess { file ->
+                startServiceForAction(WebSocketService.ACTION_SEND_FILE) {
+                    putExtra(WebSocketService.EXTRA_CONTENT_TYPE, "clipboard_image")
+                    putExtra(WebSocketService.EXTRA_FILE_PATH, file.absolutePath)
+                    putExtra(WebSocketService.EXTRA_FILE_NAME, file.name)
+                    putExtra(WebSocketService.EXTRA_FILE_MIME, "image/png")
+                }
+                Toast.makeText(this@MainActivity, "图片剪贴板已发送", Toast.LENGTH_SHORT).show()
+                refreshConnectionSnapshot()
+            }.onFailure { error ->
+                Toast.makeText(
+                    this@MainActivity,
+                    "图片剪贴板准备失败：${error.message ?: "unknown"}",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        }
     }
 
     private fun sendSelectedFile() {
@@ -600,7 +683,19 @@ class MainActivity : AppCompatActivity() {
         pickFileLauncher.launch(arrayOf("*/*"))
     }
 
-    private fun handleFileForTransfer(uri: Uri) {
+    private fun sendSelectedFolder() {
+        if (!SettingsStore.isSyncClipboardFileEnabled(this)) {
+            Toast.makeText(this, R.string.file_transfer_disabled, Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (DeviceStore.getEnabledDevices(this).none { it.allowFileTransfer }) {
+            Toast.makeText(this, R.string.file_no_target, Toast.LENGTH_SHORT).show()
+            return
+        }
+        pickFolderLauncher.launch(null)
+    }
+
+    private fun handleFileForTransfer(uri: Uri, batchId: String = "", batchCount: Int = 0) {
         lifecycleScope.launch {
             val prepared = withContext(Dispatchers.IO) {
                 runCatching { copyUriToOutgoingFile(uri) }
@@ -614,6 +709,10 @@ class MainActivity : AppCompatActivity() {
                     putExtra(WebSocketService.EXTRA_FILE_PATH, file.absolutePath)
                     putExtra(WebSocketService.EXTRA_FILE_NAME, name)
                     putExtra(WebSocketService.EXTRA_FILE_MIME, mime)
+                    if (batchId.isNotBlank()) {
+                        putExtra(WebSocketService.EXTRA_BATCH_ID, batchId)
+                        putExtra(WebSocketService.EXTRA_BATCH_COUNT, batchCount)
+                    }
                 }
                 Toast.makeText(
                     this@MainActivity,
@@ -629,6 +728,117 @@ class MainActivity : AppCompatActivity() {
                 ).show()
             }
         }
+    }
+
+    private data class FolderFileItem(
+        val file: File,
+        val name: String,
+        val mime: String,
+        val relativePath: String
+    )
+
+    private data class FolderCollectResult(val files: List<FolderFileItem>, val skipped: Int)
+
+    private fun handleFolderForTransfer(treeUri: Uri) {
+        Toast.makeText(this, "正在准备文件夹…", Toast.LENGTH_SHORT).show()
+        lifecycleScope.launch {
+            val prepared = withContext(Dispatchers.IO) {
+                runCatching { collectFolderFiles(treeUri) }
+            }
+            prepared.onSuccess { result ->
+                if (result.files.isEmpty()) {
+                    Toast.makeText(this@MainActivity, "文件夹内没有可发送的文件", Toast.LENGTH_LONG).show()
+                    return@onSuccess
+                }
+                val batchId = "batch-${java.util.UUID.randomUUID()}"
+                startNodeReceiverService()
+                result.files.forEach { item ->
+                    startServiceForAction(WebSocketService.ACTION_SEND_FILE) {
+                        putExtra(WebSocketService.EXTRA_FILE_PATH, item.file.absolutePath)
+                        putExtra(WebSocketService.EXTRA_FILE_NAME, item.name)
+                        putExtra(WebSocketService.EXTRA_FILE_MIME, item.mime)
+                        putExtra(WebSocketService.EXTRA_RELATIVE_PATH, item.relativePath)
+                        putExtra(WebSocketService.EXTRA_BATCH_ID, batchId)
+                        putExtra(WebSocketService.EXTRA_BATCH_COUNT, result.files.size)
+                    }
+                }
+                val skippedText = if (result.skipped > 0) "，跳过 ${result.skipped} 个" else ""
+                Toast.makeText(
+                    this@MainActivity,
+                    "正在发送文件夹（${result.files.size} 个文件$skippedText）",
+                    Toast.LENGTH_LONG
+                ).show()
+                refreshConnectionSnapshot()
+            }.onFailure { error ->
+                Toast.makeText(
+                    this@MainActivity,
+                    getString(R.string.file_prepare_failed, error.message ?: "unknown"),
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        }
+    }
+
+    /** 经 SAF 递归收集文件夹内文件并复制到发件暂存目录（保留相对路径）。 */
+    private fun collectFolderFiles(treeUri: Uri): FolderCollectResult {
+        val maxFiles = 200
+        val maxFileBytes = 512L * 1024L * 1024L
+        val rootDocId = DocumentsContract.getTreeDocumentId(treeUri)
+        val rootName = sanitizeOutgoingFileName(
+            queryDisplayName(DocumentsContract.buildDocumentUriUsingTree(treeUri, rootDocId)).ifBlank { "folder" }
+        )
+        val files = mutableListOf<FolderFileItem>()
+        var skipped = 0
+
+        fun walk(docId: String, relDir: String) {
+            if (files.size >= maxFiles) return
+            val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, docId)
+            contentResolver.query(
+                childrenUri,
+                arrayOf(
+                    DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                    DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                    DocumentsContract.Document.COLUMN_MIME_TYPE,
+                    DocumentsContract.Document.COLUMN_SIZE
+                ),
+                null, null, null
+            )?.use { cursor ->
+                while (cursor.moveToNext()) {
+                    if (files.size >= maxFiles) {
+                        skipped += 1
+                        continue
+                    }
+                    val childId = cursor.getString(0) ?: continue
+                    val childName = sanitizeOutgoingFileName(cursor.getString(1).orEmpty())
+                    val childMime = cursor.getString(2).orEmpty()
+                    val childSize = cursor.getLong(3)
+                    if (childMime == DocumentsContract.Document.MIME_TYPE_DIR) {
+                        walk(childId, "$relDir$childName/")
+                    } else {
+                        if (childSize <= 0L || childSize > maxFileBytes) {
+                            skipped += 1
+                            continue
+                        }
+                        val childUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, childId)
+                        val copied = runCatching { copyUriToOutgoingFile(childUri) }.getOrNull()
+                        if (copied == null) {
+                            skipped += 1
+                            continue
+                        }
+                        files.add(
+                            FolderFileItem(
+                                file = copied,
+                                name = childName,
+                                mime = childMime.ifBlank { FileTransferRegistry.guessMime(childName) },
+                                relativePath = "$rootName/$relDir$childName"
+                            )
+                        )
+                    }
+                }
+            }
+        }
+        walk(rootDocId, "")
+        return FolderCollectResult(files, skipped)
     }
 
     private fun copyUriToOutgoingFile(uri: Uri): File {
@@ -649,6 +859,21 @@ class MainActivity : AppCompatActivity() {
             outputFile.delete()
             error("文件为空")
         }
+        return outputFile
+    }
+
+    private fun prepareClipboardImagePng(uri: Uri): File {
+        val bitmap = contentResolver.openInputStream(uri)?.use { input ->
+            BitmapFactory.decodeStream(input)
+        } ?: error("invalid_image")
+        val dir = File(filesDir, "outgoing_clipboard_images").apply { mkdirs() }
+        val outputFile = uniqueFile(dir, "clipboard-${System.currentTimeMillis()}.png")
+        FileOutputStream(outputFile).use { output ->
+            if (!bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, output)) {
+                error("encode_failed")
+            }
+        }
+        bitmap.recycle()
         return outputFile
     }
 
@@ -1499,26 +1724,27 @@ class MainActivity : AppCompatActivity() {
             "未声明"
         }
         val hashText = request.sha256.take(16).ifBlank { "未声明" }
-        val detail = listOf(
+        val detail = listOfNotNull(
             "来源节点：${request.sourceDeviceName}",
             "文件名称：${request.fileName}",
             "文件大小：${formatFileSize(request.size)}",
             "文件类型：${request.mime.ifBlank { "application/octet-stream" }}",
             "Hash：$hashText",
-            "有效期：$expiresText"
+            "有效期：$expiresText",
+            if (request.batchCount > 1) "本批共 ${request.batchCount} 个文件，本次选择对整批生效" else null
         ).joinToString("\n")
 
         val (dialog, content) = createBottomSheet(
             title = "文件接收请求",
             message = detail
         )
-        addSheetButton(content, "接收文件") {
+        addSheetButton(content, if (request.batchCount > 1) "全部接收" else "接收文件") {
             shownFileTransferRequests.remove(requestId)
             FileTransferCoordinator.respond(requestId, accepted = true)
             dialog.dismiss()
             Toast.makeText(this, "正在接收 ${request.fileName}", Toast.LENGTH_SHORT).show()
         }
-        addSheetButton(content, "拒绝", outlined = true) {
+        addSheetButton(content, if (request.batchCount > 1) "全部拒绝" else "拒绝", outlined = true) {
             shownFileTransferRequests.remove(requestId)
             FileTransferCoordinator.respond(requestId, accepted = false)
             dialog.dismiss()
