@@ -1,6 +1,6 @@
 {
   "name": "code-sync-desktop",
-  "version": "1.0.31",
+  "version": "1.0.32",
   "description": "跨设备验证码同步工具 - 桌面端",
   "main": "main.js",
   "scripts": {

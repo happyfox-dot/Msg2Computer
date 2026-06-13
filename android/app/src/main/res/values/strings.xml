@@ -67,6 +67,11 @@
     <string name="receive_file_transfer_desc">默认关闭；开启后远端文件会保存到应用下载目录。</string>
     <string name="send_file">选择文件发送</string>
     <string name="send_folder">发送文件夹</string>
+    <string name="file_receive_history">接收文件历史</string>
+    <string name="file_target_select">选择接收节点</string>
+    <string name="file_target_select_desc">本次文件只会发送给勾选的可信设备节点。</string>
+    <string name="file_target_none_selected">请至少选择一个接收节点</string>
+    <string name="file_history_empty">暂无接收文件历史</string>
     <string name="file_transfer_disabled">请先开启文件发送开关</string>
     <string name="file_receive_disabled">请先开启文件接收开关</string>
     <string name="file_no_target">没有允许文件传输的推送目标</string>

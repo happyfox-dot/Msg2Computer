@@ -1073,3 +1073,126 @@ body {
 .file-transfer-row.done .file-transfer-bar {
   background: #4aa3ff;
 }
+
+.file-target-panel,
+.file-history-panel {
+  margin-top: 10px;
+  padding: 10px;
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 8px;
+  background: rgba(255,255,255,0.03);
+}
+.file-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+  color: rgba(255,255,255,0.86);
+  font-size: 12px;
+  font-weight: 700;
+}
+.btn-inline {
+  border: 1px solid rgba(255,255,255,0.14);
+  border-radius: 6px;
+  background: rgba(255,255,255,0.06);
+  color: rgba(255,255,255,0.78);
+  font-size: 11px;
+  padding: 4px 8px;
+  cursor: pointer;
+}
+.btn-inline:hover {
+  background: rgba(255,255,255,0.10);
+}
+.file-target-list,
+.file-history-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+.file-target-row {
+  display: grid;
+  grid-template-columns: 18px 24px minmax(0, 1fr);
+  gap: 8px;
+  align-items: center;
+  padding: 8px;
+  border-radius: 7px;
+  background: rgba(255,255,255,0.05);
+  cursor: pointer;
+}
+.file-target-row.disabled {
+  opacity: 0.48;
+  cursor: not-allowed;
+}
+.file-target-icon {
+  font-size: 16px;
+}
+.file-target-main,
+.file-history-main {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.file-target-name,
+.file-history-name {
+  font-size: 12px;
+  color: rgba(255,255,255,0.88);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.file-target-meta,
+.file-history-meta,
+.file-history-path {
+  font-size: 10px;
+  color: rgba(255,255,255,0.52);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.file-history-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.file-history-source {
+  font-size: 11px;
+  color: rgba(181,190,255,0.9);
+  font-weight: 700;
+}
+.file-history-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  padding: 8px;
+  border-radius: 7px;
+  background: rgba(255,255,255,0.05);
+}
+.file-history-row.missing {
+  opacity: 0.55;
+}
+.file-history-actions {
+  display: flex;
+  gap: 5px;
+}
+.file-history-actions button {
+  border: 0;
+  border-radius: 6px;
+  background: rgba(108,123,255,0.18);
+  color: #cbd2ff;
+  font-size: 11px;
+  padding: 5px 7px;
+  cursor: pointer;
+}
+.file-history-actions button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.empty-state.compact {
+  padding: 8px;
+  font-size: 11px;
+}

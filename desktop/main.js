@@ -58,6 +58,7 @@ let topologyBroadcastSuppressionDepth = 0
 let phoneSessionKeys = new WeakMap()
 let totpSeeds = new Map()
 let totpDeleteTombstones = []
+let fileTransferHistory = []
 let desktopMessageSettings = {
   receiveSmsCodes: true,
   receiveAllSms: true,
@@ -104,6 +105,8 @@ const DEFAULT_MESSAGE_SETTINGS = {
   maxFileSizeMb: 50
 }
 const PAIRING_CONFIG_FILE = 'pairing.json'
+const FILE_TRANSFER_HISTORY_FILE = 'file-transfer-history.json'
+const FILE_TRANSFER_HISTORY_LIMIT = 300
 const gotSingleInstanceLock = app.requestSingleInstanceLock()
 const ICON_PATH = path.join(__dirname, 'assets', 'icon.ico')
 const START_HIDDEN = process.argv.includes('--hidden')
@@ -780,7 +783,7 @@ function contentPolicyForJoinTemplate(template = 'basic') {
     // 数据量，保持默认关，由用户按需显式开启。
     allowClipboard: true,
     allowClipboardText: true,
-    allowClipboardImage: false,
+    allowClipboardImage: true,
     allowClipboardFile: false,
     allowFileTransfer: false,
     allowExternalEvents: true,
@@ -1088,6 +1091,83 @@ function getPairingConfigPath() {
   return path.join(app.getPath('userData'), PAIRING_CONFIG_FILE)
 }
 
+function getFileTransferHistoryPath() {
+  return path.join(app.getPath('userData'), FILE_TRANSFER_HISTORY_FILE)
+}
+
+function loadFileTransferHistory() {
+  try {
+    const filePath = getFileTransferHistoryPath()
+    if (!fs.existsSync(filePath)) {
+      fileTransferHistory = []
+      return
+    }
+    const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'))
+    fileTransferHistory = Array.isArray(parsed)
+      ? parsed.map(normalizeFileTransferHistoryEntry).filter(Boolean).slice(0, FILE_TRANSFER_HISTORY_LIMIT)
+      : []
+  } catch (error) {
+    console.warn('Failed to load file transfer history:', error.message)
+    fileTransferHistory = []
+  }
+}
+
+function saveFileTransferHistory() {
+  try {
+    const filePath = getFileTransferHistoryPath()
+    fs.mkdirSync(path.dirname(filePath), { recursive: true })
+    fs.writeFileSync(filePath, JSON.stringify(fileTransferHistory.slice(0, FILE_TRANSFER_HISTORY_LIMIT), null, 2))
+  } catch (error) {
+    console.warn('Failed to save file transfer history:', error.message)
+  }
+}
+
+function normalizeFileTransferHistoryEntry(raw = {}) {
+  const filePath = String(raw.path || raw.filePath || '').trim()
+  const name = String(raw.name || path.basename(filePath) || '').trim()
+  if (!filePath || !name) return null
+  const receivedAt = Number(raw.receivedAt || raw.timestamp || Date.now()) || Date.now()
+  return {
+    id: String(raw.id || raw.fileId || `${receivedAt}-${crypto.createHash('sha1').update(filePath).digest('hex').slice(0, 12)}`),
+    fileId: String(raw.fileId || ''),
+    name,
+    path: filePath,
+    directory: String(raw.directory || path.dirname(filePath)),
+    size: Number(raw.size || 0) || 0,
+    mime: String(raw.mime || ''),
+    sourceId: String(raw.sourceId || raw.sourceDeviceId || ''),
+    sourceName: String(raw.sourceName || raw.sourceDeviceName || '未知设备'),
+    sourceType: String(raw.sourceType || raw.sourceDeviceType || ''),
+    receivedAt,
+    exists: fs.existsSync(filePath)
+  }
+}
+
+function recordFileTransferHistory(entry = {}) {
+  const normalized = normalizeFileTransferHistoryEntry({
+    ...entry,
+    receivedAt: entry.receivedAt || Date.now()
+  })
+  if (!normalized) return null
+  fileTransferHistory = [
+    normalized,
+    ...fileTransferHistory.filter(item =>
+      item.fileId !== normalized.fileId &&
+      item.path !== normalized.path &&
+      item.id !== normalized.id
+    )
+  ].slice(0, FILE_TRANSFER_HISTORY_LIMIT)
+  saveFileTransferHistory()
+  return normalized
+}
+
+function getFileTransferHistory() {
+  return fileTransferHistory
+    .map(entry => normalizeFileTransferHistoryEntry(entry))
+    .filter(Boolean)
+    .slice(0, FILE_TRANSFER_HISTORY_LIMIT)
+}
+
 function createLocalEventToken() {
   return crypto.randomBytes(32)
     .toString('base64')
@@ -1183,9 +1263,15 @@ function loadOrCreatePairingKey() {
       const savedPolicyVersion = Number(saved.policyVersion) || 1
       const upgradeContentPolicy = entry => {
         const source = (entry && (entry.contentPolicy || entry)) || {}
-        if (savedPolicyVersion >= 2) return source
         const cleaned = { ...source }
-        delete cleaned.allowClipboard
+        if (savedPolicyVersion < 2) {
+          delete cleaned.allowClipboard
+        }
+        if (savedPolicyVersion < 3) {
+          const clipboardAllowed = cleaned.allowClipboard !== false && cleaned.allowClipboardText !== false
+          if (clipboardAllowed && cleaned.allowClipboardImage === false) delete cleaned.allowClipboardImage
+          if (clipboardAllowed && cleaned.allowImages === false) delete cleaned.allowImages
+        }
         return cleaned
       }
       authorizedPhones = new Map((saved.authorizedPhones || []).map(phone => [
@@ -1318,7 +1404,7 @@ function flushPairingConfigToDisk() {
       tmpPath,
       JSON.stringify({
         // 内容策略格式版本：v2 起 allowClipboard 默认 true（见 loadOrCreatePairingKey 迁移）
-        policyVersion: 2,
+        policyVersion: 3,
         networkId: ensureTrustedNetworkId(),
         allowLanJoinRequests,
         localEventToken: protectSecret(ensureLocalEventToken()),
@@ -4272,6 +4358,16 @@ function getDefaultClipboardImageTargetIds() {
 
 // 大图剪贴板发送侧：PNG 先暂存本地（offer 有效期内充当分片源），再按
 // clipboard_image 类型 offer。payloadExtra 带 clipVersion 供接收端 LWW 排序。
+function buildLocalSourceAddressPayload() {
+  const sourceHost = getLocalIP()
+  const sourceTsHost = getTailscaleIPv4()
+  return {
+    sourceHost,
+    sourceTsHost,
+    sourceAltHosts: [sourceTsHost].filter(host => host && host !== sourceHost)
+  }
+}
+
 async function offerClipboardImageAsFile(pngBuffer, clipTs, shortHash) {
   const targets = getDefaultClipboardImageTargetIds()
   if (targets.length === 0) {
@@ -4301,6 +4397,7 @@ async function offerClipboardImageAsFile(pngBuffer, clipTs, shortHash) {
     source: '剪贴板图片',
     rawPrefix: '剪贴板图片',
     payloadExtra: {
+      ...buildLocalSourceAddressPayload(),
       clipVersion: { ts: clipTs, origin: identity.id, hash: shortHash, kind: 'image' }
     }
   })
@@ -4383,7 +4480,8 @@ async function pollClipboardFilesForSync() {
     transfer.offerFile(filePath, targets, {
       type: CODE_TYPES.CLIPBOARD_FILE,
       source: '剪贴板文件',
-      rawPrefix: '剪贴板文件'
+      rawPrefix: '剪贴板文件',
+      payloadExtra: buildLocalSourceAddressPayload()
     }).catch(error => {
       console.error(`Clipboard file sync failed for ${filePath}:`, error.message)
     })
@@ -5991,25 +6089,65 @@ function lookupPeerPairingKey(deviceId) {
 
 // 拉取时按 originDeviceId 解析源设备的可达地址 + 共享密钥。
 // host 可为空：直连不可达时由 resolveFileRelayCandidates 提供代理通道（多跳）。
-function resolveFileSource(originDeviceId) {
+function collectNetworkHosts(...values) {
+  const hosts = []
+  const add = value => {
+    if (Array.isArray(value)) {
+      value.forEach(add)
+      return
+    }
+    const host = normalizeNetworkHost(value || '')
+    if (host && !hosts.includes(host)) hosts.push(host)
+  }
+  values.forEach(add)
+  return hosts
+}
+
+function resolveFileSource(originDeviceId, manifest = {}) {
   const id = String(originDeviceId || '')
   if (!id) return null
+  const manifestHosts = collectNetworkHosts(
+    manifest.host,
+    manifest.sourceHost,
+    manifest.tsHost,
+    manifest.sourceTsHost,
+    manifest.altHosts,
+    manifest.sourceAltHosts
+  )
   const phone = authorizedPhones.get(id)
   if (phone && phone.pairingKey) {
+    const hosts = collectNetworkHosts(
+      phone.lastIP,
+      phone.host,
+      phone.relayHost,
+      phone.tsHost,
+      phone.altHosts,
+      manifestHosts
+    )
     return {
       id,
       name: phone.name || 'Android Phone',
-      host: normalizeNetworkHost(phone.lastIP || phone.host || ''),
+      host: hosts[0] || '',
+      hosts,
       port: Number(phone.relayPort || phone.port) || JOIN_PORT,
       pairingKey: phone.pairingKey
     }
   }
   const peer = pairedDesktopPeers.get(id)
   if (peer && peer.pairingKey) {
+    const hosts = collectNetworkHosts(
+      peer.lastIP,
+      peer.host,
+      peer.relayHost,
+      peer.tsHost,
+      peer.altHosts,
+      manifestHosts
+    )
     return {
       id,
       name: peer.name || 'Desktop PC',
-      host: normalizeNetworkHost(peer.host || peer.tsHost || ''),
+      host: hosts[0] || '',
+      hosts,
       port: Number(peer.relayPort || JOIN_PORT) || JOIN_PORT,
       pairingKey: peer.pairingKey
     }
@@ -6023,12 +6161,16 @@ function resolveFileRelayCandidates(originId) {
   const exclude = String(originId || '')
   const identity = getDesktopIdentity()
   const candidates = []
-  const seen = new Set([exclude, identity.id])
+  const excludedIds = new Set([exclude, identity.id])
+  const seen = new Set()
   const add = (id, host, port, name) => {
     const normalizedHost = normalizeNetworkHost(host || '')
-    if (!id || !normalizedHost || seen.has(id)) return
-    seen.add(id)
-    candidates.push({ id, host: normalizedHost, port: Number(port) || JOIN_PORT, name: name || id })
+    if (!id || !normalizedHost || excludedIds.has(id)) return
+    const normalizedPort = Number(port) || JOIN_PORT
+    const key = `${id}|${normalizedHost}|${normalizedPort}`
+    if (seen.has(key)) return
+    seen.add(key)
+    candidates.push({ id, host: normalizedHost, port: normalizedPort, name: name || id })
   }
   try {
     const snapshot = getTopologySnapshot()
@@ -6039,19 +6181,25 @@ function resolveFileRelayCandidates(originId) {
       if (!hopId || hopId === exclude) continue
       const hop = authorizedPhones.get(hopId) || pairedDesktopPeers.get(hopId)
       if (hop && hop.enabled !== false && hop.revoked !== true) {
-        add(hopId, hop.lastIP || hop.host || hop.tsHost, hop.relayPort || JOIN_PORT, hop.name)
+        for (const host of collectNetworkHosts(hop.lastIP, hop.host, hop.relayHost, hop.tsHost, hop.altHosts)) {
+          add(hopId, host, hop.relayPort || JOIN_PORT, hop.name)
+        }
       }
     }
   } catch (_) {}
   for (const phone of getAuthorizedPhones()) {
     if (phone.enabled === false || phone.revoked === true) continue
-    add(phone.id, phone.lastIP || phone.host, phone.relayPort || JOIN_PORT, phone.name)
+    for (const host of collectNetworkHosts(phone.lastIP, phone.host, phone.relayHost, phone.tsHost, phone.altHosts)) {
+      add(phone.id, host, phone.relayPort || JOIN_PORT, phone.name)
+    }
   }
   for (const peer of getPairedDesktopPeers()) {
     if (peer.enabled === false) continue
-    add(peer.id, peer.host || peer.tsHost, peer.relayPort || JOIN_PORT, peer.name)
+    for (const host of collectNetworkHosts(peer.lastIP, peer.host, peer.relayHost, peer.tsHost, peer.altHosts)) {
+      add(peer.id, host, peer.relayPort || JOIN_PORT, peer.name)
+    }
   }
-  return candidates.slice(0, 6)
+  return candidates.slice(0, 12)
 }
 
 let fileTransfer = null
@@ -6079,10 +6227,31 @@ function initFileTransfer() {
     httpGet: httpGetBinary,
     downloadDir,
     tmpDir,
-    onComplete: ({ fileId, name, path: finalPath, sourceName }) => {
+    onComplete: ({ fileId, name, path: finalPath, size, mime, sourceId, sourceName, sourceType }) => {
+      const historyEntry = recordFileTransferHistory({
+        fileId,
+        name,
+        path: finalPath,
+        size,
+        mime,
+        sourceId,
+        sourceName,
+        sourceType
+      })
       showNotification('📁 文件接收完成', `${name}\n来源设备: ${sourceName || '未知'}`)
       if (mainWindow) {
-        mainWindow.webContents.send('file-transfer-complete', { fileId, name, path: finalPath, sourceName })
+        mainWindow.webContents.send('file-transfer-complete', {
+          fileId,
+          name,
+          path: finalPath,
+          size,
+          mime,
+          sourceId,
+          sourceName,
+          sourceType,
+          historyEntry
+        })
+        mainWindow.webContents.send('file-transfer-history-changed', getFileTransferHistory())
       }
     },
     onProgress: ({ fileId, name, received, size }) => {
@@ -6593,7 +6762,7 @@ function hasActiveWsForNode(nodeId) {
 }
 
 function hasDirectNodeAddress(node = {}) {
-  return !!normalizeNetworkHost(node.lastIP || node.host || node.relayHost || node.tsHost || '')
+  return collectNetworkHosts(node.lastIP, node.host, node.relayHost, node.tsHost, node.altHosts).length > 0
 }
 
 function hasKnownDeliveryPath(node = {}) {
@@ -6716,6 +6885,18 @@ function normalizeExternalUrl(url) {
   }
 }
 
+async function openLocalPath(targetPath, reveal = false) {
+  const normalized = String(targetPath || '').trim()
+  if (!normalized) return { success: false, error: '路径为空' }
+  if (!fs.existsSync(normalized)) return { success: false, error: '文件不存在' }
+  if (reveal) {
+    shell.showItemInFolder(normalized)
+    return { success: true }
+  }
+  const error = await shell.openPath(normalized)
+  return error ? { success: false, error } : { success: true }
+}
+
 function isSupportedImagePath(filePath) {
   const normalized = String(filePath || '')
   const ext = path.extname(normalized).toLowerCase()
@@ -6734,6 +6915,44 @@ function getDefaultFileTransferTargetIds() {
     if (canPushContentToNode(peer, CODE_TYPES.FILE_TRANSFER)) ids.push(peer.id)
   }
   return Array.from(new Set(ids))
+}
+
+function normalizeRequestedFileTargetIds(targetIds = []) {
+  const requested = Array.isArray(targetIds)
+    ? targetIds.map(id => String(id || '').trim()).filter(Boolean)
+    : []
+  if (requested.length === 0) return []
+  const allowed = new Set(getFileTransferTargets()
+    .filter(target => target.allowed && target.reachable)
+    .map(target => target.id))
+  return Array.from(new Set(requested.filter(id => allowed.has(id))))
+}
+
+function getFileTransferTargets() {
+  const targets = []
+  const append = (node, kind) => {
+    const id = String(node?.id || '').trim()
+    if (!id || node.enabled === false || node.revoked === true) return
+    const reachable = hasKnownDeliveryPath(node)
+    const allowed = canPushContentToNode(node, CODE_TYPES.FILE_TRANSFER)
+    const policy = node.contentPolicy || node
+    targets.push({
+      id,
+      name: node.name || (kind === 'phone' ? 'Android Phone' : 'Desktop Node'),
+      type: node.deviceType || node.type || (kind === 'phone' ? 'ANDROID_PHONE' : 'WINDOWS_DESKTOP'),
+      kind,
+      host: node.lastIP || node.host || node.tsHost || '',
+      lastSeen: node.lastSeen || 0,
+      reachable,
+      allowed,
+      selected: reachable && allowed,
+      reason: !allowed ? '未允许文件传输' : (!reachable ? '当前不可达' : ''),
+      maxFileSizeMb: Number(policy.maxFileSizeMb || node.maxFileSizeMb || desktopMessageSettings.maxFileSizeMb || 50)
+    })
+  }
+  getAuthorizedPhones().forEach(phone => append(phone, 'phone'))
+  getPairedDesktopPeers().forEach(peer => append(peer, 'desktop'))
+  return targets
 }
 
 function getDefaultClipboardFileTargetIds() {
@@ -6769,9 +6988,7 @@ async function selectAndSendFile(targetIds = []) {
     if (result.canceled || result.filePaths.length === 0) {
       return { success: false, canceled: true }
     }
-    const requestedTargets = Array.isArray(targetIds)
-      ? targetIds.map(id => String(id || '').trim()).filter(Boolean)
-      : []
+    const requestedTargets = normalizeRequestedFileTargetIds(targetIds)
     const targets = requestedTargets.length > 0 ? Array.from(new Set(requestedTargets)) : getDefaultFileTransferTargetIds()
     if (targets.length === 0) {
       return { success: false, error: '没有启用文件传输的推送目标' }
@@ -6818,10 +7035,15 @@ async function offerFileBatch(items, targets) {
   const batchTotalBytes = items.reduce((sum, item) => sum + (item.size || 0), 0)
   const sent = []
   for (const item of items) {
-    const options = {}
+    const options = { payloadExtra: buildLocalSourceAddressPayload() }
     if (item.rel) options.relativePath = item.rel
     if (batchId) {
-      options.payloadExtra = { batchId, batchCount: items.length, batchTotalBytes }
+      options.payloadExtra = {
+        ...options.payloadExtra,
+        batchId,
+        batchCount: items.length,
+        batchTotalBytes
+      }
     }
     const offer = await transfer.offerFile(item.abs, targets, options)
     if (offer) sent.push({ filePath: item.abs, ...offer })
@@ -6887,9 +7109,7 @@ async function selectAndSendFolder(targetIds = []) {
     if (result.canceled || result.filePaths.length === 0) {
       return { success: false, canceled: true }
     }
-    const requestedTargets = Array.isArray(targetIds)
-      ? targetIds.map(id => String(id || '').trim()).filter(Boolean)
-      : []
+    const requestedTargets = normalizeRequestedFileTargetIds(targetIds)
     const targets = requestedTargets.length > 0 ? Array.from(new Set(requestedTargets)) : getDefaultFileTransferTargetIds()
     if (targets.length === 0) {
       return { success: false, error: '没有启用文件传输的推送目标' }
@@ -6979,6 +7199,10 @@ registerDesktopIpc(ipcMain, {
   },
   fileSelectAndSend: targetIds => selectAndSendFile(targetIds),
   fileSelectAndSendFolder: targetIds => selectAndSendFolder(targetIds),
+  fileTransferTargets: () => getFileTransferTargets(),
+  fileTransferHistory: () => getFileTransferHistory(),
+  fileTransferOpenPath: filePath => openLocalPath(filePath, false),
+  fileTransferRevealPath: filePath => openLocalPath(filePath, true),
   getLanJoinSettings: () => ({
     allowLanJoinRequests: allowLanJoinRequests !== false,
     networkId: ensureTrustedNetworkId()
@@ -7133,6 +7357,7 @@ if (!gotSingleInstanceLock) {
     storage.initialize()
 
     loadOrCreatePairingKey()
+    loadFileTransferHistory()
     importStorageTotpsIntoPrimaryStore()
     createWindow({ hidden: startHidden })
     createTray()

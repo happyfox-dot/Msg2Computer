@@ -30,6 +30,7 @@ import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
@@ -41,6 +42,7 @@ import com.codesync.util.DeviceStore
 import com.codesync.util.ApkUpdater
 import com.codesync.util.ClipboardSyncState
 import com.codesync.util.FileTransferCoordinator
+import com.codesync.util.FileTransferHistoryStore
 import com.codesync.util.FileTransferRegistry
 import com.codesync.util.GoogleAuthMigrationParser
 import com.codesync.util.LanDiscoveredDevice
@@ -84,6 +86,7 @@ class MainActivity : AppCompatActivity() {
     private var updatingMessagePolicySwitches = false
     private var discoveredLanNodes: List<LanDiscoveredDevice> = emptyList()
     private val shownFileTransferRequests = mutableSetOf<String>()
+    private var pendingFileTransferTargetIds: List<String> = emptyList()
 
     // 应用内更新：DownloadManager 的下载 id 与待安装的版本号；下载完成由系统广播触发安装
     private var pendingUpdateDownloadId: Long = -1L
@@ -111,11 +114,17 @@ class MainActivity : AppCompatActivity() {
             // 同批文件带相同 batchId：接收端只确认一次
             val batchId = if (uris.size > 1) "batch-${java.util.UUID.randomUUID()}" else ""
             uris.forEach { handleFileForTransfer(it, batchId, uris.size) }
+        } else {
+            pendingFileTransferTargetIds = emptyList()
         }
     }
 
     private val pickFolderLauncher = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri: Uri? ->
-        uri?.let { handleFolderForTransfer(it) }
+        if (uri != null) {
+            handleFolderForTransfer(uri)
+        } else {
+            pendingFileTransferTargetIds = emptyList()
+        }
     }
 
     private val connectionReceiver = object : BroadcastReceiver() {
@@ -607,6 +616,9 @@ class MainActivity : AppCompatActivity() {
         binding.btnSendFolder.setOnClickListener {
             sendSelectedFolder()
         }
+        binding.btnFileHistory.setOnClickListener {
+            showFileReceiveHistory()
+        }
     }
 
     /** 读取当前剪贴板内容并投递到启用的设备节点（仅前台可读，符合系统限制）。 */
@@ -680,7 +692,10 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, R.string.file_no_target, Toast.LENGTH_SHORT).show()
             return
         }
-        pickFileLauncher.launch(arrayOf("*/*"))
+        showFileTargetSelectionSheet { targetIds ->
+            pendingFileTransferTargetIds = targetIds
+            pickFileLauncher.launch(arrayOf("*/*"))
+        }
     }
 
     private fun sendSelectedFolder() {
@@ -692,7 +707,129 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, R.string.file_no_target, Toast.LENGTH_SHORT).show()
             return
         }
-        pickFolderLauncher.launch(null)
+        showFileTargetSelectionSheet { targetIds ->
+            pendingFileTransferTargetIds = targetIds
+            pickFolderLauncher.launch(null)
+        }
+    }
+
+    private fun showFileTargetSelectionSheet(onSelected: (List<String>) -> Unit) {
+        val devices = DeviceStore.getEnabledDevices(this)
+            .filter { it.allowFileTransfer }
+            .sortedBy { it.name.lowercase(Locale.ROOT) }
+        if (devices.isEmpty()) {
+            Toast.makeText(this, R.string.file_no_target, Toast.LENGTH_SHORT).show()
+            return
+        }
+        val selected = BooleanArray(devices.size) { true }
+        val items = devices.map { device ->
+            val type = if (device.type.contains("PHONE", ignoreCase = true)) "手机" else "电脑"
+            val host = (listOf(device.host) + device.altHosts).firstOrNull { it.isNotBlank() }.orEmpty()
+            listOf(device.name, type, host).filter { it.isNotBlank() }.joinToString(" · ")
+        }
+        showMultiChoiceSheet(
+            title = getString(R.string.file_target_select),
+            message = getString(R.string.file_target_select_desc),
+            items = items,
+            selected = selected,
+            positiveText = "继续选择文件",
+            onPositive = {
+                val targetIds = devices.filterIndexed { index, _ -> selected[index] }.map { it.id }
+                if (targetIds.isEmpty()) {
+                    pendingFileTransferTargetIds = emptyList()
+                    Toast.makeText(this, R.string.file_target_none_selected, Toast.LENGTH_SHORT).show()
+                    return@showMultiChoiceSheet
+                }
+                onSelected(targetIds)
+            }
+        )
+    }
+
+    private fun showFileReceiveHistory() {
+        val history = FileTransferHistoryStore.get(this)
+        val (dialog, content) = createBottomSheet(getString(R.string.file_receive_history))
+        if (history.isEmpty()) {
+            content.addView(TextView(this).apply {
+                text = getString(R.string.file_history_empty)
+                setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_secondary))
+                textSize = 13f
+                setPadding(0, 12.dp(), 0, 4.dp())
+            })
+        } else {
+            history.take(60).forEach { item ->
+                val row = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    setBackgroundResource(R.drawable.bg_row)
+                    setPadding(12.dp(), 10.dp(), 12.dp(), 10.dp())
+                    alpha = if (item.exists) 1f else 0.55f
+                    isClickable = item.exists
+                    setOnClickListener {
+                        if (item.exists) openReceivedFile(item.path, item.mime)
+                    }
+                }
+                row.addView(TextView(this).apply {
+                    text = item.name
+                    setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_primary))
+                    textSize = 14f
+                    setTypeface(typeface, android.graphics.Typeface.BOLD)
+                })
+                row.addView(TextView(this).apply {
+                    val time = if (item.receivedAt > 0) {
+                        SimpleDateFormat("MM-dd HH:mm", Locale.getDefault()).format(Date(item.receivedAt))
+                    } else {
+                        ""
+                    }
+                    text = listOf(
+                        item.sourceDeviceName,
+                        formatFileSize(item.size),
+                        time,
+                        if (item.exists) "" else "文件已移动或删除"
+                    ).filter { it.isNotBlank() }.joinToString(" · ")
+                    setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_secondary))
+                    textSize = 12f
+                    setPadding(0, 4.dp(), 0, 0)
+                })
+                row.addView(TextView(this).apply {
+                    text = item.path
+                    setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_secondary))
+                    textSize = 11f
+                    setPadding(0, 4.dp(), 0, 0)
+                })
+                if (item.exists) {
+                    addSheetButton(row, "打开文件", outlined = true) {
+                        openReceivedFile(item.path, item.mime)
+                    }
+                }
+                content.addView(row, LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply {
+                    topMargin = 8.dp()
+                })
+            }
+        }
+        addSheetButton(content, getString(android.R.string.ok), outlined = true) {
+            dialog.dismiss()
+        }
+        dialog.show()
+    }
+
+    private fun openReceivedFile(path: String, mime: String) {
+        val file = File(path)
+        if (!file.exists()) {
+            Toast.makeText(this, "文件不存在", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val uri = FileProvider.getUriForFile(this, "${packageName}.fileprovider", file)
+        val intent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, mime.ifBlank { FileTransferRegistry.guessMime(file.name) })
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        runCatching {
+            startActivity(Intent.createChooser(intent, "打开文件"))
+        }.onFailure {
+            Toast.makeText(this, "没有可打开该文件的应用", Toast.LENGTH_SHORT).show()
+        }
     }
 
     private fun handleFileForTransfer(uri: Uri, batchId: String = "", batchCount: Int = 0) {
@@ -709,6 +846,10 @@ class MainActivity : AppCompatActivity() {
                     putExtra(WebSocketService.EXTRA_FILE_PATH, file.absolutePath)
                     putExtra(WebSocketService.EXTRA_FILE_NAME, name)
                     putExtra(WebSocketService.EXTRA_FILE_MIME, mime)
+                    putStringArrayListExtra(
+                        WebSocketService.EXTRA_TARGET_DEVICE_IDS,
+                        ArrayList(pendingFileTransferTargetIds)
+                    )
                     if (batchId.isNotBlank()) {
                         putExtra(WebSocketService.EXTRA_BATCH_ID, batchId)
                         putExtra(WebSocketService.EXTRA_BATCH_COUNT, batchCount)
@@ -758,6 +899,10 @@ class MainActivity : AppCompatActivity() {
                         putExtra(WebSocketService.EXTRA_FILE_NAME, item.name)
                         putExtra(WebSocketService.EXTRA_FILE_MIME, item.mime)
                         putExtra(WebSocketService.EXTRA_RELATIVE_PATH, item.relativePath)
+                        putStringArrayListExtra(
+                            WebSocketService.EXTRA_TARGET_DEVICE_IDS,
+                            ArrayList(pendingFileTransferTargetIds)
+                        )
                         putExtra(WebSocketService.EXTRA_BATCH_ID, batchId)
                         putExtra(WebSocketService.EXTRA_BATCH_COUNT, result.files.size)
                     }

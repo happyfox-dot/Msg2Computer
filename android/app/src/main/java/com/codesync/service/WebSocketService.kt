@@ -98,6 +98,7 @@ class WebSocketService : Service() {
         const val EXTRA_RELATIVE_PATH = "file_relative_path"
         const val EXTRA_BATCH_ID = "file_batch_id"
         const val EXTRA_BATCH_COUNT = "file_batch_count"
+        const val EXTRA_TARGET_DEVICE_IDS = "target_device_ids"
 
         const val NOTIFICATION_ID = 1001
         const val CHANNEL_ID = "code_sync_service"
@@ -342,8 +343,14 @@ class WebSocketService : Service() {
             stopIfNothingPending("文件超过发送上限")
             return
         }
+        val requestedTargetIds = intent.getStringArrayListExtra(EXTRA_TARGET_DEVICE_IDS)
+            ?.map { it.trim() }
+            ?.filter { it.isNotBlank() }
+            ?.toSet()
+            .orEmpty()
         val targetDevices = DeviceStore.getEnabledDevices(this)
             .filter { it.allowFileTransfer }
+            .filter { requestedTargetIds.isEmpty() || it.id in requestedTargetIds }
         if (targetDevices.isEmpty()) {
             stopIfNothingPending("没有允许接收文件的推送目标")
             return
@@ -357,7 +364,10 @@ class WebSocketService : Service() {
         val relativePath = intent.getStringExtra(EXTRA_RELATIVE_PATH).orEmpty()
         val batchId = intent.getStringExtra(EXTRA_BATCH_ID).orEmpty()
         val batchCount = intent.getIntExtra(EXTRA_BATCH_COUNT, 0)
-        val host = LanDiscovery.localLanHost().ifBlank { LanDiscovery.localTailscaleHost() }
+        val lanHost = LanDiscovery.localLanHost()
+        val tsHost = LanDiscovery.localTailscaleHost()
+        val host = lanHost.ifBlank { tsHost }
+        val altHosts = listOf(tsHost).filter { it.isNotBlank() && it != host }.distinct()
         val manifest = FileTransferRegistry.registerOutgoingFile(
             file = file,
             name = fileName,
@@ -365,6 +375,8 @@ class WebSocketService : Service() {
             identity = identity,
             targetDeviceIds = targetDevices.map { it.id },
             host = host,
+            tsHost = tsHost,
+            altHosts = altHosts,
             relayPort = LanDiscovery.NODE_RELAY_PORT,
             relativePath = relativePath
         )
@@ -392,6 +404,9 @@ class WebSocketService : Service() {
             .put("targetDeviceIds", JSONArray(targetDevices.map { it.id }))
             .put("pushAuthority", "source_device")
             .put("pushAuthorityDeviceId", identity.id)
+            .put("sourceHost", host)
+            .put("sourceTsHost", tsHost)
+            .put("sourceAltHosts", JSONArray(altHosts))
             .put("fileManifest", manifest)
             .apply {
                 // 同批文件带相同 batchId：接收端只确认一次，结论对整批生效
@@ -511,7 +526,10 @@ class WebSocketService : Service() {
         val identity = PhoneIdentityStore.get(this)
         val clipTs = System.currentTimeMillis()
         val fileName = intent.getStringExtra(EXTRA_FILE_NAME).orEmpty().ifBlank { file.name }
-        val host = LanDiscovery.localLanHost().ifBlank { LanDiscovery.localTailscaleHost() }
+        val lanHost = LanDiscovery.localLanHost()
+        val tsHost = LanDiscovery.localTailscaleHost()
+        val host = lanHost.ifBlank { tsHost }
+        val altHosts = listOf(tsHost).filter { it.isNotBlank() && it != host }.distinct()
         val manifest = FileTransferRegistry.registerOutgoingFile(
             file = file,
             name = fileName,
@@ -519,6 +537,8 @@ class WebSocketService : Service() {
             identity = identity,
             targetDeviceIds = targetDevices.map { it.id },
             host = host,
+            tsHost = tsHost,
+            altHosts = altHosts,
             relayPort = LanDiscovery.NODE_RELAY_PORT
         )
         val fileId = manifest.optString("fileId")
@@ -546,6 +566,9 @@ class WebSocketService : Service() {
             .put("targetDeviceIds", JSONArray(targetDevices.map { it.id }))
             .put("pushAuthority", "source_device")
             .put("pushAuthorityDeviceId", identity.id)
+            .put("sourceHost", host)
+            .put("sourceTsHost", tsHost)
+            .put("sourceAltHosts", JSONArray(altHosts))
             .put(
                 "clipVersion",
                 JSONObject()

@@ -45,6 +45,8 @@ object FileTransferRegistry {
         targetDeviceIds: List<String>,
         host: String,
         relayPort: Int,
+        tsHost: String = "",
+        altHosts: List<String> = emptyList(),
         relativePath: String = ""
     ): JSONObject {
         pruneExpired()
@@ -74,6 +76,8 @@ object FileTransferRegistry {
             .put("originDeviceId", identity.id)
             .put("originDeviceName", identity.name)
             .put("host", host)
+            .put("tsHost", tsHost)
+            .put("altHosts", JSONArray(altHosts.map { it.trim() }.filter { it.isNotBlank() && it != host }.distinct()))
             .put("relayPort", relayPort)
             .put("targetDeviceIds", JSONArray(targets.toList()))
             .put("expiresAt", record.expiresAt)

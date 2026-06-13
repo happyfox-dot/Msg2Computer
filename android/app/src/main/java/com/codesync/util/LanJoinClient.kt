@@ -198,7 +198,7 @@ object LanJoinClient {
             ),
             allowClipboardImage = policy.optBoolean(
                 "allowClipboardImage",
-                policy.optBoolean("allowImages", false)
+                policy.optBoolean("allowImages", policy.optBoolean("allowClipboard", true))
             ),
             allowClipboardFile = policy.optBoolean(
                 "allowClipboardFile",

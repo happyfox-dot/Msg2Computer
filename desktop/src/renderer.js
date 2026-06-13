@@ -11,6 +11,8 @@ let topologySnapshot = null
 let selectedTopologyNodeId = ''
 let lastPairingInfo = null
 let lanDevices = []
+let fileTransferTargets = []
+let fileTransferHistory = []
 let messageSettings = {
   receiveSmsCodes: true,
   receiveAllSms: true,
@@ -388,12 +390,119 @@ async function setupMessageSettings() {
 function setupFileTransferControls() {
   const button = document.getElementById('btn-send-file')
   const folderButton = document.getElementById('btn-send-folder')
+  const refreshTargetsButton = document.getElementById('btn-refresh-file-targets')
+  const refreshHistoryButton = document.getElementById('btn-refresh-file-history')
   const status = document.getElementById('file-transfer-status')
   const transferList = document.getElementById('file-transfer-list')
+  const targetList = document.getElementById('file-target-list')
+  const historyList = document.getElementById('file-history-list')
   if (!button || !window.electronAPI.selectAndSendFile) return
 
   const setStatus = (text) => {
     if (status) status.textContent = text || ''
+  }
+
+  const formatBytes = (bytes) => {
+    const value = Number(bytes || 0)
+    if (!Number.isFinite(value) || value <= 0) return ''
+    if (value < 1024) return `${value} B`
+    if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`
+    if (value < 1024 * 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)} MB`
+    return `${(value / 1024 / 1024 / 1024).toFixed(1)} GB`
+  }
+
+  const getSelectedTargetIds = () => {
+    if (!targetList) return []
+    return Array.from(targetList.querySelectorAll('input[data-file-target-id]:checked'))
+      .map(input => input.dataset.fileTargetId)
+      .filter(Boolean)
+  }
+
+  const renderFileTargets = () => {
+    if (!targetList) return
+    if (!fileTransferTargets.length) {
+      targetList.innerHTML = '<div class="empty-state compact">暂无可发送文件的设备节点</div>'
+      return
+    }
+    targetList.innerHTML = fileTransferTargets.map(target => {
+      const disabled = !target.allowed || !target.reachable
+      const checked = target.selected && !disabled
+      const meta = [
+        getDeviceTypeName(target.type),
+        target.host || '',
+        target.lastSeen ? `上次同步 ${formatTime(target.lastSeen)}` : '',
+        target.reason || ''
+      ].filter(Boolean).join(' · ')
+      return `
+        <label class="file-target-row ${disabled ? 'disabled' : ''}">
+          <input type="checkbox" data-file-target-id="${escapeHtml(target.id)}" ${checked ? 'checked' : ''} ${disabled ? 'disabled' : ''}>
+          <span class="file-target-icon">${getDeviceIcon(target.type)}</span>
+          <span class="file-target-main">
+            <span class="file-target-name">${escapeHtml(target.name || target.id)}</span>
+            <span class="file-target-meta">${escapeHtml(meta)}</span>
+          </span>
+        </label>
+      `
+    }).join('')
+  }
+
+  const loadFileTargets = async () => {
+    try {
+      fileTransferTargets = await window.electronAPI.getFileTransferTargets?.() || []
+      renderFileTargets()
+    } catch (error) {
+      console.error('Failed to load file transfer targets:', error)
+      if (targetList) targetList.innerHTML = '<div class="empty-state compact">目标节点加载失败</div>'
+    }
+  }
+
+  const renderFileHistory = () => {
+    if (!historyList) return
+    if (!fileTransferHistory.length) {
+      historyList.innerHTML = '<div class="empty-state compact">暂无接收文件历史</div>'
+      return
+    }
+    const groups = new Map()
+    for (const item of fileTransferHistory) {
+      const key = item.sourceId || item.sourceName || 'unknown'
+      if (!groups.has(key)) groups.set(key, { sourceName: item.sourceName || '未知设备', items: [] })
+      groups.get(key).items.push(item)
+    }
+    historyList.innerHTML = Array.from(groups.values()).map(group => `
+      <div class="file-history-group">
+        <div class="file-history-source">${escapeHtml(group.sourceName)}</div>
+        ${group.items.slice(0, 20).map(item => {
+          const meta = [
+            item.receivedAt ? formatTime(item.receivedAt) : '',
+            formatBytes(item.size),
+            item.exists === false ? '文件已移动或删除' : ''
+          ].filter(Boolean).join(' · ')
+          return `
+            <div class="file-history-row ${item.exists === false ? 'missing' : ''}">
+              <div class="file-history-main">
+                <div class="file-history-name">${escapeHtml(item.name || '文件')}</div>
+                <div class="file-history-meta">${escapeHtml(meta)}</div>
+                <div class="file-history-path" title="${escapeHtml(item.path || '')}">${escapeHtml(item.path || '')}</div>
+              </div>
+              <div class="file-history-actions">
+                <button type="button" data-action="open-file-history" data-path="${escapeHtml(item.path || '')}" ${item.exists === false ? 'disabled' : ''}>打开</button>
+                <button type="button" data-action="reveal-file-history" data-path="${escapeHtml(item.path || '')}" ${item.exists === false ? 'disabled' : ''}>定位</button>
+              </div>
+            </div>
+          `
+        }).join('')}
+      </div>
+    `).join('')
+  }
+
+  const loadFileHistory = async () => {
+    try {
+      fileTransferHistory = await window.electronAPI.getFileTransferHistory?.() || []
+      renderFileHistory()
+    } catch (error) {
+      console.error('Failed to load file transfer history:', error)
+      if (historyList) historyList.innerHTML = '<div class="empty-state compact">接收历史加载失败</div>'
+    }
   }
 
   const handleSendResult = (result, kind) => {
@@ -412,10 +521,16 @@ function setupFileTransferControls() {
   const bindSendButton = (element, invoke, kind) => {
     if (!element || typeof invoke !== 'function') return
     element.addEventListener('click', async () => {
+      const targetIds = getSelectedTargetIds()
+      if (targetIds.length === 0) {
+        setStatus('请先选择至少一个接收节点')
+        showNotification('未选择接收节点', '请在文件传输目标中勾选设备节点')
+        return
+      }
       element.disabled = true
       setStatus('选择中…')
       try {
-        handleSendResult(await invoke(), kind)
+        handleSendResult(await invoke(targetIds), kind)
       } catch (error) {
         setStatus('发送失败')
         showNotification(`${kind}发送失败`, error.message || '请重试')
@@ -426,8 +541,22 @@ function setupFileTransferControls() {
     })
   }
 
-  bindSendButton(button, () => window.electronAPI.selectAndSendFile(), '文件')
-  bindSendButton(folderButton, () => window.electronAPI.selectAndSendFolder?.(), '文件夹')
+  bindSendButton(button, (targetIds) => window.electronAPI.selectAndSendFile(targetIds), '文件')
+  bindSendButton(folderButton, (targetIds) => window.electronAPI.selectAndSendFolder?.(targetIds), '文件夹')
+  refreshTargetsButton?.addEventListener('click', loadFileTargets)
+  refreshHistoryButton?.addEventListener('click', loadFileHistory)
+  historyList?.addEventListener('click', async (event) => {
+    const actionButton = event.target.closest('button[data-action]')
+    if (!actionButton) return
+    const filePath = actionButton.dataset.path || ''
+    const result = actionButton.dataset.action === 'open-file-history'
+      ? await window.electronAPI.openFileTransferPath?.(filePath)
+      : await window.electronAPI.revealFileTransferPath?.(filePath)
+    if (result && result.success === false) {
+      showNotification('文件路径不可用', result.error || '无法打开文件')
+      await loadFileHistory()
+    }
+  })
 
   // 接收进度列表：每个 fileId 一行（文件名 + 进度条 + 百分比），完成后短暂停留
   const transferRows = new Map()
@@ -467,7 +596,22 @@ function setupFileTransferControls() {
   window.electronAPI.onFileTransferComplete?.((result) => {
     upsertTransferRow(result?.fileId || result?.name || 'last', result?.name, 1, 1, true)
     showNotification('文件接收完成', result?.name || '')
+    if (result?.historyEntry) {
+      fileTransferHistory = [
+        result.historyEntry,
+        ...fileTransferHistory.filter(item => item.id !== result.historyEntry.id && item.path !== result.historyEntry.path)
+      ]
+      renderFileHistory()
+    } else {
+      loadFileHistory()
+    }
   })
+  window.electronAPI.onFileTransferHistoryChanged?.((history) => {
+    fileTransferHistory = Array.isArray(history) ? history : []
+    renderFileHistory()
+  })
+  loadFileTargets()
+  loadFileHistory()
 }
 
 async function setupLanJoinSettings() {

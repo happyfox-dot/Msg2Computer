@@ -81,6 +81,7 @@ object LanDiscovery {
 
         try {
             sendProbe(context, socket)
+            sendKnownUnicastProbes(context, socket)
             val deadline = System.currentTimeMillis() + timeoutMs
             val buffer = ByteArray(8192)
 
@@ -162,6 +163,7 @@ object LanDiscovery {
             .put("name", identity.name)
             .put("deviceType", "ANDROID_PHONE")
             .put("host", "")
+            .put("tsHost", localTailscaleHost())
             .put("port", NODE_RELAY_PORT)
             .put("joinPort", NODE_RELAY_PORT)
             .put("joinPublicKey", LanJoinCrypto.publicKeyBase64(context))
@@ -176,6 +178,42 @@ object LanDiscovery {
             runCatching {
                 val packet = DatagramPacket(bytes, bytes.size, address, DISCOVERY_PORT)
                 socket.send(packet)
+            }
+        }
+    }
+
+    private fun sendKnownUnicastProbes(context: Context, socket: DatagramSocket) {
+        val identity = PhoneIdentityStore.get(context)
+        val tsHost = localTailscaleHost()
+        for (host in TopologyStore.discoveryProbeHosts(context)) {
+            val address = runCatching { InetAddress.getByName(host) }.getOrNull() ?: continue
+            val advertisedHost = if (isTailscaleAddress(address.hostAddress.orEmpty())) {
+                tsHost.ifBlank { localLanHost() }
+            } else {
+                localLanHost().ifBlank { tsHost }
+            }
+            val payload = JSONObject()
+                .put("type", "codebridge_discovery_probe")
+                .put("protocol", DISCOVERY_PROTOCOL)
+                .put("version", 1)
+                .put("deviceId", identity.id)
+                .put("id", identity.id)
+                .put("deviceName", identity.name)
+                .put("name", identity.name)
+                .put("deviceType", "ANDROID_PHONE")
+                .put("host", advertisedHost)
+                .put("tsHost", tsHost)
+                .put("port", NODE_RELAY_PORT)
+                .put("joinPort", NODE_RELAY_PORT)
+                .put("joinPublicKey", LanJoinCrypto.publicKeyBase64(context))
+                .put("joinFingerprint", LanJoinCrypto.fingerprint(context))
+                .put("capabilities", nodeCapabilities())
+                .put("networkId", LanTrustStore.getNetworkId(context))
+                .put("topologyRole", "peer")
+                .put("timestamp", System.currentTimeMillis())
+            val bytes = payload.toString().toByteArray(Charsets.UTF_8)
+            runCatching {
+                socket.send(DatagramPacket(bytes, bytes.size, address, DISCOVERY_PORT))
             }
         }
     }
@@ -200,6 +238,7 @@ object LanDiscovery {
             .put("name", identity.name)
             .put("deviceType", "ANDROID_PHONE")
             .put("host", "")
+            .put("tsHost", localTailscaleHost())
             .put("port", NODE_RELAY_PORT)
             .put("joinPort", NODE_RELAY_PORT)
             .put("joinPublicKey", LanJoinCrypto.publicKeyBase64(context))
@@ -242,7 +281,9 @@ object LanDiscovery {
         val id = payload.optString("deviceId", payload.optString("id", "")).trim()
         if (id.isBlank() || id == localId) return null
 
-        val host = remoteAddress.ifBlank { payload.optString("host", "").trim() }
+        val host = remoteAddress.ifBlank {
+            payload.optString("host", payload.optString("tsHost", "")).trim()
+        }
         val port = payload.optInt("port", WS_PORT)
         val joinPort = payload.optInt("joinPort", payload.optInt("relayPort", NODE_RELAY_PORT))
 

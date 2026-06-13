@@ -60,9 +60,19 @@ async function main() {
     maxChunkBytes: 256 * 1024
   })
 
-  const offer = await sender.offerFile(sourcePath, [receiverId])
+  const offer = await sender.offerFile(sourcePath, [receiverId], {
+    payloadExtra: {
+      sourceHost: '192.0.2.10',
+      sourceTsHost: '127.0.0.1',
+      sourceAltHosts: ['127.0.0.1']
+    }
+  })
   if (!offer || !manifest) throw new Error('offer failed')
+  if (manifest.host !== '192.0.2.10' || manifest.tsHost !== '127.0.0.1') {
+    throw new Error('source addresses missing from manifest')
+  }
 
+  const directHosts = []
   const receiver = createFileTransfer({
     getIdentity: () => ({ id: receiverId, name: 'Phone B', type: 'ANDROID_PHONE' }),
     encryptBytes,
@@ -71,10 +81,19 @@ async function main() {
     generateNonce: () => crypto.randomBytes(16).toString('base64'),
     sendManifest: async () => 0,
     lookupPeerKey: () => null,
-    resolveSource: id => id === senderId
-      ? { id: senderId, name: 'Desktop A', host: '127.0.0.1', port: 19529, pairingKey: key }
+    resolveSource: (id, incomingManifest) => id === senderId
+      ? {
+          id: senderId,
+          name: 'Desktop A',
+          host: '192.0.2.10',
+          hosts: [incomingManifest.host, incomingManifest.tsHost],
+          port: 19529,
+          pairingKey: key
+        }
       : null,
-    httpGet: async ({ path: reqPath }) => {
+    httpGet: async ({ host, path: reqPath }) => {
+      directHosts.push(host)
+      if (host !== '127.0.0.1') return null
       const url = new URL(reqPath, 'http://127.0.0.1')
       const result = await sender.serveFileChunk({
         fileId: decodeURIComponent(url.pathname.slice('/file/'.length)),
@@ -93,6 +112,9 @@ async function main() {
 
   const pulled = await receiver.startIncomingPull(manifest, { maxBytes: 10 * 1024 * 1024 })
   if (!pulled) throw new Error('pull failed')
+  if (!directHosts.includes('192.0.2.10') || !directHosts.includes('127.0.0.1')) {
+    throw new Error('direct multi-host fallback not exercised')
+  }
 
   const downloaded = fs.readdirSync(downloads).find(name => name === path.basename(sourcePath))
   if (!downloaded) throw new Error('download missing')

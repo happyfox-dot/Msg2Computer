@@ -28,7 +28,7 @@ data class DesktopDevice(
     // 针对个别设备的显式关闭（旧默认 false 导致全局开关打开后剪贴板
     // 同步依然提示"没有启用的推送目标"）
     val allowClipboard: Boolean = true,
-    val allowClipboardImage: Boolean = false,
+    val allowClipboardImage: Boolean = true,
     val allowClipboardFile: Boolean = false,
     val allowFileTransfer: Boolean = false,
     val maxFileSizeMb: Int = 50,
@@ -47,6 +47,7 @@ data class DesktopDevice(
 object DeviceStore {
     private const val PREFS_NAME = "paired_desktop_devices"
     private const val KEY_DEVICES = "devices"
+    private const val KEY_CLIPBOARD_IMAGE_POLICY_V3 = "clipboard_image_policy_v3"
     // 剪贴板策略 v2 一次性迁移标记：v1 存储里的 allowClipboard:false 是旧默认值
     // 而非用户选择，首次读取时统一翻转为新默认 true（此后用户的显式关闭原样保留）
     private const val KEY_CLIPBOARD_POLICY_V2 = "clipboard_policy_v2"
@@ -88,7 +89,10 @@ object DeviceStore {
                             "allowClipboardText",
                             item.optBoolean("allowClipboard", true)
                         ),
-                        allowClipboardImage = item.optBoolean("allowClipboardImage", false),
+                        allowClipboardImage = item.optBoolean(
+                            "allowClipboardImage",
+                            item.optBoolean("allowClipboard", true)
+                        ),
                         allowClipboardFile = item.optBoolean("allowClipboardFile", false),
                         allowFileTransfer = item.optBoolean("allowFileTransfer", false),
                         maxFileSizeMb = item.optInt("maxFileSizeMb", 50).coerceIn(1, 512),
@@ -221,7 +225,7 @@ object DeviceStore {
                 allowNotifications = policyAllowNotifications ?: true,
                 allowTotp = policyAllowTotp ?: true,
                 allowClipboard = policyAllowClipboard ?: true,
-                allowClipboardImage = policyAllowClipboardImage ?: false,
+                allowClipboardImage = policyAllowClipboardImage ?: (policyAllowClipboard ?: true),
                 allowClipboardFile = policyAllowClipboardFile ?: false,
                 allowFileTransfer = policyAllowFileTransfer ?: false,
                 maxFileSizeMb = (policyMaxFileSizeMb ?: 50).coerceIn(1, 512),
@@ -351,19 +355,32 @@ object DeviceStore {
     /** v1→v2：把存量设备的 allowClipboard 统一翻转为 true（详见 KEY_CLIPBOARD_POLICY_V2）。 */
     private fun ensureClipboardPolicyUpgrade(context: Context) {
         val p = prefs(context)
-        if (p.getBoolean(KEY_CLIPBOARD_POLICY_V2, false)) return
+        val needsTextUpgrade = !p.getBoolean(KEY_CLIPBOARD_POLICY_V2, false)
+        val needsImageUpgrade = !p.getBoolean(KEY_CLIPBOARD_IMAGE_POLICY_V3, false)
+        if (!needsTextUpgrade && !needsImageUpgrade) return
         val raw = p.getString(KEY_DEVICES, "[]") ?: "[]"
         runCatching {
             val array = JSONArray(raw)
             for (i in 0 until array.length()) {
-                array.optJSONObject(i)?.put("allowClipboard", true)
+                val item = array.optJSONObject(i) ?: continue
+                if (needsTextUpgrade) item.put("allowClipboard", true)
+                if (needsImageUpgrade &&
+                    item.optBoolean("allowClipboard", true) &&
+                    !item.optBoolean("allowClipboardImage", false)
+                ) {
+                    item.put("allowClipboardImage", true)
+                }
             }
             p.edit()
                 .putString(KEY_DEVICES, array.toString())
                 .putBoolean(KEY_CLIPBOARD_POLICY_V2, true)
+                .putBoolean(KEY_CLIPBOARD_IMAGE_POLICY_V3, true)
                 .apply()
         }.onFailure {
-            p.edit().putBoolean(KEY_CLIPBOARD_POLICY_V2, true).apply()
+            p.edit()
+                .putBoolean(KEY_CLIPBOARD_POLICY_V2, true)
+                .putBoolean(KEY_CLIPBOARD_IMAGE_POLICY_V3, true)
+                .apply()
         }
     }
 

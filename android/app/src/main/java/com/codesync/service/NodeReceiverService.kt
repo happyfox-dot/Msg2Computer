@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.content.ClipData
+import android.content.ClipDescription
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
@@ -23,6 +24,7 @@ import com.codesync.util.ContentBus
 import com.codesync.util.CryptoUtil
 import com.codesync.util.DeviceStore
 import com.codesync.util.FileTransferCoordinator
+import com.codesync.util.FileTransferHistoryStore
 import com.codesync.util.FileTransferRegistry
 import com.codesync.util.LanDiscovery
 import com.codesync.util.LanJoinClient
@@ -87,6 +89,7 @@ class NodeReceiverService : Service() {
         val id: String,
         val name: String,
         val host: String,
+        val hosts: List<String>,
         val port: Int,
         val type: String,
         val pairingKey: String
@@ -97,6 +100,7 @@ class NodeReceiverService : Service() {
         val file: File,
         val size: Long,
         val mime: String,
+        val sourceId: String,
         val sourceName: String
     )
 
@@ -647,6 +651,13 @@ class NodeReceiverService : Service() {
         return false
     }
 
+    private fun jsonArrayToList(array: JSONArray?): List<String> {
+        if (array == null) return emptyList()
+        return (0 until array.length()).mapNotNull {
+            array.optString(it).trim().takeIf { value -> value.isNotBlank() }
+        }
+    }
+
     private fun isSupportedPayload(type: String): Boolean {
         return isUserMessagePayload(type) ||
             type == "totp_seed" ||
@@ -959,17 +970,25 @@ class NodeReceiverService : Service() {
         // 拉取通道：直连源设备优先，其后是可信节点代理（多跳场景，代理只
         // 转发字节，鉴权与分片加密仍在本机与源设备之间端到端完成）。
         val routes = mutableListOf<Pair<String, String>>() // label to url 前缀（不含 query）
-        if (source.host.isNotBlank()) {
-            routes.add("direct" to "http://${source.host}:${source.port}/file/${urlEncode(fileId)}")
+        val sourceHosts = source.hosts.ifEmpty {
+            listOf(source.host).filter { it.isNotBlank() }
+        }
+        for (host in sourceHosts) {
+            routes.add("direct:$host" to "http://$host:${source.port}/file/${urlEncode(fileId)}")
         }
         DeviceStore.getEnabledDevices(this)
-            .filter { it.id != source.id && it.host.isNotBlank() }
+            .filter { it.id != source.id }
             .take(5)
             .forEach { device ->
-                routes.add(
-                    "proxy:${device.name}" to
-                        "http://${device.host}:${LanDiscovery.NODE_RELAY_PORT}/file/proxy/${urlEncode(source.id)}/${urlEncode(fileId)}"
-                )
+                (listOf(device.host) + device.altHosts)
+                    .filter { it.isNotBlank() }
+                    .distinct()
+                    .forEach { host ->
+                        routes.add(
+                            "proxy:${device.name}@$host" to
+                                "http://$host:${LanDiscovery.NODE_RELAY_PORT}/file/proxy/${urlEncode(source.id)}/${urlEncode(fileId)}"
+                        )
+                    }
             }
         if (routes.isEmpty()) {
             Log.w(TAG, "文件拉取失败：源不可直达且没有可用代理节点")
@@ -997,7 +1016,7 @@ class NodeReceiverService : Service() {
                             "&senderId=${urlEncode(identity.id)}" +
                             "&nonce=${urlEncode(nonce)}" +
                             "&authToken=${urlEncode(authToken)}"
-                        val url = if (label == "direct") "$urlBase?$query" else "$urlBase?$query&hop=3"
+                        val url = if (label.startsWith("direct")) "$urlBase?$query" else "$urlBase?$query&hop=3"
                         encrypted = runCatching { httpGetBytes(url) }.getOrNull()
                         if (encrypted != null) break
                         Log.w(TAG, "分片通道不可用 $label，切换下一通道")
@@ -1040,7 +1059,24 @@ class NodeReceiverService : Service() {
             }
             getSystemService(NotificationManager::class.java).cancel(progressNotificationId)
             DeviceStore.markDeviceSynced(this, source.id)
-            ReceivedFile(name = finalFile.name, file = finalFile, size = size, mime = mime, sourceName = source.name)
+            FileTransferHistoryStore.addReceived(
+                context = this,
+                fileId = fileId,
+                name = finalFile.name,
+                path = finalFile.absolutePath,
+                size = size,
+                mime = mime,
+                sourceDeviceId = source.id,
+                sourceDeviceName = source.name
+            )
+            ReceivedFile(
+                name = finalFile.name,
+                file = finalFile,
+                size = size,
+                mime = mime,
+                sourceId = source.id,
+                sourceName = source.name
+            )
         } catch (e: Exception) {
             runCatching { partFile.delete() }
             getSystemService(NotificationManager::class.java).cancel(progressNotificationId)
@@ -1088,6 +1124,14 @@ class NodeReceiverService : Service() {
             .ifBlank { manifest.optString("host") }
             .ifBlank { payload.optString("sourceHost") }
             .trim()
+        val hosts = (listOf(host) +
+            (device?.altHosts ?: emptyList()) +
+            jsonArrayToList(manifest.optJSONArray("altHosts")) +
+            jsonArrayToList(payload.optJSONArray("sourceAltHosts")) +
+            listOf(manifest.optString("tsHost"), payload.optString("sourceTsHost")))
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .distinct()
         val port = manifest.optInt(
             "relayPort",
             payload.optInt("relayPort", LanDiscovery.NODE_RELAY_PORT)
@@ -1100,6 +1144,7 @@ class NodeReceiverService : Service() {
             id = sourceId,
             name = name,
             host = host,
+            hosts = hosts,
             port = port,
             type = device?.type ?: payload.optString("sourceDeviceType", "UNKNOWN_DEVICE"),
             pairingKey = device?.pairingKey.orEmpty()
@@ -1265,7 +1310,11 @@ class NodeReceiverService : Service() {
                 file
             )
             val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
-            clipboard.setPrimaryClip(ClipData.newUri(contentResolver, "codebridge_clipboard_image", uri))
+            val clip = ClipData(
+                ClipDescription("codebridge_clipboard_image", arrayOf("image/png")),
+                ClipData.Item(uri)
+            )
+            clipboard.setPrimaryClip(clip)
             true
         }.onFailure {
             Log.w(TAG, "写入图片剪贴板失败: ${it.message}")

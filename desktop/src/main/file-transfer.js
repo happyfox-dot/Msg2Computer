@@ -126,7 +126,7 @@ function createFileTransfer(deps = {}) {
     generateNonce,
     sendManifest, // async (targetIds, basePayload) => deliveredCount
     lookupPeerKey, // (deviceId) => pairingKeyB64 | null   服务分片时验签+加密用
-    resolveSource, // (originDeviceId) => {host, port, pairingKey, id, name} | null  拉取时用
+    resolveSource, // (originDeviceId, manifest) => {host, hosts, port, pairingKey, id, name} | null  拉取时用
     resolveRelayCandidates = () => [], // (originId) => [{id, host, port, name}] 源不可直达时的代理节点
     httpGet, // async ({host, port, path, timeoutMs}) => {status, body:Buffer} | null
     downloadDir,
@@ -203,6 +203,9 @@ function createFileTransfer(deps = {}) {
     const chunkSize = maxChunkBytes
     const expiresAt = ts + offerTtlMs
     const targets = Array.isArray(targetIds) ? targetIds.map(String).filter(Boolean) : []
+    const payloadExtra = options.payloadExtra && typeof options.payloadExtra === 'object'
+      ? options.payloadExtra
+      : {}
 
     outgoingTransfers.set(fileId, {
       path: absPath,
@@ -215,6 +218,12 @@ function createFileTransfer(deps = {}) {
       targetDeviceIds: new Set(targets)
     })
 
+    const sourceHost = String(options.sourceHost || payloadExtra.sourceHost || '').trim()
+    const sourceTsHost = String(options.sourceTsHost || payloadExtra.sourceTsHost || '').trim()
+    const sourceAltHosts = Array.from(new Set([
+      ...(Array.isArray(options.sourceAltHosts) ? options.sourceAltHosts : []),
+      ...(Array.isArray(payloadExtra.sourceAltHosts) ? payloadExtra.sourceAltHosts : [])
+    ].map(host => String(host || '').trim()).filter(Boolean)))
     const manifest = {
       fileId,
       name,
@@ -226,6 +235,9 @@ function createFileTransfer(deps = {}) {
       expiresAt,
       inline: false
     }
+    if (sourceHost) manifest.host = sourceHost
+    if (sourceTsHost) manifest.tsHost = sourceTsHost
+    if (sourceAltHosts.length > 0) manifest.altHosts = sourceAltHosts
     // 目录分享：相对路径（含文件名）随 manifest 下发，接收端消毒后重建目录树
     if (options.relativePath) manifest.relativePath = String(options.relativePath)
     const payloadType = String(options.type || 'file_transfer')
@@ -233,7 +245,7 @@ function createFileTransfer(deps = {}) {
     const rawPrefix = String(options.rawPrefix || (payloadType === 'clipboard_file' ? '剪贴板文件' : '文件'))
     // 调用方附加字段（如剪贴板大图的 clipVersion）先铺底，骨架字段不允许被覆盖
     const basePayload = {
-      ...(options.payloadExtra && typeof options.payloadExtra === 'object' ? options.payloadExtra : {}),
+      ...payloadExtra,
       type: payloadType,
       code: '',
       source,
@@ -342,11 +354,15 @@ function createFileTransfer(deps = {}) {
       onError({ phase: 'pull', fileId, error: `文件超出接收上限或大小无效 (${size}B)` })
       return false
     }
-    const source = resolveSource(manifest.originDeviceId)
+    const source = resolveSource(manifest.originDeviceId, manifest)
     // 源没有直达地址时不再立即失败：还可以经可信节点代理拉取（多跳场景）
     const relayCandidates = (resolveRelayCandidates(manifest.originDeviceId) || [])
       .filter(cand => cand && cand.host)
-    if (!source || !source.pairingKey || (!source.host && relayCandidates.length === 0)) {
+    const sourceHosts = Array.from(new Set([
+      ...(Array.isArray(source?.hosts) ? source.hosts : []),
+      source?.host
+    ].map(host => String(host || '').trim()).filter(Boolean)))
+    if (!source || !source.pairingKey || (sourceHosts.length === 0 && relayCandidates.length === 0)) {
       onError({ phase: 'pull', fileId, error: '找不到源设备的可达地址或密钥' })
       return false
     }
@@ -393,8 +409,8 @@ function createFileTransfer(deps = {}) {
       // 通道重新尝试——不再用单调递增的索引锁定通道，否则某片偶发失败切到 proxy
       // 后，即使直连随后恢复也永远回不去。direct 恢复即自动用回 direct。
       const transports = []
-      if (source.host) {
-        transports.push({ kind: 'direct', host: source.host, port: source.port, label: `direct:${source.host}` })
+      for (const host of sourceHosts) {
+        transports.push({ kind: 'direct', host, port: source.port, label: `direct:${host}` })
       }
       for (const cand of relayCandidates) {
         transports.push({ kind: 'proxy', host: cand.host, port: cand.port, label: `proxy:${cand.id}` })
@@ -481,7 +497,16 @@ function createFileTransfer(deps = {}) {
       }
     }
     incomingTransfers.delete(fileId)
-    completeHook({ fileId, name, path: finalPath, size, sourceName: source.name || manifest.originDeviceName || '' })
+    completeHook({
+      fileId,
+      name,
+      path: finalPath,
+      size,
+      mime: manifest.mime || '',
+      sourceId: source.id || manifest.originDeviceId || '',
+      sourceName: source.name || manifest.originDeviceName || '',
+      sourceType: source.type || ''
+    })
     log(`文件接收完成 ${name} → ${finalPath}`)
     return true
   }

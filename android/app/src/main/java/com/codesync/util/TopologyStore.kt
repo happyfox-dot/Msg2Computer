@@ -252,6 +252,50 @@ object TopologyStore {
     fun seenSeqSnapshot(context: Context): JSONObject =
         JSONObject(loadSeenSeq(context).toString())
 
+    /**
+     * UDP broadcast cannot cross a Tailscale link. Discovery therefore also probes
+     * known tailnet addresses learned from trusted topology gossip or local devices.
+     */
+    fun discoveryProbeHosts(context: Context): List<String> {
+        val identity = PhoneIdentityStore.get(context)
+        val networkId = LanTrustStore.getNetworkId(context)
+        val localHosts = setOf(
+            LanDiscovery.localLanHost(),
+            LanDiscovery.localTailscaleHost()
+        ).filter { it.isNotBlank() }.toSet()
+        val hosts = linkedSetOf<String>()
+
+        fun addHost(value: String) {
+            val host = normalizeProbeHost(value)
+            if (host.isBlank() || host in localHosts) return
+            if (!LanDiscovery.isTailscaleAddress(host)) return
+            hosts.add(host)
+        }
+
+        DeviceStore.getDevices(context)
+            .filter { it.id != identity.id && it.enabled && it.pairingKey.isNotBlank() }
+            .forEach { device ->
+                addHost(device.host)
+                device.altHosts.forEach(::addHost)
+            }
+
+        val nodes = loadArray(context, KEY_NODES)
+        for (i in 0 until nodes.length()) {
+            val node = nodes.optJSONObject(i) ?: continue
+            val id = node.optString("id", node.optString("deviceId")).trim()
+            if (id.isBlank() || id == identity.id) continue
+            if (node.optBoolean("revoked", false) || !node.optBoolean("enabled", true)) continue
+            val nodeNetworkId = node.optString("networkId").trim()
+            if (networkId.isNotBlank() && nodeNetworkId.isNotBlank() && nodeNetworkId != networkId) continue
+            addHost(node.optString("host", node.optString("lastIP")))
+            addHost(node.optString("relayHost"))
+            addHost(node.optString("tsHost"))
+            jsonArrayToList(node.optJSONArray("altHosts")).forEach(::addHost)
+        }
+
+        return hosts.toList()
+    }
+
     fun markDeviceState(
         context: Context,
         device: DesktopDevice,
@@ -443,7 +487,10 @@ object TopologyStore {
                 "allowClipboardText",
                 node.optBoolean("allowClipboard", true)
             ),
-            policyAllowClipboardImage = node.optBoolean("allowClipboardImage", false),
+            policyAllowClipboardImage = node.optBoolean(
+                "allowClipboardImage",
+                node.optBoolean("allowImages", node.optBoolean("allowClipboard", true))
+            ),
             policyAllowClipboardFile = node.optBoolean("allowClipboardFile", false),
             policyAllowFileTransfer = node.optBoolean("allowFileTransfer", false),
             policyMaxFileSizeMb = node.optInt("maxFileSizeMb", 50),
@@ -500,6 +547,17 @@ object TopologyStore {
         return (0 until array.length()).mapNotNull {
             array.optString(it).takeIf { value -> value.isNotBlank() }
         }
+    }
+
+    private fun normalizeProbeHost(value: String): String {
+        return value.trim()
+            .removePrefix("http://")
+            .removePrefix("https://")
+            .removePrefix("[")
+            .substringBefore("]")
+            .substringBefore("/")
+            .substringBefore(":")
+            .trim()
     }
 
     private fun loadSeenSeq(context: Context): JSONObject =

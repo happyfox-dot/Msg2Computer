@@ -435,6 +435,15 @@
                     style="@style/Widget.Material3.Button.TonalButton"
                     app:cornerRadius="14dp" />
 
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btnFileHistory"
+                    android:layout_width="match_parent"
+                    android:layout_height="48dp"
+                    android:layout_marginTop="8dp"
+                    android:text="@string/file_receive_history"
+                    style="@style/Widget.Material3.Button.TextButton"
+                    app:cornerRadius="14dp" />
+
             </LinearLayout>
 
         </com.google.android.material.card.MaterialCardView>

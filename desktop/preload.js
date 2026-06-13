@@ -13,6 +13,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   setMessageSettings: (updates) => ipcRenderer.invoke('set-message-settings', updates),
   selectAndSendFile: (targetIds) => ipcRenderer.invoke('file-select-and-send', targetIds),
   selectAndSendFolder: (targetIds) => ipcRenderer.invoke('file-select-and-send-folder', targetIds),
+  getFileTransferTargets: () => ipcRenderer.invoke('file-transfer-targets'),
+  getFileTransferHistory: () => ipcRenderer.invoke('file-transfer-history'),
+  openFileTransferPath: (filePath) => ipcRenderer.invoke('file-transfer-open-path', filePath),
+  revealFileTransferPath: (filePath) => ipcRenderer.invoke('file-transfer-reveal-path', filePath),
   getLanJoinSettings: () => ipcRenderer.invoke('get-lan-join-settings'),
   setLanJoinSettings: (updates) => ipcRenderer.invoke('set-lan-join-settings', updates),
   isWindowVisible: () => ipcRenderer.invoke('is-window-visible'),
@@ -80,5 +84,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   },
   onFileTransferComplete: (callback) => {
     ipcRenderer.on('file-transfer-complete', (event, data) => callback(data))
+  },
+  onFileTransferHistoryChanged: (callback) => {
+    ipcRenderer.on('file-transfer-history-changed', (event, data) => callback(data))
   }
 })
