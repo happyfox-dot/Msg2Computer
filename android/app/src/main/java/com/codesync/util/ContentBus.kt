@@ -11,6 +11,8 @@ object ContentBus {
     // codebridge_bus 重放窗口：sentAt 纳入 HMAC，超窗整包拒收。与 relay 的
     // relaySentAt 不同，bus 协议没有旧版发送端，sentAt 缺失直接拒绝而非跳过。
     private const val BUS_REPLAY_WINDOW_MS = 5 * 60 * 1000L
+    private const val BUS_NONCE_LIMIT_PER_SENDER = 300
+    private val recentBusNonces = mutableMapOf<String, LinkedHashMap<String, Long>>()
 
     object Topic {
         const val TOPOLOGY_DELTA = "topology.delta"
@@ -125,7 +127,11 @@ object ContentBus {
             .put("authToken", CryptoUtil.hmacSha256Base64(peerKey, "${identity.id}|$nonce|$sentAt|$encryptedPayload"))
     }
 
-    fun parseTransportEnvelope(context: Context, transport: JSONObject): Pair<String, JSONObject>? {
+    fun parseTransportEnvelope(
+        context: Context,
+        transport: JSONObject,
+        peerKeyResolver: (String) -> String? = { null }
+    ): Pair<String, JSONObject>? {
         if (transport.optString("type") != "codebridge_bus") return null
         val identity = PhoneIdentityStore.get(context)
         val senderId = transport.optString("senderId").trim()
@@ -133,12 +139,35 @@ object ContentBus {
         val encryptedPayload = transport.optString("payload").trim()
         val authToken = transport.optString("authToken").trim()
         if (senderId.isBlank() || nonce.isBlank() || encryptedPayload.isBlank() || authToken.isBlank()) return null
+        val peerKey = peerKeyResolver(senderId)?.takeIf { it.isNotBlank() } ?: identity.pairingKey
         val sentAt = transport.optLong("sentAt", 0L)
         if (sentAt <= 0L || kotlin.math.abs(System.currentTimeMillis() - sentAt) > BUS_REPLAY_WINDOW_MS) return null
-        val expected = CryptoUtil.hmacSha256Base64(identity.pairingKey, "$senderId|$nonce|$sentAt|$encryptedPayload")
+        val expected = CryptoUtil.hmacSha256Base64(peerKey, "$senderId|$nonce|$sentAt|$encryptedPayload")
         if (!MessageDigest.isEqual(expected.toByteArray(), authToken.toByteArray())) return null
-        val envelope = JSONObject(CryptoUtil.decrypt(encryptedPayload, identity.pairingKey))
+        if (isReplayedBusNonce(senderId, nonce)) return null
+        val envelope = JSONObject(CryptoUtil.decrypt(encryptedPayload, peerKey))
         return if (isEnvelope(envelope)) senderId to envelope else null
+    }
+
+    private fun isReplayedBusNonce(senderId: String, nonce: String): Boolean {
+        if (senderId.isBlank() || nonce.isBlank()) return true
+        val now = System.currentTimeMillis()
+        synchronized(recentBusNonces) {
+            val seen = recentBusNonces.getOrPut(senderId) { LinkedHashMap() }
+            val iterator = seen.entries.iterator()
+            while (iterator.hasNext()) {
+                if (now - iterator.next().value > BUS_REPLAY_WINDOW_MS) iterator.remove()
+            }
+            if (seen.containsKey(nonce)) return true
+            seen[nonce] = now
+            while (seen.size > BUS_NONCE_LIMIT_PER_SENDER) {
+                val first = seen.entries.iterator()
+                if (!first.hasNext()) break
+                first.next()
+                first.remove()
+            }
+        }
+        return false
     }
 
     private fun copyStringArray(array: JSONArray?): JSONArray {

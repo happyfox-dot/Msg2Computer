@@ -1164,7 +1164,7 @@ function getContentBus() {
     canReceive: topic => canReceiveBusTopic(topic),
     sendDirect: (target, envelope, route) => sendBusEnvelopeDirect(target, envelope, route),
     sendWs: (target, envelope) => sendBusEnvelopeWs(target, envelope),
-    sendRelay: (target, envelope) => sendBusEnvelopeLegacyRelay(target, envelope),
+    sendRelay: (target, envelope, route) => sendBusEnvelopeLegacyRelay(target, envelope, route),
     onReceive: (envelope, context) => dispatchInboundBusEnvelope(envelope, context.lastHopDeviceId || ''),
     log: message => console.log(message)
   })
@@ -2310,7 +2310,7 @@ async function handleLanJoinRequest(body, remoteAddress = '') {
 }
 
 function handleBusMessageRequest(body, remoteAddress = '') {
-  const parsed = parseBusTransportEnvelope(body, pairingKey)
+  const parsed = parseBusTransportEnvelope(body, senderId => lookupPeerPairingKey(senderId) || pairingKey)
   if (!parsed) {
     return { status: 403, body: { type: 'bus_ack', accepted: false, reason: 'invalid_bus_envelope' } }
   }
@@ -3281,6 +3281,28 @@ function postJsonToNode(host, port, body, optionsOrTimeout = 3500) {
 // codebridge_bus 重放窗口：sentAt 纳入 HMAC，超窗整包拒收。与 relay 的
 // relaySentAt 不同，bus 协议没有旧版发送端，sentAt 缺失直接拒绝而非跳过。
 const BUS_REPLAY_WINDOW_MS = 5 * 60 * 1000
+const BUS_NONCE_LIMIT_PER_SENDER = 300
+const recentBusNonces = new Map()
+
+function isReplayedBusNonce(senderId, nonce) {
+  if (!senderId || !nonce) return true
+  const now = Date.now()
+  let seen = recentBusNonces.get(senderId)
+  if (!seen) {
+    seen = new Map()
+    recentBusNonces.set(senderId, seen)
+  }
+  for (const [itemNonce, firstSeen] of seen) {
+    if (now - firstSeen > BUS_REPLAY_WINDOW_MS) seen.delete(itemNonce)
+  }
+  if (seen.has(nonce)) return true
+  seen.set(nonce, now)
+  while (seen.size > BUS_NONCE_LIMIT_PER_SENDER) {
+    const oldest = seen.keys().next().value
+    seen.delete(oldest)
+  }
+  return false
+}
 
 function buildBusTransportEnvelope(envelope, peerKey) {
   const identity = getDesktopIdentity()
@@ -3299,17 +3321,22 @@ function buildBusTransportEnvelope(envelope, peerKey) {
   }
 }
 
-function parseBusTransportEnvelope(body, peerKey) {
+function parseBusTransportEnvelope(body, peerKeyOrLookup) {
   if (!body || body.type !== 'codebridge_bus') return null
   const senderId = String(body.senderId || '').trim()
   const nonce = String(body.nonce || '').trim()
   const payload = String(body.payload || '').trim()
   const authToken = String(body.authToken || '').trim()
   if (!senderId || !nonce || !payload || !authToken) return null
+  const peerKey = typeof peerKeyOrLookup === 'function'
+    ? peerKeyOrLookup(senderId)
+    : peerKeyOrLookup
+  if (!peerKey) return null
   const sentAt = Number(body.sentAt || 0)
   if (!Number.isFinite(sentAt) || sentAt <= 0 || Math.abs(Date.now() - sentAt) > BUS_REPLAY_WINDOW_MS) return null
   const expected = hmacBase64(peerKey, `${senderId}|${nonce}|${sentAt}|${payload}`)
   if (!timingSafeEqual(expected, authToken)) return null
+  if (isReplayedBusNonce(senderId, nonce)) return null
   const plain = decryptMessage(payload, peerKey)
   if (!plain) return null
   const envelope = JSON.parse(plain)
@@ -3373,12 +3400,18 @@ function sendBusEnvelopeWs(target, envelope) {
   return false
 }
 
-async function sendBusEnvelopeLegacyRelay(target, envelope) {
+async function sendBusEnvelopeLegacyRelay(target, envelope, route = {}) {
   const payload = busEnvelope.toLegacyPayload(envelope)
-  if (String(target?.deviceType || target?.type || '').includes('PHONE')) {
-    return sendRelayEnvelopeToPhone(target, payload, { skipBus: true })
+  const targetId = String(target?.id || target?.phoneId || envelope.targetNodeIds?.[0] || '').trim()
+  const nextHopId = String(route.nextHopId || '').trim()
+  const deliveryTarget = nextHopId && nextHopId !== targetId
+    ? (resolveForwardTarget(nextHopId)?.node || target)
+    : target
+  const deliveryTargetId = String(deliveryTarget?.id || deliveryTarget?.phoneId || targetId).trim()
+  if (String(deliveryTarget?.deviceType || deliveryTarget?.type || '').includes('PHONE')) {
+    return sendRelayEnvelopeToPhone(deliveryTarget, payload, { skipBus: true })
   }
-  return sendVerifyCodeToDesktopNode(target.id, JSON.stringify(payload), envelope.messageId)
+  return sendVerifyCodeToDesktopNode(deliveryTargetId, JSON.stringify(payload), envelope.messageId)
 }
 
 function dispatchInboundBusEnvelope(envelope, lastHopDeviceId = '') {
@@ -4227,11 +4260,11 @@ function getDefaultClipboardImageTargetIds() {
   const ids = []
   for (const phone of getAuthorizedPhones()) {
     if (phone.enabled === false || phone.revoked === true) continue
-    if (!phone.pairingKey || !(phone.lastIP || phone.host)) continue
+    if (!hasKnownDeliveryPath(phone)) continue
     if (canPushContentToNode(phone, CODE_TYPES.CLIPBOARD_IMAGE)) ids.push(phone.id)
   }
   for (const peer of getPairedDesktopPeers()) {
-    if (peer.enabled === false || !peer.pairingKey) continue
+    if (peer.enabled === false || !hasKnownDeliveryPath(peer)) continue
     if (canPushContentToNode(peer, CODE_TYPES.CLIPBOARD_IMAGE)) ids.push(peer.id)
   }
   return Array.from(new Set(ids))
@@ -4473,25 +4506,8 @@ function broadcastClipboardImageToNodes(pngBuffer, sha256, options = {}) {
   relayPath.forEach(id => exclude.add(id))
   exclude.add(clipOrigin)
 
-  const targetPhones = getAuthorizedPhones().filter(phone =>
-    phone.enabled !== false &&
-    phone.revoked !== true &&
-    !exclude.has(phone.id) &&
-    canPushContentToNode(phone, CODE_TYPES.CLIPBOARD_IMAGE) &&
-    phone.pairingKey &&
-    (phone.lastIP || phone.host)
-  )
-  const targetDesktopPeerIds = new Set(
-    Array.from(activeDesktopPeerConnections.keys()).filter(peerId => {
-      if (exclude.has(peerId)) return false
-      const peer = pairedDesktopPeers.get(peerId)
-      return !!peer && peer.enabled !== false && canPushContentToNode(peer, CODE_TYPES.CLIPBOARD_IMAGE)
-    })
-  )
-  const targetDeviceIds = [
-    ...targetPhones.map(phone => phone.id),
-    ...Array.from(targetDesktopPeerIds)
-  ]
+  const targetDeviceIds = getDefaultClipboardImageTargetIds()
+    .filter(id => !exclude.has(id))
   if (targetDeviceIds.length === 0) return
 
   const fullHash = sha256 || hashBuffer(pngBuffer)
@@ -4535,6 +4551,19 @@ function broadcastClipboardImageToNodes(pngBuffer, sha256, options = {}) {
       : USER_MESSAGE_RELAY_TTL,
     targetDeviceIds
   }
+
+  getContentBus().publish(busEnvelope.TOPICS.CLIPBOARD_IMAGE, basePayload, {
+    targetNodeIds: targetDeviceIds,
+    ttl: basePayload.relayTtl,
+    routePath: relayPath
+  }).then(result => {
+    if (result.delivered > 0) {
+      console.log(`clipboard image synced v${clipTs}: delivered=${result.delivered}/${targetDeviceIds.length}`)
+    }
+  }).catch(error => {
+    console.error('clipboard image sync failed:', error.message)
+  })
+  return
 
   const peerPayloadPlain = JSON.stringify(basePayload)
   let delivered = 0
@@ -6074,12 +6103,18 @@ function initFileTransfer() {
 async function broadcastFileManifestToNodes(targetIds, basePayload) {
   const targets = new Set((Array.isArray(targetIds) ? targetIds : []).map(String))
   const relayPath = [getDesktopIdentity().id]
+  const payloadType = String(basePayload?.type || '')
+  const topic = payloadType === CODE_TYPES.CLIPBOARD_IMAGE
+    ? busEnvelope.TOPICS.CLIPBOARD_IMAGE
+    : payloadType === CODE_TYPES.CLIPBOARD_FILE
+      ? busEnvelope.TOPICS.CLIPBOARD_FILE
+      : busEnvelope.TOPICS.FILE_MANIFEST
   const payload = {
     ...basePayload,
     relayPath,
     relayTtl: USER_MESSAGE_RELAY_TTL
   }
-  const result = await getContentBus().publish(busEnvelope.TOPICS.FILE_MANIFEST, payload, {
+  const result = await getContentBus().publish(topic, payload, {
     targetNodeIds: Array.from(targets),
     ttl: USER_MESSAGE_RELAY_TTL,
     routePath: relayPath
@@ -6283,7 +6318,7 @@ function handleIncomingFileManifest(codeInfo, codeData) {
   const sourceName = codeInfo.sourceDeviceName || codeInfo.phoneName || manifest.originDeviceName || '未知设备'
   const autoAccept = desktopMessageSettings.autoAcceptFiles === true
   const beginPull = () => {
-    fileTransfer.startIncomingPull(manifest, { maxBytes }).catch(err => {
+    initFileTransfer().startIncomingPull(manifest, { maxBytes }).catch(err => {
       console.error('文件拉取启动失败:', err)
     })
   }
@@ -6546,6 +6581,41 @@ function nodeSupportsSoftBus(node = {}) {
   return caps.softBus === true || caps.p2pDirect === true
 }
 
+function hasActiveWsForNode(nodeId) {
+  const id = String(nodeId || '').trim()
+  if (!id) return false
+  const desktopWs = activeDesktopPeerConnections.get(id)
+  if (desktopWs && desktopWs.readyState === WebSocket.OPEN && desktopWs.__codebridgeSessionKey) return true
+  const phoneConnections = activePhoneConnections.get(id)
+  return !!(phoneConnections && Array.from(phoneConnections).some(ws =>
+    ws && ws.readyState === WebSocket.OPEN && phoneSessionKeys.get(ws)
+  ))
+}
+
+function hasDirectNodeAddress(node = {}) {
+  return !!normalizeNetworkHost(node.lastIP || node.host || node.relayHost || node.tsHost || '')
+}
+
+function hasKnownDeliveryPath(node = {}) {
+  const id = String(node.id || node.phoneId || '').trim()
+  if (!id || !node.pairingKey) return false
+  if (hasDirectNodeAddress(node) || hasActiveWsForNode(id)) return true
+  try {
+    const identity = getDesktopIdentity()
+    const routes = getTopologySnapshot().routeTables?.[identity.id] || []
+    return routes.some(route => {
+      if (String(route.destinationId || route.to || '') !== id) return false
+      const hopId = String(route.nextHopId || route.via || '').trim()
+      if (!hopId || hopId === id || hopId === identity.id) return false
+      const hop = resolveForwardTarget(hopId)?.node
+      return !!hop && hop.enabled !== false && hop.revoked !== true &&
+        !!hop.pairingKey && (hasDirectNodeAddress(hop) || hasActiveWsForNode(hopId))
+    })
+  } catch (_) {
+    return false
+  }
+}
+
 function forwardMessageToNode(targetId, payload, messageKey) {
   const target = resolveForwardTarget(targetId)
   if (!target || target.node.enabled === false || target.node.revoked === true) return false
@@ -6656,11 +6726,11 @@ function getDefaultFileTransferTargetIds() {
   const ids = []
   for (const phone of getAuthorizedPhones()) {
     if (phone.enabled === false || phone.revoked === true) continue
-    if (!phone.pairingKey || !(phone.lastIP || phone.host)) continue
+    if (!hasKnownDeliveryPath(phone)) continue
     if (canPushContentToNode(phone, CODE_TYPES.FILE_TRANSFER)) ids.push(phone.id)
   }
   for (const peer of getPairedDesktopPeers()) {
-    if (peer.enabled === false || !peer.pairingKey) continue
+    if (peer.enabled === false || !hasKnownDeliveryPath(peer)) continue
     if (canPushContentToNode(peer, CODE_TYPES.FILE_TRANSFER)) ids.push(peer.id)
   }
   return Array.from(new Set(ids))
@@ -6670,7 +6740,7 @@ function getDefaultClipboardFileTargetIds() {
   const ids = []
   for (const phone of getAuthorizedPhones()) {
     if (phone.enabled === false || phone.revoked === true) continue
-    if (!phone.pairingKey || !(phone.lastIP || phone.host)) continue
+    if (!hasKnownDeliveryPath(phone)) continue
     if (
       canPushContentToNode(phone, CODE_TYPES.CLIPBOARD_FILE) ||
       canPushContentToNode(phone, CODE_TYPES.FILE_TRANSFER)
@@ -6679,7 +6749,7 @@ function getDefaultClipboardFileTargetIds() {
     }
   }
   for (const peer of getPairedDesktopPeers()) {
-    if (peer.enabled === false || !peer.pairingKey) continue
+    if (peer.enabled === false || !hasKnownDeliveryPath(peer)) continue
     if (
       canPushContentToNode(peer, CODE_TYPES.CLIPBOARD_FILE) ||
       canPushContentToNode(peer, CODE_TYPES.FILE_TRANSFER)

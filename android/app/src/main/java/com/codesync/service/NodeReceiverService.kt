@@ -599,14 +599,20 @@ class NodeReceiverService : Service() {
     }
 
     private fun handleBusEnvelope(transport: JSONObject): Pair<Int, JSONObject> {
-        val parsed = ContentBus.parseTransportEnvelope(this, transport)
+        val identity = PhoneIdentityStore.get(this)
+        val parsed = ContentBus.parseTransportEnvelope(this, transport) { senderId ->
+            if (senderId == identity.id) {
+                identity.pairingKey
+            } else {
+                DeviceStore.findDevice(this, senderId)?.pairingKey
+            }
+        }
             ?: return 403 to JSONObject()
                 .put("type", "bus_ack")
                 .put("accepted", false)
                 .put("reason", "invalid_bus_envelope")
         val senderId = parsed.first
         val envelope = parsed.second
-        val identity = PhoneIdentityStore.get(this)
         val trusted = senderId == identity.id || DeviceStore.findDevice(this, senderId) != null
         if (!trusted) {
             return 403 to JSONObject()

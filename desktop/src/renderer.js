@@ -502,14 +502,16 @@ function setupPhoneList() {
     const row = target.closest('.phone-row')
     if (!row) return
 
-    if (target.matches('[data-action="toggle-phone-totp"], [data-action="toggle-phone-clipboard"], [data-action="toggle-phone-clipboard-image"]')) {
+    if (target.matches('[data-action="toggle-phone-totp"], [data-action="toggle-phone-clipboard"], [data-action="toggle-phone-clipboard-image"], [data-action="toggle-phone-file"]')) {
       target.disabled = true
       try {
         const updates = target.dataset.action === 'toggle-phone-clipboard'
           ? { allowClipboard: target.checked, allowClipboardText: target.checked }
           : target.dataset.action === 'toggle-phone-clipboard-image'
             ? { allowClipboardImage: target.checked }
-            : { allowTotp: target.checked }
+            : target.dataset.action === 'toggle-phone-file'
+              ? { allowClipboardFile: target.checked, allowFileTransfer: target.checked }
+              : { allowTotp: target.checked }
         const phones = await window.electronAPI.setPhoneContentPolicy(row.dataset.phoneId, updates)
         authorizedPhones = Array.isArray(phones) ? phones : []
         renderPhones()
@@ -807,6 +809,7 @@ function renderPhones() {
     const totpChecked = contentPolicy.allowTotp !== false
     const clipboardChecked = contentPolicy.allowClipboardText !== false && contentPolicy.allowClipboard !== false
     const clipboardImageChecked = contentPolicy.allowClipboardImage === true
+    const fileChecked = contentPolicy.allowClipboardFile === true || contentPolicy.allowFileTransfer === true
     const meta = [
       phone.lastSeen ? `上次 ${formatTime(phone.lastSeen)}` : '',
       phone.lastIP || ''
@@ -844,6 +847,10 @@ function renderPhones() {
         <label class="phone-policy-toggle" title="是否向该节点同步本机图片剪贴板">
           <input type="checkbox" data-action="toggle-phone-clipboard-image" ${clipboardImageChecked ? 'checked' : ''} ${phone.revoked ? 'disabled' : ''}>
           <span>图片</span>
+        </label>
+        <label class="phone-policy-toggle" title="是否向该节点同步本机文件剪贴板和文件">
+          <input type="checkbox" data-action="toggle-phone-file" ${fileChecked ? 'checked' : ''} ${phone.revoked ? 'disabled' : ''}>
+          <span>文件</span>
         </label>
         ${actionButton}
       </div>

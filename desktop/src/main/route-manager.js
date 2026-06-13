@@ -73,16 +73,19 @@ function buildPeerRoutes({ target = {}, topologyRoutes = [], hasActiveWs = false
       direct: false
     })
   }
-  if (routes.length === 0 && target.pairingKey) {
-    routes.push({
-      targetId: id,
-      nextHopId: id,
-      transportType: 'legacy_http',
-      host: normalizeHost(target.lastIP || target.host),
-      port: Number(target.relayPort || target.joinPort || 19529),
-      metric: TRANSPORT_PRIORITY.legacy_http,
-      direct: false
-    })
+  if (target.pairingKey) {
+    const legacyHost = normalizeHost(target.lastIP || target.host || target.relayHost)
+    if (legacyHost) {
+      routes.push({
+        targetId: id,
+        nextHopId: id,
+        transportType: 'legacy_http',
+        host: legacyHost,
+        port: Number(target.relayPort || target.joinPort || 19529),
+        metric: TRANSPORT_PRIORITY.legacy_http,
+        direct: false
+      })
+    }
   }
   return routes
     .filter(route => route.transportType === 'legacy_ws' || route.host || route.nextHopId)
