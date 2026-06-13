@@ -1152,7 +1152,7 @@ function renderCodes() {
     const sourceClass = isLocal ? 'local' : 'remote'
 
     return `
-      <div class="code-item ${Date.now() - c.timestamp < 3000 ? 'new-code' : ''}" data-id="${c.id}">
+      <div class="code-item ${Date.now() - c.timestamp < 3000 ? 'new-code' : ''}" data-id="${c.id}" title="点击查看详细内容">
         <div class="code-main">
           <div class="code-type-badge type-${escapeHtml(contentType)}">${escapeHtml(contentTypeLabel)}</div>
           ${contentMeta}
@@ -1193,22 +1193,111 @@ function renderCodes() {
     })
   })
 
-  // 点击卡片正文：在该条的「验证码 / 原文」之间切换；无原文则回退为复制验证码。
+  // 点击卡片正文打开详情；复制与原文/验证码切换保留为显式按钮。
   container.querySelectorAll('.code-item').forEach(item => {
     item.addEventListener('click', function(e) {
       if (e.target.closest('button')) return
-      // 原文区域允许自由选中复制文本，不触发整卡切换
-      if (e.target.closest('.code-raw-message') && window.getSelection()?.toString()) return
+      // 原文区域允许自由选中复制文本，不触发详情弹窗
+      if (window.getSelection?.()?.toString()) return
       const id = this.dataset.id
       const codeData = codes.find(c => c.id === id)
-      if (codeData && (codeData.contentType || codeData.type) === 'sms' && getRawMessage(codeData)) {
-        toggleCardDisplayMode(id)
-      } else {
-        const value = getCopyValueForMessage(codeData)
-        if (value) window.electronAPI.copyToClipboard(value)
-      }
+      if (codeData) showMessageDetailDialog(codeData)
     })
   })
+}
+
+function showMessageDetailDialog(codeInfo) {
+  if (!codeInfo) return
+  document.querySelectorAll('.message-detail-dialog').forEach(item => item.remove())
+
+  const dialog = document.createElement('div')
+  dialog.className = 'message-detail-dialog'
+  const contentType = codeInfo.contentType || codeInfo.type || 'sms'
+  const rawMessage = getRawMessage(codeInfo)
+  const copyValue = getCopyValueForMessage(codeInfo)
+  const manifest = codeInfo.fileManifest || {}
+  const targetDevices = Array.isArray(codeInfo.targetDevices) ? codeInfo.targetDevices : []
+  const targetText = targetDevices.length
+    ? targetDevices.map(item => typeof item === 'string'
+      ? item
+      : (item?.name || item?.deviceName || item?.id || item?.deviceId)
+    ).filter(Boolean).slice(0, 8).join('、')
+    : (codeInfo.targetDeviceName || '当前设备')
+
+  const rows = [
+    ['类型', getContentTypeLabel(contentType)],
+    ['时间', formatFullTime(codeInfo.timestamp)],
+    ['来源', getMessageSourceText(codeInfo)],
+    ['来源设备', codeInfo.sourceDeviceName || codeInfo.phoneName || '未知设备'],
+    ['目标设备', targetDevices.length > 8 ? `${targetText} 等 ${targetDevices.length} 个设备` : targetText],
+    ['上一跳', codeInfo.lastHopDeviceName || ''],
+    ['消息 ID', codeInfo.originMessageId || codeInfo.relayMessageId || ''],
+    ['推送权限', getAuthorityLabel(codeInfo.pushAuthority) || codeInfo.pushAuthority || '']
+  ]
+
+  if (codeInfo.code) rows.splice(2, 0, ['验证码', codeInfo.code])
+  if (codeInfo.title) rows.push(['标题', codeInfo.title])
+  if (codeInfo.appName) rows.push(['应用', codeInfo.appName])
+  if (codeInfo.packageName) rows.push(['包名', codeInfo.packageName])
+  if (manifest && Object.keys(manifest).length) {
+    rows.push(['文件名', manifest.name || ''])
+    rows.push(['MIME', manifest.mime || ''])
+    rows.push(['大小', manifest.size ? formatBytesCompact(manifest.size) : ''])
+    rows.push(['SHA-256', manifest.sha256 || ''])
+    rows.push(['File ID', manifest.fileId || ''])
+  }
+
+  const bodyText = rawMessage || codeInfo.source || ''
+  dialog.innerHTML = `
+    <div class="message-detail-card">
+      <div class="message-detail-header">
+        <div>
+          <div class="message-detail-title">${escapeHtml(getContentTypeLabel(contentType))}</div>
+          <div class="message-detail-subtitle">${escapeHtml(codeInfo.sourceDeviceName || codeInfo.phoneName || '未知设备')} · ${escapeHtml(formatFullTime(codeInfo.timestamp))}</div>
+        </div>
+        <button class="message-detail-close" data-action="close" title="关闭">×</button>
+      </div>
+      <div class="message-detail-grid">
+        ${rows.filter(([, value]) => value !== undefined && value !== null && String(value).trim() !== '').map(([label, value]) => `
+          <div class="message-detail-row">
+            <span>${escapeHtml(label)}</span>
+            <strong title="${escapeHtml(String(value))}">${escapeHtml(String(value))}</strong>
+          </div>
+        `).join('')}
+      </div>
+      <div class="message-detail-section">
+        <div class="message-detail-section-title">详细内容</div>
+        <pre class="message-detail-body">${escapeHtml(bodyText || '无正文')}</pre>
+      </div>
+      <div class="message-detail-actions">
+        ${copyValue ? '<button class="btn-dialog btn-secondary" data-action="copy-main">复制主要内容</button>' : ''}
+        ${rawMessage && rawMessage !== copyValue ? '<button class="btn-dialog btn-secondary" data-action="copy-raw">复制原文</button>' : ''}
+        <button class="btn-dialog btn-primary" data-action="close">关闭</button>
+      </div>
+    </div>
+  `
+
+  const close = () => {
+    document.removeEventListener('keydown', onKeydown)
+    dialog.remove()
+  }
+  const onKeydown = (event) => {
+    if (event.key === 'Escape') close()
+  }
+  dialog.querySelectorAll('[data-action="close"]').forEach(button => {
+    button.addEventListener('click', close)
+  })
+  dialog.querySelector('[data-action="copy-main"]')?.addEventListener('click', () => {
+    if (copyValue) window.electronAPI.copyToClipboard(copyValue)
+  })
+  dialog.querySelector('[data-action="copy-raw"]')?.addEventListener('click', () => {
+    if (rawMessage) window.electronAPI.copyToClipboard(rawMessage)
+  })
+  dialog.addEventListener('click', event => {
+    if (event.target === dialog) close()
+  })
+  document.addEventListener('keydown', onKeydown)
+  document.body.appendChild(dialog)
 }
 
 function renderTopology() {
@@ -1408,11 +1497,35 @@ function renderTopologyLegend() {
   return `
     <div class="topology-legend">
       ${items}
-      <span class="topology-legend-item"><i class="topology-legend-swatch legend-active"></i>无向连接</span>
-      <span class="topology-legend-item"><i class="topology-legend-swatch legend-active"></i>实线 = 活跃</span>
-      <span class="topology-legend-item"><i class="topology-legend-swatch legend-idle"></i>虚线 = 待连接 / 停用</span>
+      <span class="topology-legend-item"><i class="topology-legend-swatch legend-active"></i>实线 = 在线连接</span>
+      <span class="topology-legend-item"><i class="topology-legend-swatch legend-partial"></i>点线 = 部分在线</span>
+      <span class="topology-legend-item"><i class="topology-legend-swatch legend-idle"></i>虚线 = 可路由 / 离线 / 历史</span>
     </div>
   `
+}
+
+function getTopologyEdgeState(edge) {
+  if (!edge) return 'disabled'
+  if (edge.type === 'lan_discovery') return 'discovered'
+  if (edge.type === 'recent_verify' || edge.type === 'totp_seed_scope') return 'history'
+  if (edge.enabled === false) return 'disabled'
+  if (edge.active === true) return 'online'
+  if (edge.partiallyActive === true) return 'partial'
+  if (edge.routable === true || edge.metric) return 'routable'
+  return 'offline'
+}
+
+function getTopologyEdgeStateLabel(edge) {
+  const state = getTopologyEdgeState(edge)
+  return {
+    online: '在线连接',
+    partial: '部分在线',
+    routable: '可路由候选',
+    discovered: '局域网发现',
+    history: '同步历史',
+    disabled: '已停用',
+    offline: '离线'
+  }[state] || '未知'
 }
 
 function renderDirectedTopologyPath(edge, positions) {
@@ -1425,16 +1538,19 @@ function renderDirectedTopologyPath(edge, positions) {
   const endY = to.y + 33
   const midX = (startX + endX) / 2
   const curve = `M ${startX} ${startY} C ${midX} ${startY}, ${midX} ${endY}, ${endX} ${endY}`
+  const edgeState = getTopologyEdgeState(edge)
   const className = [
     'topology-directed-path',
     `type-${edge.type || 'sync'}`,
-    edge.active ? 'active' : '',
+    `state-${edgeState}`,
+    edgeState === 'online' ? 'active' : '',
+    edgeState === 'partial' ? 'partial' : '',
     edge.enabled ? '' : 'disabled'
   ].filter(Boolean).join(' ')
   const tooltip = [
     edge.label || '同步',
     edge.metric ? `metric ${edge.metric}` : '',
-    edge.active ? '活跃' : (edge.enabled ? '待连接' : '已停用')
+    getTopologyEdgeStateLabel(edge)
   ].filter(Boolean).join(' · ')
   // metric 标在曲线中点略上方，只对参与路由计算的链路显示
   const midY = (startY + endY) / 2
@@ -1491,7 +1607,7 @@ function addRecentCodeTopology(nodeMap, edgeMap, code, localNodeId) {
     name: code.sourceDeviceName || code.phoneName || '未知手机',
     type: code.sourceDeviceType || 'ANDROID_PHONE',
     role: 'source',
-    status: 'online',
+    status: 'synced',
     authority: code.pushAuthority || 'source_device',
     lastSeen: code.timestamp || Date.now()
   })
@@ -1522,7 +1638,7 @@ function addRecentCodeTopology(nodeMap, edgeMap, code, localNodeId) {
       type: 'recent_verify',
       label: code.type === 'totp' ? '最近 TOTP 推送' : '最近短信推送',
       enabled: true,
-      active: targetId === localNodeId,
+      active: false,
       authority: code.pushAuthority || 'source_device',
       updatedAt: code.timestamp || Date.now(),
       count: 1
@@ -1558,14 +1674,17 @@ function mergeTopologyViewNode(nodeMap, node) {
     nodeMap.set(normalized.id, normalized)
     return
   }
+  const preferredStatus = getTopologyStatusRank(existing.status) >= getTopologyStatusRank(normalized.status)
+    ? existing.status
+    : normalized.status
   nodeMap.set(normalized.id, {
     ...existing,
     ...normalized,
     name: normalized.name || existing.name,
     type: normalized.type || existing.type,
     role: existing.role === 'local_desktop' ? existing.role : normalized.role,
-    status: existing.status === 'online' ? existing.status : normalized.status,
-    statusLabel: existing.status === 'online' ? getTopologyStatusLabel('online') : normalized.statusLabel,
+    status: preferredStatus,
+    statusLabel: getTopologyStatusLabel(preferredStatus),
     lastSeen: Math.max(existing.lastSeen || 0, normalized.lastSeen || 0),
     lastIP: normalized.lastIP || existing.lastIP || '',
     routeMetric: normalized.routeMetric || existing.routeMetric || 0,
@@ -1619,6 +1738,8 @@ function addTopologyViewEdge(edgeMap, edge) {
     edgeMap.set(key, {
       ...existing,
       active: existing.active || edge.active === true,
+      partiallyActive: existing.partiallyActive || edge.partiallyActive === true,
+      routable: existing.routable === true || edge.routable === true,
       enabled: existing.enabled !== false && edge.enabled !== false,
       updatedAt: Math.max(existing.updatedAt || 0, edge.updatedAt || 0),
       metric: Math.min(existing.metric || edge.metric || 0, edge.metric || existing.metric || 0),
@@ -1633,6 +1754,8 @@ function addTopologyViewEdge(edgeMap, edge) {
     type: edge.type || 'sync',
     enabled: edge.enabled !== false,
     active: edge.active === true,
+    partiallyActive: edge.partiallyActive === true,
+    routable: edge.routable === true,
     authority: edge.authority || '',
     updatedAt: edge.updatedAt || 0,
     count: edge.count || 1
@@ -1755,10 +1878,13 @@ function renderTopologyEdge(edge, nodeMap) {
   const authority = getAuthorityLabel(edge.authority)
   const count = edge.count > 1 ? ` · ${edge.count} 次` : ''
   const metric = edge.metric ? ` · metric ${edge.metric}` : ''
-  const statusText = edge.active ? '活跃' : (edge.enabled ? '待连接' : '已停用')
+  const statusText = getTopologyEdgeStateLabel(edge)
+  const edgeState = getTopologyEdgeState(edge)
   const className = [
     'topology-edge',
-    edge.active ? 'active' : '',
+    `state-${edgeState}`,
+    edgeState === 'online' ? 'active' : '',
+    edgeState === 'partial' ? 'partial' : '',
     edge.enabled ? '' : 'disabled'
   ].filter(Boolean).join(' ')
 
@@ -1782,24 +1908,54 @@ function isPhoneNode(node) {
 }
 
 function sortTopologyNodes(a, b) {
-  return Number(b.status === 'online') - Number(a.status === 'online') ||
+  return getTopologyStatusSortRank(b.status) - getTopologyStatusSortRank(a.status) ||
     String(a.name || '').localeCompare(String(b.name || ''), 'zh-CN')
+}
+
+function getTopologyStatusSortRank(status) {
+  return ({
+    online: 5,
+    reachable: 4,
+    synced: 3,
+    discovered: 2,
+    offline: 1,
+    disabled: 0,
+    revoked: -1
+  }[status] || 0)
+}
+
+function getTopologyStatusRank(status) {
+  return ({
+    revoked: 7,
+    disabled: 6,
+    online: 5,
+    reachable: 4,
+    synced: 3,
+    discovered: 2,
+    offline: 1
+  }[status] || 0)
 }
 
 function getTopologyStatusLabel(status) {
   return {
     online: '在线',
+    reachable: '可路由',
     offline: '离线',
     disabled: '已禁用',
-    revoked: '已撤销'
+    revoked: '已撤销',
+    discovered: '已发现',
+    synced: '已同步'
   }[status] || '未知'
 }
 
 function getTopologyNodeStatusLabel(node) {
   if (!node) return '未知'
   if (node.status === 'online') return '在线'
+  if (node.status === 'reachable') return node.lastSeen ? `可路由 · 上次同步 ${formatRelativeTime(node.lastSeen)}` : '可路由 · 未在线'
   if (node.status === 'disabled') return '已禁用'
   if (node.status === 'revoked') return '已撤销'
+  if (node.status === 'discovered') return '已发现 · 未配对'
+  if (node.status === 'synced') return node.lastSeen ? `已同步 ${formatRelativeTime(node.lastSeen)}` : '已同步'
   if (node.lastSeen) return `上次同步 ${formatRelativeTime(node.lastSeen)}`
   return '等待首次同步'
 }
@@ -2287,7 +2443,12 @@ function getContentTypeLabel(type) {
   return {
     sms: '验证码短信',
     sms_message: '普通短信',
-    app_notification: 'App 通知'
+    app_notification: 'App 通知',
+    clipboard: '剪贴板',
+    clipboard_text: '剪贴板文本',
+    clipboard_image: '剪贴板图片',
+    clipboard_file: '剪贴板文件',
+    file_transfer: '文件传输'
   }[type] || '消息'
 }
 
@@ -2371,6 +2532,15 @@ function formatFullTime(timestamp) {
   const time = new Date(timestamp)
   const pad = value => String(value).padStart(2, '0')
   return `${time.getFullYear()}-${pad(time.getMonth() + 1)}-${pad(time.getDate())} ${pad(time.getHours())}:${pad(time.getMinutes())}:${pad(time.getSeconds())}`
+}
+
+function formatBytesCompact(bytes) {
+  const value = Number(bytes || 0)
+  if (!Number.isFinite(value) || value <= 0) return ''
+  if (value < 1024) return `${value} B`
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`
+  if (value < 1024 * 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)} MB`
+  return `${(value / 1024 / 1024 / 1024).toFixed(1)} GB`
 }
 
 function hashString(text) {

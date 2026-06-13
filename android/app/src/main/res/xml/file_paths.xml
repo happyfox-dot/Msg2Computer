@@ -4,4 +4,6 @@
          经 FileProvider 暴露给系统安装器（external-files-path 对应该目录） -->
     <external-files-path name="update_downloads" path="Download/" />
     <files-path name="clipboard_images" path="clipboard_images/" />
+    <files-path name="outgoing_clipboard_images" path="outgoing_clipboard_images/" />
+    <files-path name="outgoing_files" path="outgoing_files/" />
 </paths>

@@ -7,7 +7,9 @@ import android.os.Bundle
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import com.codesync.service.WebSocketService
+import com.codesync.util.ClipboardHistoryStore
 import com.codesync.util.DeviceStore
+import com.codesync.util.PhoneIdentityStore
 import com.codesync.util.SettingsStore
 
 /**
@@ -47,6 +49,15 @@ class ClipboardSyncActivity : AppCompatActivity() {
         if (text.isBlank()) {
             Toast.makeText(this, R.string.clipboard_empty, Toast.LENGTH_SHORT).show()
             return
+        }
+        PhoneIdentityStore.get(this).let { identity ->
+            ClipboardHistoryStore.addText(
+                context = this,
+                text = text,
+                direction = "outgoing",
+                sourceDeviceId = identity.id,
+                sourceDeviceName = identity.name
+            )
         }
         // 不做「已同步就跳过」：磁贴是用户显式动作，语义是"把当前状态再推一遍"，
         // 用于补齐当时离线没收到的节点。内容未变时复用现有版本号（见

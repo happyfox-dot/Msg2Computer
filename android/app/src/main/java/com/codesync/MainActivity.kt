@@ -3,6 +3,7 @@ package com.codesync
 import android.Manifest
 import android.app.DownloadManager
 import android.content.BroadcastReceiver
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
@@ -16,6 +17,7 @@ import android.os.PowerManager
 import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import android.provider.Settings
+import android.service.notification.NotificationListenerService
 import android.text.InputType
 import android.view.Gravity
 import android.view.LayoutInflater
@@ -36,10 +38,13 @@ import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import com.codesync.databinding.ActivityMainBinding
 import com.codesync.service.NodeReceiverService
+import com.codesync.service.NotificationRelayService
 import com.codesync.service.WebSocketService
 import com.codesync.util.DesktopDevice
 import com.codesync.util.DeviceStore
 import com.codesync.util.ApkUpdater
+import com.codesync.util.ClipboardHistoryEntry
+import com.codesync.util.ClipboardHistoryStore
 import com.codesync.util.ClipboardSyncState
 import com.codesync.util.FileTransferCoordinator
 import com.codesync.util.FileTransferHistoryStore
@@ -82,6 +87,7 @@ import java.io.FileOutputStream
 class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
     private var totpUpdateJob: Job? = null
+    private var notificationRebindJob: Job? = null
     private var updatingForwardSwitch = false
     private var updatingMessagePolicySwitches = false
     private var discoveredLanNodes: List<LanDiscoveredDevice> = emptyList()
@@ -103,6 +109,17 @@ class MainActivity : AppCompatActivity() {
         val enabled: Boolean = true,
         val onClick: () -> Unit
     )
+
+    private enum class MainPage {
+        HOME,
+        MESSAGES,
+        CLIPBOARD,
+        DEVICES,
+        TOPOLOGY,
+        TOTP
+    }
+
+    private var currentMainPage = MainPage.HOME
 
     // 相册图片选择器
     private val pickImageLauncher = registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
@@ -184,6 +201,7 @@ class MainActivity : AppCompatActivity() {
         // 按需模型：启动时不再建立常驻连接，仅展示当前空闲状态
         refreshConnectionSnapshot()
         startTotpUpdates()
+        ensureNotificationRelayBound()
 
         // 下载完成广播跟随 Activity 生命周期注册（下载期间退到后台仍可收到，
         // 进程被杀则由用户重新点「检查更新」续流程）。
@@ -236,9 +254,11 @@ class MainActivity : AppCompatActivity() {
         super.onResume()
         refreshDeviceList()
         rebuildTopologyList()
+        renderClipboardHistory()
         syncForwardSwitch()
         syncMessagePolicySwitches()
         refreshConnectionSnapshot()
+        ensureNotificationRelayBound()
 
         // 从「安装未知应用」设置页返回：已授权则继续下载，未授权则明确告知已取消
         // （原先静默放弃，用户以为没反应；现在给一条 toast 引导重试）
@@ -356,6 +376,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupUI() {
+        setupPageNavigation()
+
         binding.btnScanQR.setOnClickListener {
             startActivity(Intent(this, QRScannerActivity::class.java))
         }
@@ -391,6 +413,13 @@ class MainActivity : AppCompatActivity() {
         binding.btnCheckUpdate.setOnClickListener {
             checkForAppUpdate(manual = true)
         }
+        binding.btnHomeSyncClipboard.setOnClickListener {
+            showMainPage(MainPage.CLIPBOARD)
+            sendCurrentClipboard()
+        }
+        binding.btnRefreshClipboardHistory.setOnClickListener {
+            renderClipboardHistory()
+        }
 
         syncForwardSwitch()
         binding.switchAutoSync.setOnCheckedChangeListener { _, isChecked ->
@@ -412,6 +441,57 @@ class MainActivity : AppCompatActivity() {
         }
 
         setupMessagePolicyControls()
+        renderClipboardHistory()
+    }
+
+    private fun setupPageNavigation() {
+        binding.btnPageHome.setOnClickListener { showMainPage(MainPage.HOME) }
+        binding.btnPageMessages.setOnClickListener { showMainPage(MainPage.MESSAGES) }
+        binding.btnPageClipboard.setOnClickListener { showMainPage(MainPage.CLIPBOARD) }
+        binding.btnPageDevices.setOnClickListener { showMainPage(MainPage.DEVICES) }
+        binding.btnPageTopology.setOnClickListener { showMainPage(MainPage.TOPOLOGY) }
+        binding.btnPageTotp.setOnClickListener { showMainPage(MainPage.TOTP) }
+        showMainPage(MainPage.HOME)
+    }
+
+    private fun showMainPage(page: MainPage) {
+        currentMainPage = page
+        val pages = listOf(
+            MainPage.HOME to binding.pageHome,
+            MainPage.MESSAGES to binding.pageMessages,
+            MainPage.CLIPBOARD to binding.pageClipboard,
+            MainPage.DEVICES to binding.pageDevices,
+            MainPage.TOPOLOGY to binding.pageTopology,
+            MainPage.TOTP to binding.pageTotp
+        )
+        pages.forEach { (itemPage, view) ->
+            view.visibility = if (itemPage == page) View.VISIBLE else View.GONE
+        }
+        val buttons = listOf(
+            MainPage.HOME to binding.btnPageHome,
+            MainPage.MESSAGES to binding.btnPageMessages,
+            MainPage.CLIPBOARD to binding.btnPageClipboard,
+            MainPage.DEVICES to binding.btnPageDevices,
+            MainPage.TOPOLOGY to binding.btnPageTopology,
+            MainPage.TOTP to binding.btnPageTotp
+        )
+        val activeBg = ContextCompat.getColor(this, R.color.primary_container)
+        val idleBg = ContextCompat.getColor(this, R.color.bg_surface_variant)
+        val activeText = ContextCompat.getColor(this, R.color.text_primary)
+        val idleText = ContextCompat.getColor(this, R.color.text_secondary)
+        buttons.forEach { (itemPage, button) ->
+            val active = itemPage == page
+            button.backgroundTintList = ColorStateList.valueOf(if (active) activeBg else idleBg)
+            button.setTextColor(if (active) activeText else idleText)
+            button.strokeWidth = if (active) 1.dp() else 0
+        }
+        when (page) {
+            MainPage.CLIPBOARD -> renderClipboardHistory()
+            MainPage.DEVICES -> refreshDeviceList()
+            MainPage.TOPOLOGY -> rebuildTopologyList()
+            MainPage.TOTP -> rebuildTotpList()
+            else -> Unit
+        }
     }
 
     // ====== 应用内更新（GitHub Releases 侧载更新）======
@@ -570,6 +650,7 @@ class MainActivity : AppCompatActivity() {
         binding.switchSendNotifications.setOnCheckedChangeListener { _, isChecked ->
             if (updatingMessagePolicySwitches) return@setOnCheckedChangeListener
             SettingsStore.setSendNotificationsEnabled(this, isChecked)
+            if (isChecked) ensureNotificationRelayBound()
             showMessagePolicySaved()
         }
         binding.switchReceiveSmsCodes.setOnCheckedChangeListener { _, isChecked ->
@@ -644,10 +725,20 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, R.string.clipboard_empty, Toast.LENGTH_SHORT).show()
             return
         }
+        PhoneIdentityStore.get(this).let { identity ->
+            ClipboardHistoryStore.addText(
+                context = this,
+                text = text,
+                direction = "outgoing",
+                sourceDeviceId = identity.id,
+                sourceDeviceName = identity.name
+            )
+        }
         startServiceForAction(WebSocketService.ACTION_SEND_CLIPBOARD) {
             putExtra(WebSocketService.EXTRA_MESSAGE_BODY, text)
         }
         Toast.makeText(this, R.string.clipboard_sent, Toast.LENGTH_SHORT).show()
+        renderClipboardHistory()
         refreshConnectionSnapshot()
     }
 
@@ -665,6 +756,19 @@ class MainActivity : AppCompatActivity() {
                 runCatching { prepareClipboardImagePng(uri) }
             }
             prepared.onSuccess { file ->
+                PhoneIdentityStore.get(this@MainActivity).let { identity ->
+                    ClipboardHistoryStore.addFile(
+                        context = this@MainActivity,
+                        kind = "image",
+                        direction = "outgoing",
+                        title = file.name,
+                        path = file.absolutePath,
+                        mime = "image/png",
+                        size = file.length(),
+                        sourceDeviceId = identity.id,
+                        sourceDeviceName = identity.name
+                    )
+                }
                 startServiceForAction(WebSocketService.ACTION_SEND_FILE) {
                     putExtra(WebSocketService.EXTRA_CONTENT_TYPE, "clipboard_image")
                     putExtra(WebSocketService.EXTRA_FILE_PATH, file.absolutePath)
@@ -672,6 +776,7 @@ class MainActivity : AppCompatActivity() {
                     putExtra(WebSocketService.EXTRA_FILE_MIME, "image/png")
                 }
                 Toast.makeText(this@MainActivity, "图片剪贴板已发送", Toast.LENGTH_SHORT).show()
+                renderClipboardHistory()
                 refreshConnectionSnapshot()
             }.onFailure { error ->
                 Toast.makeText(
@@ -814,6 +919,129 @@ class MainActivity : AppCompatActivity() {
         dialog.show()
     }
 
+    private fun renderClipboardHistory() {
+        val container = binding.clipboardHistoryList
+        container.removeAllViews()
+        val history = ClipboardHistoryStore.get(this)
+        if (history.isEmpty()) {
+            container.addView(TextView(this).apply {
+                text = getString(R.string.clipboard_history_empty)
+                setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_secondary))
+                textSize = 13f
+                gravity = Gravity.CENTER
+                setPadding(0, 18.dp(), 0, 8.dp())
+            })
+            return
+        }
+
+        history.take(50).forEach { item ->
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setBackgroundResource(R.drawable.bg_row)
+                setPadding(12.dp(), 10.dp(), 12.dp(), 10.dp())
+                alpha = if (item.exists) 1f else 0.58f
+                isClickable = true
+                setOnClickListener { showClipboardHistoryDetail(item) }
+            }
+            row.addView(TextView(this).apply {
+                text = "${clipboardKindLabel(item.kind)} · ${clipboardDirectionLabel(item.direction)}"
+                setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_primary))
+                textSize = 14f
+                setTypeface(typeface, android.graphics.Typeface.BOLD)
+            })
+            row.addView(TextView(this).apply {
+                text = clipboardHistoryPreview(item)
+                setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_secondary))
+                textSize = 12f
+                maxLines = 2
+                setPadding(0, 4.dp(), 0, 0)
+            })
+            row.addView(TextView(this).apply {
+                val time = if (item.createdAt > 0L) {
+                    SimpleDateFormat("MM-dd HH:mm", Locale.getDefault()).format(Date(item.createdAt))
+                } else {
+                    ""
+                }
+                text = listOf(
+                    item.sourceDeviceName,
+                    if (item.kind == "text") "${item.text.length} 字" else formatFileSize(item.size),
+                    time,
+                    if (item.exists) "" else "文件已移动或删除"
+                ).filter { it.isNotBlank() }.joinToString(" · ")
+                setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_tertiary))
+                textSize = 11f
+                setPadding(0, 4.dp(), 0, 0)
+            })
+            container.addView(row, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                bottomMargin = 8.dp()
+            })
+        }
+    }
+
+    private fun showClipboardHistoryDetail(item: ClipboardHistoryEntry) {
+        val (dialog, content) = createBottomSheet(getString(R.string.clipboard_history_detail))
+        val detail = buildList {
+            add("类型：${clipboardKindLabel(item.kind)}")
+            add("方向：${clipboardDirectionLabel(item.direction)}")
+            add("来源：${item.sourceDeviceName}")
+            add("时间：${formatFullSyncTime(item.createdAt)}")
+            if (item.kind == "text") {
+                add("长度：${item.text.length} 字")
+                add("")
+                add(item.text)
+            } else {
+                add("大小：${formatFileSize(item.size)}")
+                add("MIME：${item.mime.ifBlank { "未知" }}")
+                add("路径：${item.path}")
+                if (!item.exists) add("状态：文件已移动或删除")
+            }
+        }.joinToString("\n")
+        content.addView(TextView(this).apply {
+            text = detail
+            setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_secondary))
+            textSize = 13f
+            setPadding(0, 12.dp(), 0, 4.dp())
+        })
+        if (item.kind == "text") {
+            addSheetButton(content, getString(R.string.copy)) {
+                copyToClipboard(item.text)
+                dialog.dismiss()
+            }
+        } else if (item.exists) {
+            addSheetButton(content, "打开") {
+                openReceivedFile(item.path, item.mime)
+                dialog.dismiss()
+            }
+        }
+        addSheetButton(content, getString(android.R.string.ok), outlined = true) {
+            dialog.dismiss()
+        }
+        dialog.show()
+    }
+
+    private fun clipboardKindLabel(kind: String): String = when (kind) {
+        "image" -> "图片"
+        "file" -> "文件"
+        else -> "文本"
+    }
+
+    private fun clipboardDirectionLabel(direction: String): String =
+        if (direction == "outgoing") getString(R.string.clipboard_history_outgoing)
+        else getString(R.string.clipboard_history_incoming)
+
+    private fun clipboardHistoryPreview(item: ClipboardHistoryEntry): String {
+        if (item.kind == "text") {
+            return item.text
+                .replace('\n', ' ')
+                .replace('\r', ' ')
+                .take(140)
+        }
+        return listOf(item.title, item.path).filter { it.isNotBlank() }.joinToString("\n")
+    }
+
     private fun openReceivedFile(path: String, mime: String) {
         val file = File(path)
         if (!file.exists()) {
@@ -841,6 +1069,19 @@ class MainActivity : AppCompatActivity() {
                 val name = queryDisplayName(uri).ifBlank { file.name }
                 val mime = contentResolver.getType(uri).orEmpty()
                     .ifBlank { FileTransferRegistry.guessMime(name) }
+                PhoneIdentityStore.get(this@MainActivity).let { identity ->
+                    ClipboardHistoryStore.addFile(
+                        context = this@MainActivity,
+                        kind = "file",
+                        direction = "outgoing",
+                        title = name,
+                        path = file.absolutePath,
+                        mime = mime,
+                        size = file.length(),
+                        sourceDeviceId = identity.id,
+                        sourceDeviceName = identity.name
+                    )
+                }
                 startNodeReceiverService()
                 startServiceForAction(WebSocketService.ACTION_SEND_FILE) {
                     putExtra(WebSocketService.EXTRA_FILE_PATH, file.absolutePath)
@@ -860,6 +1101,7 @@ class MainActivity : AppCompatActivity() {
                     getString(R.string.file_transfer_started, name),
                     Toast.LENGTH_LONG
                 ).show()
+                renderClipboardHistory()
                 refreshConnectionSnapshot()
             }.onFailure { error ->
                 Toast.makeText(
@@ -892,8 +1134,20 @@ class MainActivity : AppCompatActivity() {
                     return@onSuccess
                 }
                 val batchId = "batch-${java.util.UUID.randomUUID()}"
+                val identity = PhoneIdentityStore.get(this@MainActivity)
                 startNodeReceiverService()
                 result.files.forEach { item ->
+                    ClipboardHistoryStore.addFile(
+                        context = this@MainActivity,
+                        kind = "file",
+                        direction = "outgoing",
+                        title = item.name,
+                        path = item.file.absolutePath,
+                        mime = item.mime,
+                        size = item.file.length(),
+                        sourceDeviceId = identity.id,
+                        sourceDeviceName = identity.name
+                    )
                     startServiceForAction(WebSocketService.ACTION_SEND_FILE) {
                         putExtra(WebSocketService.EXTRA_FILE_PATH, item.file.absolutePath)
                         putExtra(WebSocketService.EXTRA_FILE_NAME, item.name)
@@ -913,6 +1167,7 @@ class MainActivity : AppCompatActivity() {
                     "正在发送文件夹（${result.files.size} 个文件$skippedText）",
                     Toast.LENGTH_LONG
                 ).show()
+                renderClipboardHistory()
                 refreshConnectionSnapshot()
             }.onFailure { error ->
                 Toast.makeText(
@@ -1067,6 +1322,33 @@ class MainActivity : AppCompatActivity() {
         updatingMessagePolicySwitches = false
     }
 
+    private fun ensureNotificationRelayBound() {
+        if (!SettingsStore.isSendNotificationsEnabled(this)) return
+        val component = ComponentName(this, NotificationRelayService::class.java)
+        if (!isNotificationListenerEnabled(component)) return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            notificationRebindJob?.cancel()
+            notificationRebindJob = lifecycleScope.launch {
+                listOf(0L, 1_500L, 5_000L).forEach { delayMs ->
+                    if (delayMs > 0) delay(delayMs)
+                    runCatching { NotificationListenerService.requestRebind(component) }
+                }
+            }
+        }
+    }
+
+    private fun isNotificationListenerEnabled(component: ComponentName): Boolean {
+        val enabled = Settings.Secure.getString(
+            contentResolver,
+            "enabled_notification_listeners"
+        ).orEmpty()
+        return enabled.split(':').any { value ->
+            val enabledComponent = ComponentName.unflattenFromString(value) ?: return@any false
+            enabledComponent.packageName == component.packageName &&
+                enabledComponent.className == component.className
+        }
+    }
+
     private fun showMessagePolicySaved() {
         Toast.makeText(this, R.string.message_policy_saved, Toast.LENGTH_SHORT).show()
         refreshConnectionSnapshot()
@@ -1141,14 +1423,14 @@ class MainActivity : AppCompatActivity() {
             add("内容: ${deviceContentPolicySummary(device)}")
             add(getString(R.string.last_sync_time, formatRelativeSyncTime(device.lastSyncAt)))
         }.joinToString(" · ")
-        tintDot(dot, device.enabled)
+        tintDot(dot, isDeviceOnline(device))
 
         switch.setOnCheckedChangeListener(null)
         switch.isChecked = device.enabled
         switch.setOnCheckedChangeListener { _, checked ->
             DeviceStore.setDeviceEnabled(this, device.id, checked)
             TopologyStore.markDeviceState(this, device.copy(enabled = checked), enabled = checked)
-            tintDot(dot, checked)
+            tintDot(dot, checked && WebSocketService.connectedDeviceIds.contains(device.id))
             rebuildTopologyList()
             broadcastTopologyChange(if (checked) "device_enabled" else "device_disabled")
             if (checked) {
@@ -1172,6 +1454,7 @@ class MainActivity : AppCompatActivity() {
     /** 设备节点完整详情（地址 / Tailscale / 路由 / 同步时间），点设备行弹出。 */
     private fun showDeviceDetailSheet(device: DesktopDevice) {
         val state = if (device.enabled) getString(R.string.push_enabled) else getString(R.string.push_disabled)
+        val connectionState = getTopologyDeviceStateLabel(device)
         val tailscaleHosts = (listOf(device.host) + device.altHosts)
             .filter { LanDiscovery.isTailscaleAddress(it) }
         val viaOtherNode = device.routeNextHopId.isNotBlank() && device.routeNextHopId != device.id
@@ -1191,6 +1474,7 @@ class MainActivity : AppCompatActivity() {
             )
             if (device.routePath.size > 2) add("路径：${device.routePath.joinToString(" → ")}")
             add("状态：$state")
+            add("连接：$connectionState")
             add("推送内容：${deviceContentPolicySummary(device)}")
             add("上次同步：${formatFullSyncTime(device.lastSyncAt)}")
             add("提示：长按列表项可移除该设备")
@@ -1280,6 +1564,26 @@ class MainActivity : AppCompatActivity() {
         dot.backgroundTintList = ColorStateList.valueOf(color)
     }
 
+    private fun isDeviceOnline(device: DesktopDevice): Boolean =
+        WebSocketService.connectedDeviceIds.contains(device.id)
+
+    private fun isDeviceRoutableCandidate(device: DesktopDevice): Boolean =
+        device.enabled && device.host.isNotBlank() && device.pairingKey.isNotBlank()
+
+    private fun getTopologyDeviceStatus(device: DesktopDevice): String = when {
+        !device.enabled -> "disabled"
+        isDeviceOnline(device) -> "online"
+        isDeviceRoutableCandidate(device) -> "reachable"
+        else -> "offline"
+    }
+
+    private fun getTopologyDeviceStateLabel(device: DesktopDevice): String = when (getTopologyDeviceStatus(device)) {
+        "online" -> "在线连接"
+        "reachable" -> "可路由，未在线"
+        "disabled" -> getString(R.string.push_disabled)
+        else -> "离线"
+    }
+
     private fun rebuildTopologyList() {
         val container = binding.topologyList
         container.removeAllViews()
@@ -1320,6 +1624,8 @@ class MainActivity : AppCompatActivity() {
         devices.forEach { device ->
             // 路由信息（由桌面节点 SPF 计算后下发）：直连显示地址，多跳显示下一跳
             val viaOtherNode = device.routeNextHopId.isNotBlank() && device.routeNextHopId != device.id
+            val deviceStatus = getTopologyDeviceStatus(device)
+            val deviceStateLabel = getTopologyDeviceStateLabel(device)
             val tsTag = if (
                 LanDiscovery.isTailscaleAddress(device.host) ||
                 device.altHosts.any { LanDiscovery.isTailscaleAddress(it) }
@@ -1329,10 +1635,10 @@ class MainActivity : AppCompatActivity() {
                     id = device.id,
                     name = device.name,
                     type = device.type,
-                    status = if (device.enabled) "enabled" else "disabled",
+                    status = deviceStatus,
                     meta = when {
-                        viaOtherNode -> "经 ${device.routeNextHopName.ifBlank { "中继节点" }}$tsTag"
-                        else -> device.host + tsTag
+                        viaOtherNode -> "经 ${device.routeNextHopName.ifBlank { "中继节点" }}$tsTag · $deviceStateLabel"
+                        else -> device.host + tsTag + " · " + deviceStateLabel
                     }
                 )
             )
@@ -1345,8 +1651,12 @@ class MainActivity : AppCompatActivity() {
                         device.routeMetric > 0 -> "SPF 路由"
                         else -> "推送"
                     },
-                    active = device.enabled,
-                    kind = if (viaOtherNode) "relay" else "push",
+                    active = deviceStatus == "online",
+                    kind = when {
+                        deviceStatus == "reachable" -> "route"
+                        viaOtherNode -> "relay"
+                        else -> "push"
+                    },
                     metric = device.routeMetric
                 )
             )
@@ -1373,7 +1683,7 @@ class MainActivity : AppCompatActivity() {
                             from = nodeId,
                             to = phone.id,
                             label = "TOTP 同步",
-                            active = true,
+                            active = false,
                             kind = "totp"
                         )
                     )
@@ -1418,6 +1728,7 @@ class MainActivity : AppCompatActivity() {
 
         devices.forEach { device ->
             val state = if (device.enabled) getString(R.string.push_enabled) else getString(R.string.push_disabled)
+            val connectionState = getTopologyDeviceStateLabel(device)
             val lastSync = formatRelativeSyncTime(device.lastSyncAt)
             val routeLine = when {
                 device.routeNextHopId.isNotBlank() && device.routeNextHopId != device.id ->
@@ -1431,7 +1742,7 @@ class MainActivity : AppCompatActivity() {
             container.addView(
                 createTopologyRow(
                     title = "${deviceIcon("ANDROID_PHONE")} ${phone.name}  --  ${deviceIcon(device.type)} ${device.name}",
-                    meta = "${getString(R.string.topology_push_edge)} · $state · ${getString(R.string.status_last_sync, lastSync)}",
+                    meta = "${getString(R.string.topology_push_edge)} · $state · $connectionState · ${getString(R.string.status_last_sync, lastSync)}",
                     detail = buildList {
                         add("来源：${phone.name}")
                         add("目标：${device.name}")
@@ -1447,6 +1758,7 @@ class MainActivity : AppCompatActivity() {
                             add("路径：${device.routePath.joinToString(" → ")}")
                         }
                         add("状态：$state")
+                        add("连接：$connectionState")
                         add("推送内容：${deviceContentPolicySummary(device)}")
                         add("上次同步：${formatFullSyncTime(device.lastSyncAt)}")
                         add("权限：来源手机控制推送范围")
@@ -2704,6 +3016,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        notificationRebindJob?.cancel()
         totpUpdateJob?.cancel()
         runCatching { unregisterReceiver(downloadCompleteReceiver) }
         runCatching { unregisterReceiver(lanJoinReceiver) }

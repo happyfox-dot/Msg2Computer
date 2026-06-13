@@ -1,6 +1,7 @@
 package com.codesync.service
 
 import android.app.Notification
+import android.content.ComponentName
 import android.content.Intent
 import android.os.Build
 import android.service.notification.NotificationListenerService
@@ -19,12 +20,35 @@ class NotificationRelayService : NotificationListenerService() {
 
     private val recentNotifications = LinkedHashMap<String, Long>()
 
+    override fun onListenerConnected() {
+        super.onListenerConnected()
+        Log.i(TAG, "通知监听服务已连接")
+        WebSocketService.reportExternalStatus(this, "通知监听服务已连接")
+    }
+
+    override fun onListenerDisconnected() {
+        super.onListenerDisconnected()
+        Log.w(TAG, "通知监听服务已断开，尝试重新绑定")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            runCatching {
+                NotificationListenerService.requestRebind(
+                    ComponentName(this, NotificationRelayService::class.java)
+                )
+            }
+        }
+    }
+
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
         sbn ?: return
-        if (!SettingsStore.isSendNotificationsEnabled(this)) return
+        if (!SettingsStore.isSendNotificationsEnabled(this)) {
+            Log.d(TAG, "通知推送总开关关闭，跳过 package=${sbn.packageName}")
+            return
+        }
         if (sbn.packageName == packageName) return
         if (sbn.isOngoing) return
-        if (DeviceStore.getEnabledDevices(this).none { it.allowNotifications }) {
+        val targets = DeviceStore.getEnabledDevices(this).filter { it.allowNotifications }
+        if (targets.isEmpty()) {
+            Log.d(TAG, "收到通知但没有允许 App 通知的目标，package=${sbn.packageName}")
             WebSocketService.reportExternalStatus(this, "收到通知，但没有启用“应用通知”的推送目标")
             return
         }
@@ -32,12 +56,20 @@ class NotificationRelayService : NotificationListenerService() {
         val notification = sbn.notification ?: return
         val title = extractText(notification, Notification.EXTRA_TITLE)
         val text = extractNotificationBody(notification)
-        if (title.isBlank() && text.isBlank()) return
+        if (title.isBlank() && text.isBlank()) {
+            Log.d(TAG, "通知标题和正文为空，跳过 package=${sbn.packageName}")
+            return
+        }
 
         val appName = resolveAppName(sbn.packageName)
         val body = text.ifBlank { title }.take(MAX_BODY_LENGTH)
         val dedupeKey = "${sbn.packageName}|${title}|${body}"
-        if (isRecentDuplicate(dedupeKey)) return
+        if (isRecentDuplicate(dedupeKey)) {
+            Log.d(TAG, "通知短时间重复，跳过 package=${sbn.packageName}")
+            return
+        }
+
+        Log.d(TAG, "收到通知，准备推送 package=${sbn.packageName}, targets=${targets.size}")
 
         val intent = Intent(this, WebSocketService::class.java).apply {
             action = WebSocketService.ACTION_SEND_NOTIFICATION

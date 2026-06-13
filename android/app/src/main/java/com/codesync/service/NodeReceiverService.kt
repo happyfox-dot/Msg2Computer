@@ -19,6 +19,7 @@ import androidx.core.content.FileProvider
 import androidx.core.app.NotificationCompat
 import com.codesync.MainActivity
 import com.codesync.R
+import com.codesync.util.ClipboardHistoryStore
 import com.codesync.util.ClipboardSyncState
 import com.codesync.util.ContentBus
 import com.codesync.util.CryptoUtil
@@ -64,7 +65,7 @@ class NodeReceiverService : Service() {
         private const val CHANNEL_ID = "code_sync_node_receiver"
         private const val MAX_BODY_BYTES = 512 * 1024
         private const val MAX_INLINE_CLIPBOARD_IMAGE_BYTES = 180 * 1024
-        private const val FILE_TRANSFER_CHUNK_BYTES = 1024 * 1024
+        private const val FILE_TRANSFER_CHUNK_BYTES = 4 * 1024 * 1024
         private const val FILE_TRANSFER_TIMEOUT_MS = 20_000
         private const val RECENT_IDS_LIMIT = 200
         private const val PREFS_NAME = "node_relay_dedup"
@@ -207,7 +208,8 @@ class NodeReceiverService : Service() {
             toRaw = request.query["to"],
             senderId = request.query["senderId"],
             nonce = request.query["nonce"],
-            authToken = request.query["authToken"]
+            authToken = request.query["authToken"],
+            chunkEncoding = request.query["chunkEncoding"]
         )
         if (result.status == 206 && result.body != null) {
             writeBinaryHttpResponse(
@@ -247,7 +249,7 @@ class NodeReceiverService : Service() {
             return
         }
         val requesterId = request.query["senderId"].orEmpty()
-        val baseQuery = listOf("from", "to", "senderId", "nonce", "authToken")
+        val baseQuery = listOf("from", "to", "senderId", "nonce", "authToken", "chunkEncoding")
             .mapNotNull { key -> request.query[key]?.let { "$key=${urlEncode(it)}" } }
             .joinToString("&")
         val origin = DeviceStore.findDevice(this, originId)
@@ -957,6 +959,7 @@ class NodeReceiverService : Service() {
         }
         val chunkSize = manifest.optLong("chunkSize", FILE_TRANSFER_CHUNK_BYTES.toLong())
             .coerceIn(1L, FILE_TRANSFER_CHUNK_BYTES.toLong())
+        val usePlainChunks = jsonArrayToList(manifest.optJSONArray("chunkEncodings")).contains("none")
         val name = sanitizeFileName(manifest.optString("name").ifBlank { "file" })
         val mime = manifest.optString("mime", "application/octet-stream").ifBlank { "application/octet-stream" }
         val expectedHash = manifest.optString("sha256").lowercase(Locale.ROOT)
@@ -1012,10 +1015,12 @@ class NodeReceiverService : Service() {
                             transferKey,
                             "${identity.id}|$nonce|$fileId|$offset-$to"
                         )
+                        val encodingQuery = if (usePlainChunks) "&chunkEncoding=none" else ""
                         val query = "from=$offset&to=$to" +
                             "&senderId=${urlEncode(identity.id)}" +
                             "&nonce=${urlEncode(nonce)}" +
-                            "&authToken=${urlEncode(authToken)}"
+                            "&authToken=${urlEncode(authToken)}" +
+                            encodingQuery
                         val url = if (label.startsWith("direct")) "$urlBase?$query" else "$urlBase?$query&hop=3"
                         encrypted = runCatching { httpGetBytes(url) }.getOrNull()
                         if (encrypted != null) break
@@ -1025,7 +1030,7 @@ class NodeReceiverService : Service() {
                     if (encrypted == null) {
                         throw IllegalStateException("分片拉取失败（所有通道均不可达）@$offset")
                     }
-                    val plain = CryptoUtil.decryptBytes(encrypted, transferKey)
+                    val plain = if (usePlainChunks) encrypted else CryptoUtil.decryptBytes(encrypted, transferKey)
                     val expectedLen = (to - offset + 1).toInt()
                     if (plain.size != expectedLen) {
                         throw IllegalStateException("chunk length mismatch expected=$expectedLen got=${plain.size}")
@@ -1238,6 +1243,16 @@ class NodeReceiverService : Service() {
         }
         writeClipboard(text)
         ClipboardSyncState.remember(this, ts, origin, text)
+        ClipboardHistoryStore.addText(
+            context = this,
+            text = text,
+            direction = "incoming",
+            sourceDeviceId = origin,
+            sourceDeviceName = payload.optString("originDeviceName")
+                .ifBlank { payload.optString("sourceDeviceName") }
+                .ifBlank { origin.ifBlank { "未知设备" } },
+            createdAt = ts
+        )
         return true
     }
 
@@ -1263,8 +1278,9 @@ class NodeReceiverService : Service() {
         val bytes = runCatching { received.file.readBytes() }.getOrNull()
         runCatching { received.file.delete() }
         if (bytes == null || bytes.isEmpty()) return false
-        if (!writeClipboardImage(bytes, ts, shortHash)) return false
+        val clipboardFile = writeClipboardImage(bytes, ts, shortHash) ?: return false
         rememberClipboardImageVersion(ts, origin, shortHash)
+        rememberClipboardImageHistory(payload, clipboardFile, bytes.size.toLong(), ts, origin)
         return true
     }
 
@@ -1294,12 +1310,13 @@ class NodeReceiverService : Service() {
         val origin = version?.optString("origin").orEmpty()
             .ifBlank { payload.optString("originDeviceId", payload.optString("sourceDeviceId")) }
         if (!isNewerClipboardImageVersion(ts, origin, shortHash)) return false
-        if (!writeClipboardImage(bytes, ts, shortHash)) return false
+        val clipboardFile = writeClipboardImage(bytes, ts, shortHash) ?: return false
         rememberClipboardImageVersion(ts, origin, shortHash)
+        rememberClipboardImageHistory(payload, clipboardFile, bytes.size.toLong(), ts, origin)
         return true
     }
 
-    private fun writeClipboardImage(bytes: ByteArray, ts: Long, shortHash: String): Boolean {
+    private fun writeClipboardImage(bytes: ByteArray, ts: Long, shortHash: String): File? {
         return runCatching {
             val dir = File(filesDir, "clipboard_images").apply { mkdirs() }
             val file = File(dir, "clipboard-${ts.takeIf { it > 0L } ?: System.currentTimeMillis()}-$shortHash.png")
@@ -1315,10 +1332,34 @@ class NodeReceiverService : Service() {
                 ClipData.Item(uri)
             )
             clipboard.setPrimaryClip(clip)
-            true
+            file
         }.onFailure {
             Log.w(TAG, "写入图片剪贴板失败: ${it.message}")
-        }.getOrDefault(false)
+        }.getOrNull()
+    }
+
+    private fun rememberClipboardImageHistory(
+        payload: JSONObject,
+        file: File,
+        size: Long,
+        ts: Long,
+        origin: String
+    ) {
+        ClipboardHistoryStore.addFile(
+            context = this,
+            kind = "image",
+            direction = "incoming",
+            title = payload.optJSONObject("fileManifest")?.optString("name").orEmpty()
+                .ifBlank { "剪贴板图片" },
+            path = file.absolutePath,
+            mime = "image/png",
+            size = size,
+            sourceDeviceId = origin,
+            sourceDeviceName = payload.optString("originDeviceName")
+                .ifBlank { payload.optString("sourceDeviceName") }
+                .ifBlank { origin.ifBlank { "未知设备" } },
+            createdAt = ts.takeIf { it > 0L } ?: System.currentTimeMillis()
+        )
     }
 
     private fun isNewerClipboardImageVersion(ts: Long, origin: String, hash: String): Boolean {

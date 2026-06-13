@@ -20,7 +20,7 @@ const fs = require('fs')
 const path = require('path')
 const crypto = require('crypto')
 
-const DEFAULT_CHUNK_BYTES = 1024 * 1024 // 1MB
+const DEFAULT_CHUNK_BYTES = 4 * 1024 * 1024 // 4MB
 const DEFAULT_OFFER_TTL_MS = 30 * 60 * 1000 // offer 30 分钟过期
 const NONCE_TTL_MS = 5 * 60 * 1000
 const NONCE_LIMIT = 500
@@ -215,7 +215,8 @@ function createFileTransfer(deps = {}) {
       sha256,
       chunkSize,
       expiresAt,
-      targetDeviceIds: new Set(targets)
+      targetDeviceIds: new Set(targets),
+      chunkEncodings: new Set(['none', 'aes-gcm'])
     })
 
     const sourceHost = String(options.sourceHost || payloadExtra.sourceHost || '').trim()
@@ -233,7 +234,8 @@ function createFileTransfer(deps = {}) {
       chunkSize,
       originDeviceId: identity.id,
       expiresAt,
-      inline: false
+      inline: false,
+      chunkEncodings: ['none', 'aes-gcm']
     }
     if (sourceHost) manifest.host = sourceHost
     if (sourceTsHost) manifest.tsHost = sourceTsHost
@@ -277,7 +279,7 @@ function createFileTransfer(deps = {}) {
 
   // serveFileChunk：HTTP server 调用，校验鉴权后返回加密分片 Buffer。
   // 返回 { status, body?:Buffer, contentRange?:string, totalSize?:number }
-  async function serveFileChunk({ fileId, from, to, senderId, nonce, authToken }) {
+  async function serveFileChunk({ fileId, from, to, senderId, nonce, authToken, chunkEncoding = 'aes-gcm' }) {
     pruneExpired()
     const transfer = outgoingTransfers.get(String(fileId || ''))
     if (!transfer) return { status: 404 }
@@ -313,11 +315,12 @@ function createFileTransfer(deps = {}) {
       onError({ phase: 'serve', fileId, error: e.message })
       return { status: 500 }
     }
-    const encrypted = encryptBytes(plainSlice, peerKey)
-    if (!encrypted) return { status: 500 }
+    const usePlainChunk = chunkEncoding === 'none' && transfer.chunkEncodings?.has('none')
+    const body = usePlainChunk ? plainSlice : encryptBytes(plainSlice, peerKey)
+    if (!body) return { status: 500 }
     return {
       status: 206,
-      body: encrypted,
+      body,
       contentRange: `bytes ${fromN}-${clampedTo}/${transfer.size}`,
       totalSize: transfer.size
     }
@@ -369,6 +372,7 @@ function createFileTransfer(deps = {}) {
 
     const identity = getIdentity()
     const name = sanitizeFileName(manifest.name)
+    const usePlainChunks = Array.isArray(manifest.chunkEncodings) && manifest.chunkEncodings.includes('none')
     const tmpPath = path.join(tmpDir, `${fileId}.part`)
     try {
       fs.mkdirSync(tmpDir, { recursive: true })
@@ -425,7 +429,8 @@ function createFileTransfer(deps = {}) {
               `from=${offset}&to=${to}` +
               `&senderId=${encodeURIComponent(identity.id)}` +
               `&nonce=${encodeURIComponent(nonce)}` +
-              `&authToken=${encodeURIComponent(authToken)}`
+              `&authToken=${encodeURIComponent(authToken)}` +
+              (usePlainChunks ? '&chunkEncoding=none' : '')
             const reqPath = transport.kind === 'direct'
               ? `/file/${fileIdEnc}?${query}`
               : `/file/proxy/${originIdEnc}/${fileIdEnc}?${query}&hop=3`
@@ -444,7 +449,7 @@ function createFileTransfer(deps = {}) {
         if (!resp) {
           throw new Error(`分片拉取失败（所有通道均不可达）@${offset}`)
         }
-        const plain = decryptBytes(resp.body, source.pairingKey)
+        const plain = usePlainChunks ? resp.body : decryptBytes(resp.body, source.pairingKey)
         if (!plain) throw new Error(`分片解密失败 @${offset}`)
         const expectedLen = to - offset + 1
         if (plain.length !== expectedLen) {

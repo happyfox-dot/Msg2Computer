@@ -98,6 +98,8 @@ function computeShortestRoutesFrom(sourceId, lsdb) {
     if (path[0] !== source || path.length < 2) continue
     const nextHopId = path[1]
     const destinationNode = nodeMap.get(destination) || {}
+    const activeEdgeCount = edgePath.filter(edge => edge.active).length
+    const fullyActive = edgePath.length > 0 && activeEdgeCount === edgePath.length
     routes.push({
       id: `${source}->${destination}:spf`,
       from: source,
@@ -115,7 +117,10 @@ function computeShortestRoutesFrom(sourceId, lsdb) {
       type: 'spf_route',
       label: `SPF route metric ${metric}`,
       enabled: true,
-      active: edgePath.some(edge => edge.active),
+      active: fullyActive,
+      partiallyActive: activeEdgeCount > 0 && !fullyActive,
+      activeEdgeCount,
+      totalEdgeCount: edgePath.length,
       authority: 'link_state',
       updatedAt: Math.max(0, ...edgePath.map(edge => edge.updatedAt || 0))
     })

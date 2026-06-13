@@ -39,7 +39,7 @@ class TopologyGraphView @JvmOverloads constructor(
         val to: String,
         val label: String,
         val active: Boolean = true,
-        // push（验证码推送）/ relay（节点中继路由）/ totp（种子同步）/ discovery（仅发现）
+        // push（验证码推送）/ relay（节点中继路由）/ route（可路由候选）/ totp（种子同步）/ discovery（仅发现）
         val kind: String = "push",
         // SPF metric，>0 时附加显示在边标签上
         val metric: Int = 0
@@ -146,10 +146,11 @@ class TopologyGraphView @JvmOverloads constructor(
         val localY = height / 2f - nodeHeight / 2f
         nodeRects[local.id] = RectF(localX, localY, localX + nodeWidth, localY + nodeHeight)
 
-        // 在线/启用的节点排在上面，离线和仅发现的排在下面
+        // 在线节点排最前，可路由候选其次，离线和仅发现的排在下面
         val remotes = nodes.filter { it.id != local.id }
             .sortedWith(
-                compareByDescending<Node> { it.status == "online" || it.status == "enabled" }
+                compareByDescending<Node> { it.status == "online" }
+                    .thenByDescending { it.status == "reachable" }
                     .thenBy { it.status == "discovered" }
                     .thenBy { it.name.lowercase() }
             )
@@ -169,10 +170,11 @@ class TopologyGraphView @JvmOverloads constructor(
     }
 
     private fun edgeColor(edge: Edge): Int = when {
+        edge.kind == "discovery" -> COLOR_IDLE
+        edge.kind == "totp" -> COLOR_TOTP
+        edge.kind == "route" -> Color.rgb(96, 165, 250)
         !edge.active -> COLOR_IDLE
         edge.kind == "relay" -> COLOR_RELAY
-        edge.kind == "totp" -> COLOR_TOTP
-        edge.kind == "discovery" -> COLOR_IDLE
         else -> COLOR_ACTIVE
     }
 
@@ -231,7 +233,8 @@ class TopologyGraphView @JvmOverloads constructor(
     }
 
     private fun statusColor(node: Node): Int = when (node.status) {
-        "online", "enabled" -> COLOR_ACTIVE
+        "online" -> COLOR_ACTIVE
+        "reachable" -> Color.rgb(96, 165, 250)
         "synced" -> COLOR_TOTP
         "discovered" -> COLOR_META
         else -> COLOR_IDLE
@@ -239,6 +242,7 @@ class TopologyGraphView @JvmOverloads constructor(
 
     private fun statusText(status: String): String = when (status) {
         "online" -> "在线"
+        "reachable" -> "可路由"
         "enabled" -> "已启用"
         "disabled" -> "已禁用"
         "synced" -> "已同步"
@@ -251,7 +255,7 @@ class TopologyGraphView @JvmOverloads constructor(
             val rect = nodeRects[node.id] ?: return@forEach
             val accent = statusColor(node)
             nodePaint.color = if (node.local) COLOR_LOCAL_BG else COLOR_NODE_BG
-            strokePaint.color = if (node.status == "online" || node.status == "enabled" || node.local) {
+            strokePaint.color = if (node.status == "online" || node.status == "reachable" || node.local) {
                 accent
             } else {
                 COLOR_NODE_STROKE
@@ -271,7 +275,7 @@ class TopologyGraphView @JvmOverloads constructor(
             val meta = node.meta.ifBlank {
                 "${if (node.type.uppercase().contains("PHONE")) "手机" else "电脑"} · ${statusText(node.status)}"
             }
-            metaPaint.color = if (node.status == "online" || node.status == "enabled") accent else COLOR_META
+            metaPaint.color = if (node.status == "online" || node.status == "reachable") accent else COLOR_META
             canvas.drawText(ellipsize(meta, 18), rect.left + dp(11f), rect.top + dp(38f), metaPaint)
         }
     }

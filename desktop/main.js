@@ -2479,7 +2479,8 @@ async function serveLocalFileChunk(fileId, parsedUrl, res) {
       to: parsedUrl.searchParams.get('to'),
       senderId: parsedUrl.searchParams.get('senderId'),
       nonce: parsedUrl.searchParams.get('nonce'),
-      authToken: parsedUrl.searchParams.get('authToken')
+      authToken: parsedUrl.searchParams.get('authToken'),
+      chunkEncoding: parsedUrl.searchParams.get('chunkEncoding') || 'aes-gcm'
     })
     if (!result || result.status !== 206 || !Buffer.isBuffer(result.body)) {
       sendJsonResponse(res, result?.status || 500, { error: 'file_chunk_unavailable' })
@@ -2519,7 +2520,7 @@ async function handleFileProxyRequest(parsedUrl, res) {
       sendJsonResponse(res, 502, { error: 'proxy_hop_exhausted' })
       return
     }
-    const baseQuery = ['from', 'to', 'senderId', 'nonce', 'authToken']
+    const baseQuery = ['from', 'to', 'senderId', 'nonce', 'authToken', 'chunkEncoding']
       .map(key => {
         const value = parsedUrl.searchParams.get(key)
         return value === null ? '' : `${key}=${encodeURIComponent(value)}`
@@ -3270,6 +3271,10 @@ function buildPhoneRoutingTable(forPhoneId = '', topology = null) {
         path: route.path || [],
         pathLabels: route.pathLabels || [],
         via: route.via || route.nextHopId,
+        active: route.active === true,
+        partiallyActive: route.partiallyActive === true,
+        activeEdgeCount: route.activeEdgeCount || 0,
+        totalEdgeCount: route.totalEdgeCount || 0,
         type: 'spf_route',
         label: route.label || 'SPF 路由'
       })),
@@ -5298,6 +5303,8 @@ function getDesktopTotps() {
 function getDeviceStatusLabel(status) {
   return {
     online: '在线',
+    reachable: '可路由',
+    known: '已知',
     offline: '离线',
     disabled: '已禁用',
     revoked: '已撤销',
@@ -5310,6 +5317,7 @@ function getPhoneTopologyStatus(phone) {
   if (phone.revoked) return 'revoked'
   if (phone.enabled === false) return 'disabled'
   if (phone.connected) return 'online'
+  if (phone.pairingKey && phone.lastIP) return 'reachable'
   return 'offline'
 }
 
@@ -5435,12 +5443,18 @@ function getTopologySnapshot() {
 
   for (const node of topologyLsdb.nodes.values()) {
     if (!node.id) continue
+    const lsdbConnected = node.id === identity.id || node.connected === true
+    const lsdbStatus = lsdbConnected
+      ? 'online'
+      : (node.enabled === false
+          ? 'disabled'
+          : (node.routable === true && (node.host || node.lastIP) ? 'reachable' : (node.status || 'offline')))
     mergeTopologyNode(nodes, {
       ...node,
       deviceType: node.type,
-      status: node.id === identity.id ? 'online' : (node.status || 'offline'),
+      status: lsdbStatus,
       enabled: node.enabled !== false,
-      connected: node.id === identity.id || node.connected === true,
+      connected: lsdbConnected,
       lastSeen: node.lastSeen || node.updatedAt || 0,
       lastIP: node.lastIP || node.host || '',
       authority: node.authority || 'topology_gossip'
@@ -5528,7 +5542,7 @@ function getTopologySnapshot() {
         label: viaTailscale ? '节点直连 relay (Tailscale)' : '节点直连 relay',
         direction: 'peer',
         enabled: true,
-        active: from.connected === true || to.connected === true,
+        active: from.connected === true && to.connected === true,
         authority: 'source_device',
         updatedAt: Math.max(from.lastSeen || 0, to.lastSeen || 0),
         description: `经 ${identity.name} 交换路由信息后，两个手机节点可直接同步短信和 TOTP`
@@ -5537,7 +5551,9 @@ function getTopologySnapshot() {
   }
 
   desktopPeers.forEach(peer => {
-    const status = peer.connected ? 'online' : (peer.enabled === false ? 'disabled' : 'offline')
+    const status = peer.connected
+      ? 'online'
+      : (peer.enabled === false ? 'disabled' : ((peer.host || peer.lastIP) && peer.pairingKey ? 'reachable' : 'offline'))
     mergeTopologyNode(nodes, {
       id: peer.id,
       name: peer.name,
@@ -6084,6 +6100,10 @@ function lookupPeerPairingKey(deviceId) {
   }
   const peer = pairedDesktopPeers.get(id)
   if (peer && peer.pairingKey && peer.enabled !== false) return peer.pairingKey
+  const lsdbNode = topologyLsdb.nodes.get(id)
+  if (lsdbNode && lsdbNode.pairingKey && lsdbNode.enabled !== false && lsdbNode.revoked !== true) {
+    return lsdbNode.pairingKey
+  }
   return null
 }
 
@@ -6152,6 +6172,25 @@ function resolveFileSource(originDeviceId, manifest = {}) {
       pairingKey: peer.pairingKey
     }
   }
+  const lsdbNode = topologyLsdb.nodes.get(id)
+  if (lsdbNode && lsdbNode.pairingKey && lsdbNode.enabled !== false && lsdbNode.revoked !== true) {
+    const hosts = collectNetworkHosts(
+      lsdbNode.lastIP,
+      lsdbNode.host,
+      lsdbNode.relayHost,
+      lsdbNode.tsHost,
+      lsdbNode.altHosts,
+      manifestHosts
+    )
+    return {
+      id,
+      name: lsdbNode.name || 'Device Node',
+      host: hosts[0] || '',
+      hosts,
+      port: Number(lsdbNode.relayPort || lsdbNode.port) || JOIN_PORT,
+      pairingKey: lsdbNode.pairingKey
+    }
+  }
   return null
 }
 
@@ -6197,6 +6236,12 @@ function resolveFileRelayCandidates(originId) {
     if (peer.enabled === false) continue
     for (const host of collectNetworkHosts(peer.lastIP, peer.host, peer.relayHost, peer.tsHost, peer.altHosts)) {
       add(peer.id, host, peer.relayPort || JOIN_PORT, peer.name)
+    }
+  }
+  for (const node of topologyLsdb.nodes.values()) {
+    if (!node || node.enabled === false || node.revoked === true || !node.pairingKey) continue
+    for (const host of collectNetworkHosts(node.lastIP, node.host, node.relayHost, node.tsHost, node.altHosts)) {
+      add(node.id, host, node.relayPort || node.port || JOIN_PORT, node.name)
     }
   }
   return candidates.slice(0, 12)
@@ -6904,17 +6949,9 @@ function isSupportedImagePath(filePath) {
 }
 
 function getDefaultFileTransferTargetIds() {
-  const ids = []
-  for (const phone of getAuthorizedPhones()) {
-    if (phone.enabled === false || phone.revoked === true) continue
-    if (!hasKnownDeliveryPath(phone)) continue
-    if (canPushContentToNode(phone, CODE_TYPES.FILE_TRANSFER)) ids.push(phone.id)
-  }
-  for (const peer of getPairedDesktopPeers()) {
-    if (peer.enabled === false || !hasKnownDeliveryPath(peer)) continue
-    if (canPushContentToNode(peer, CODE_TYPES.FILE_TRANSFER)) ids.push(peer.id)
-  }
-  return Array.from(new Set(ids))
+  return getFileTransferTargets()
+    .filter(target => target.selected)
+    .map(target => target.id)
 }
 
 function normalizeRequestedFileTargetIds(targetIds = []) {
@@ -6929,30 +6966,103 @@ function normalizeRequestedFileTargetIds(targetIds = []) {
 }
 
 function getFileTransferTargets() {
-  const targets = []
-  const append = (node, kind) => {
-    const id = String(node?.id || '').trim()
-    if (!id || node.enabled === false || node.revoked === true) return
-    const reachable = hasKnownDeliveryPath(node)
-    const allowed = canPushContentToNode(node, CODE_TYPES.FILE_TRANSFER)
-    const policy = node.contentPolicy || node
-    targets.push({
+  const identity = getDesktopIdentity()
+  const nodes = new Map()
+
+  const inferKind = (node, fallback = 'node') => {
+    const type = String(node?.deviceType || node?.type || '').toUpperCase()
+    if (type.includes('PHONE')) return 'phone'
+    if (type.includes('DESKTOP')) return 'desktop'
+    return fallback
+  }
+
+  const append = (raw, fallbackKind = 'node') => {
+    if (!raw) return
+    const id = String(raw.id || raw.phoneId || '').trim()
+    if (!id || id === identity.id || raw.enabled === false || raw.revoked === true) return
+
+    const previous = nodes.get(id) || {}
+    const mergedHosts = collectNetworkHosts(
+      previous.lastIP,
+      previous.host,
+      previous.relayHost,
+      previous.tsHost,
+      previous.altHosts,
+      raw.lastIP,
+      raw.host,
+      raw.relayHost,
+      raw.tsHost,
+      raw.altHosts
+    )
+    const type = raw.deviceType || raw.type || previous.deviceType || previous.type ||
+      (fallbackKind === 'phone' ? 'ANDROID_PHONE' : fallbackKind === 'desktop' ? 'WINDOWS_DESKTOP' : 'DEVICE_NODE')
+    const lastSeen = Math.max(
+      Number(previous.lastSeen || previous.updatedAt || 0) || 0,
+      Number(raw.lastSeen || raw.updatedAt || 0) || 0
+    )
+    const connected = previous.connected === true || raw.connected === true || hasActiveWsForNode(id)
+    const contentPolicy = normalizePushContentPolicy({
+      ...(previous.contentPolicy || previous || {}),
+      ...(raw.contentPolicy || raw || {})
+    })
+
+    nodes.set(id, {
+      ...previous,
+      ...raw,
       id,
-      name: node.name || (kind === 'phone' ? 'Android Phone' : 'Desktop Node'),
-      type: node.deviceType || node.type || (kind === 'phone' ? 'ANDROID_PHONE' : 'WINDOWS_DESKTOP'),
-      kind,
-      host: node.lastIP || node.host || node.tsHost || '',
-      lastSeen: node.lastSeen || 0,
-      reachable,
-      allowed,
-      selected: reachable && allowed,
-      reason: !allowed ? '未允许文件传输' : (!reachable ? '当前不可达' : ''),
-      maxFileSizeMb: Number(policy.maxFileSizeMb || node.maxFileSizeMb || desktopMessageSettings.maxFileSizeMb || 50)
+      name: raw.name || previous.name || (fallbackKind === 'phone' ? 'Android Phone' : 'Device Node'),
+      type,
+      deviceType: type,
+      kind: inferKind({ ...previous, ...raw, type }, fallbackKind),
+      pairingKey: raw.pairingKey || previous.pairingKey || '',
+      contentPolicy,
+      lastSeen,
+      connected,
+      status: connected ? 'online' : (raw.status || previous.status || 'known'),
+      lastIP: raw.lastIP || previous.lastIP || mergedHosts[0] || '',
+      host: raw.host || previous.host || mergedHosts[0] || '',
+      relayHost: raw.relayHost || previous.relayHost || '',
+      tsHost: raw.tsHost || previous.tsHost || '',
+      altHosts: mergedHosts,
+      relayPort: raw.relayPort || raw.port || previous.relayPort || previous.port || JOIN_PORT
     })
   }
+
+  for (const node of topologyLsdb.nodes.values()) append(node, inferKind(node))
   getAuthorizedPhones().forEach(phone => append(phone, 'phone'))
   getPairedDesktopPeers().forEach(peer => append(peer, 'desktop'))
-  return targets
+
+  return Array.from(nodes.values())
+    .map(node => {
+      const id = String(node.id || '').trim()
+      const hosts = collectNetworkHosts(node.lastIP, node.host, node.relayHost, node.tsHost, node.altHosts)
+      const reachable = node.connected === true ||
+        node.status === 'online' ||
+        hasActiveWsForNode(id) ||
+        hosts.length > 0 ||
+        hasKnownDeliveryPath(node)
+      const trusted = !!lookupPeerPairingKey(id)
+      const allowed = trusted && canPushContentToNode(node, CODE_TYPES.FILE_TRANSFER)
+      const reason = !trusted ? '未完成可信配对' : (!allowed ? '未允许文件传输' : (!reachable ? '当前不可达' : ''))
+      return {
+        id,
+        name: node.name || id,
+        type: node.deviceType || node.type || 'DEVICE_NODE',
+        kind: node.kind || inferKind(node),
+        host: hosts[0] || '',
+        lastSeen: node.lastSeen || 0,
+        reachable,
+        allowed,
+        selected: reachable && allowed,
+        reason,
+        maxFileSizeMb: Number(node.contentPolicy?.maxFileSizeMb || node.maxFileSizeMb || desktopMessageSettings.maxFileSizeMb || 50)
+      }
+    })
+    .sort((a, b) => {
+      if (a.selected !== b.selected) return a.selected ? -1 : 1
+      if (a.reachable !== b.reachable) return a.reachable ? -1 : 1
+      return String(a.name || a.id).localeCompare(String(b.name || b.id), 'zh-Hans-CN')
+    })
 }
 
 function getDefaultClipboardFileTargetIds() {

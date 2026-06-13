@@ -11,7 +11,7 @@ import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 
 object FileTransferRegistry {
-    private const val CHUNK_BYTES = 1024 * 1024
+    private const val CHUNK_BYTES = 4 * 1024 * 1024
     private const val OFFER_TTL_MS = 30 * 60 * 1000L
     private const val NONCE_TTL_MS = 5 * 60 * 1000L
     private const val NONCE_LIMIT = 500
@@ -73,6 +73,7 @@ object FileTransferRegistry {
             .put("size", record.size)
             .put("sha256", record.sha256)
             .put("chunkSize", record.chunkSize)
+            .put("chunkEncodings", JSONArray(listOf("none", "aes-gcm")))
             .put("originDeviceId", identity.id)
             .put("originDeviceName", identity.name)
             .put("host", host)
@@ -95,7 +96,8 @@ object FileTransferRegistry {
         toRaw: String?,
         senderId: String?,
         nonce: String?,
-        authToken: String?
+        authToken: String?,
+        chunkEncoding: String? = null
     ): ChunkResponse {
         pruneExpired()
         val transfer = outgoingTransfers[fileId] ?: return ChunkResponse(404)
@@ -134,10 +136,10 @@ object FileTransferRegistry {
             raf.seek(from)
             raf.readFully(plain)
         }
-        val encrypted = CryptoUtil.encryptBytes(plain, sourceKey)
+        val body = if (chunkEncoding == "none") plain else CryptoUtil.encryptBytes(plain, sourceKey)
         return ChunkResponse(
             status = 206,
-            body = encrypted,
+            body = body,
             contentRange = "bytes $from-$clampedTo/${transfer.size}",
             totalSize = transfer.size
         )

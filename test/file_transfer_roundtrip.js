@@ -101,7 +101,8 @@ async function main() {
         to: url.searchParams.get('to'),
         senderId: url.searchParams.get('senderId'),
         nonce: url.searchParams.get('nonce'),
-        authToken: url.searchParams.get('authToken')
+        authToken: url.searchParams.get('authToken'),
+        chunkEncoding: url.searchParams.get('chunkEncoding') || 'aes-gcm'
       })
       return { status: result.status, body: result.body }
     },
@@ -157,7 +158,8 @@ async function main() {
       to: url.searchParams.get('to'),
       senderId: url.searchParams.get('senderId'),
       nonce: url.searchParams.get('nonce'),
-      authToken: url.searchParams.get('authToken')
+      authToken: url.searchParams.get('authToken'),
+      chunkEncoding: url.searchParams.get('chunkEncoding') || 'aes-gcm'
     })
     return { status: result.status, body: result.body }
   }

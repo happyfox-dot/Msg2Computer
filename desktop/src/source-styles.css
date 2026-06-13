@@ -315,6 +315,12 @@
   stroke-width: 2.8;
 }
 
+.topology-directed-path.partial {
+  stroke-width: 2.5;
+  stroke-dasharray: 3 5;
+  opacity: 0.78;
+}
+
 .topology-directed-path:not(.active) {
   stroke-dasharray: 7 6;
   opacity: 0.55;
@@ -323,6 +329,11 @@
 .topology-directed-path.disabled {
   stroke: rgba(130, 136, 150, 0.24);
   stroke-dasharray: 7 6;
+}
+
+.topology-directed-path.partial:not(.active) {
+  stroke-dasharray: 3 5;
+  opacity: 0.78;
 }
 
 /* 链路类型配色（与图例 swatch 一致） */
@@ -391,6 +402,9 @@
 .topology-legend-swatch.type-routing_adjacency { background: rgba(124, 138, 255, 0.65); }
 .topology-legend-swatch.type-lan_discovery { background: rgba(140, 148, 166, 0.55); }
 .topology-legend-swatch.legend-active { background: rgba(92, 219, 139, 0.85); }
+.topology-legend-swatch.legend-partial {
+  background: repeating-linear-gradient(90deg, rgba(96, 165, 250, 0.9) 0 2px, transparent 2px 5px);
+}
 .topology-legend-swatch.legend-idle {
   background: repeating-linear-gradient(90deg, rgba(140, 148, 166, 0.7) 0 3px, transparent 3px 6px);
 }
@@ -455,6 +469,7 @@
 
 .topology-directed-node.status-disabled,
 .topology-directed-node.status-revoked,
+.topology-directed-node.status-offline,
 .topology-directed-node.status-discovered {
   opacity: 0.62;
 }
@@ -522,6 +537,7 @@
 
 .topology-node.status-disabled,
 .topology-node.status-revoked,
+.topology-node.status-offline,
 .topology-node.status-discovered {
   opacity: 0.62;
 }
@@ -569,25 +585,41 @@
   background: #667084;
 }
 
+.topology-directed-node.status-online .topology-node-dot,
 .topology-node.status-online .topology-node-dot {
   background: #5cdb8b;
   box-shadow: 0 0 8px rgba(92, 219, 139, 0.45);
 }
 
+.topology-directed-node.status-reachable .topology-node-dot,
+.topology-node.status-reachable .topology-node-dot {
+  background: #60a5fa;
+  box-shadow: 0 0 8px rgba(96, 165, 250, 0.28);
+}
+
+.topology-directed-node.status-disabled .topology-node-dot,
 .topology-node.status-disabled .topology-node-dot {
   background: #e0b060;
 }
 
+.topology-directed-node.status-revoked .topology-node-dot,
 .topology-node.status-revoked .topology-node-dot {
   background: #e06060;
 }
 
+.topology-directed-node.status-discovered .topology-node-dot,
 .topology-node.status-discovered .topology-node-dot {
   background: #7c8aff;
 }
 
+.topology-directed-node.status-synced .topology-node-dot,
 .topology-node.status-synced .topology-node-dot {
-  background: #5cdb8b;
+  background: #fbbf24;
+}
+
+.topology-directed-node.status-offline .topology-node-dot,
+.topology-node.status-offline .topology-node-dot {
+  background: #667084;
 }
 
 .topology-node-detail {
@@ -707,6 +739,11 @@
 .topology-edge.active {
   border-color: rgba(92, 219, 139, 0.24);
   background: rgba(92, 219, 139, 0.07);
+}
+
+.topology-edge.partial {
+  border-color: rgba(96, 165, 250, 0.22);
+  background: rgba(96, 165, 250, 0.06);
 }
 
 .topology-edge.disabled {
