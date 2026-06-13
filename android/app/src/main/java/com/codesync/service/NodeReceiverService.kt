@@ -534,7 +534,19 @@ class NodeReceiverService : Service() {
                     // 旧值/重复/回环副本静默丢弃。应用成功后把目标列表改写为
                     // 本机的剪贴板授权邻居（gossip 再扩散），传播范围由
                     // 「源设备直接认识的节点」扩大为授权图的连通分量
-                    if (applyRemoteClipboard(payload)) {
+                    val textManifest = payload.optJSONObject("fileManifest")
+                    if (textManifest != null && !textManifest.optBoolean("inline", true)) {
+                        serviceScope.launch {
+                            if (pullRemoteClipboardText(payload)) {
+                                notifyUserMessageRelay(payload)
+                                WebSocketService.reportExternalStatus(
+                                    this@NodeReceiverService,
+                                    receivedStatusMessage(payloadType, sourceName)
+                                )
+                                rewriteClipboardGossipTargets(payload)
+                            }
+                        }
+                    } else if (applyRemoteClipboard(payload)) {
                         notifyUserMessageRelay(payload)
                         WebSocketService.reportExternalStatus(this, receivedStatusMessage(payloadType, sourceName))
                         rewriteClipboardGossipTargets(payload)
@@ -935,7 +947,11 @@ class NodeReceiverService : Service() {
             .notify((System.currentTimeMillis() % Int.MAX_VALUE).toInt(), notification)
     }
 
-    private fun pullIncomingFileTransfer(payload: JSONObject): ReceivedFile? {
+    private fun pullIncomingFileTransfer(
+        payload: JSONObject,
+        saveToHistory: Boolean = true,
+        subDirectoryName: String = "CodeBridge"
+    ): ReceivedFile? {
         val manifest = payload.optJSONObject("fileManifest") ?: return null
         if (manifest.optBoolean("inline", false)) return null
         val fileId = manifest.optString("fileId").trim()
@@ -965,7 +981,7 @@ class NodeReceiverService : Service() {
         val expectedHash = manifest.optString("sha256").lowercase(Locale.ROOT)
         val downloadsRoot = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: filesDir
         // 目录分享：relativePath 重建相对目录（逐段消毒，杜绝路径穿越）
-        val dir = relativeSubDir(File(downloadsRoot, "CodeBridge"), manifest.optString("relativePath"))
+        val dir = relativeSubDir(File(downloadsRoot, subDirectoryName), manifest.optString("relativePath"))
             .apply { mkdirs() }
         val partFile = File(dir, "$fileId.part")
         val digest = MessageDigest.getInstance("SHA-256")
@@ -1064,16 +1080,18 @@ class NodeReceiverService : Service() {
             }
             getSystemService(NotificationManager::class.java).cancel(progressNotificationId)
             DeviceStore.markDeviceSynced(this, source.id)
-            FileTransferHistoryStore.addReceived(
-                context = this,
-                fileId = fileId,
-                name = finalFile.name,
-                path = finalFile.absolutePath,
-                size = size,
-                mime = mime,
-                sourceDeviceId = source.id,
-                sourceDeviceName = source.name
-            )
+            if (saveToHistory) {
+                FileTransferHistoryStore.addReceived(
+                    context = this,
+                    fileId = fileId,
+                    name = finalFile.name,
+                    path = finalFile.absolutePath,
+                    size = size,
+                    mime = mime,
+                    sourceDeviceId = source.id,
+                    sourceDeviceName = source.name
+                )
+            }
             ReceivedFile(
                 name = finalFile.name,
                 file = finalFile,
@@ -1227,8 +1245,8 @@ class NodeReceiverService : Service() {
      * LWW 应用远端剪贴板：仅当版本比已应用版本新、且内容确实不同才写入。
      * 返回 true 表示本机状态前进（调用方据此继续 gossip 扩散）。
      */
-    private fun applyRemoteClipboard(payload: JSONObject): Boolean {
-        val text = payload.optString("rawMessage")
+    private fun applyRemoteClipboard(payload: JSONObject, overrideText: String? = null): Boolean {
+        val text = overrideText ?: payload.optString("rawMessage")
         if (text.isBlank()) return false
         val version = payload.optJSONObject("clipVersion")
         // 旧版负载无 clipVersion：退化用消息时间戳参与排序，保持互通
@@ -1274,7 +1292,11 @@ class NodeReceiverService : Service() {
         val origin = version?.optString("origin").orEmpty()
             .ifBlank { payload.optString("originDeviceId", payload.optString("sourceDeviceId")) }
         if (!isNewerClipboardImageVersion(ts, origin, shortHash)) return false
-        val received = pullIncomingFileTransfer(payload) ?: return false
+        val received = pullIncomingFileTransfer(
+            payload,
+            saveToHistory = false,
+            subDirectoryName = "CodeBridgeClipboard"
+        ) ?: return false
         val bytes = runCatching { received.file.readBytes() }.getOrNull()
         runCatching { received.file.delete() }
         if (bytes == null || bytes.isEmpty()) return false
@@ -1282,6 +1304,38 @@ class NodeReceiverService : Service() {
         rememberClipboardImageVersion(ts, origin, shortHash)
         rememberClipboardImageHistory(payload, clipboardFile, bytes.size.toLong(), ts, origin)
         return true
+    }
+
+    private fun pullRemoteClipboardText(payload: JSONObject): Boolean {
+        val manifest = payload.optJSONObject("fileManifest") ?: return false
+        val mime = manifest.optString("mime").lowercase(Locale.ROOT)
+        if (
+            mime.isNotBlank() &&
+            !mime.startsWith("text/plain") &&
+            !mime.startsWith("text/markdown") &&
+            mime != "application/octet-stream"
+        ) {
+            return false
+        }
+        val version = payload.optJSONObject("clipVersion")
+        val shortHash = version?.optString("hash").orEmpty()
+            .ifBlank { manifest.optString("sha256").take(24) }
+        val ts = (version?.optLong("ts", 0L) ?: 0L).takeIf { it > 0L }
+            ?: payload.optLong("timestamp", 0L)
+        val origin = version?.optString("origin").orEmpty()
+            .ifBlank { payload.optString("originDeviceId", payload.optString("sourceDeviceId")) }
+        if (shortHash.isNotBlank() && shortHash == ClipboardSyncState.appliedHash(this)) return false
+        if (!ClipboardSyncState.isNewer(this, ts, origin)) return false
+        val received = pullIncomingFileTransfer(
+            payload,
+            saveToHistory = false,
+            subDirectoryName = "CodeBridgeClipboard"
+        ) ?: return false
+        val text = runCatching { received.file.readText(Charsets.UTF_8) }.getOrNull()
+        runCatching { received.file.delete() }
+        if (text.isNullOrEmpty()) return false
+        if (shortHash.isNotBlank() && ClipboardSyncState.hash(text) != shortHash) return false
+        return applyRemoteClipboard(payload, text)
     }
 
     private fun applyRemoteClipboardImage(payload: JSONObject): Boolean {

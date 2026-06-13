@@ -110,6 +110,14 @@ class MainActivity : AppCompatActivity() {
         val onClick: () -> Unit
     )
 
+    private data class FileTransferTargetOption(
+        val device: DesktopDevice,
+        val reachable: Boolean,
+        val allowed: Boolean,
+        val statusLabel: String,
+        val reason: String
+    )
+
     private enum class MainPage {
         HOME,
         MESSAGES,
@@ -289,7 +297,7 @@ class MainActivity : AppCompatActivity() {
         val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
         val text = clipboard.primaryClip?.takeIf { it.itemCount > 0 }
             ?.getItemAt(0)?.coerceToText(this)?.toString()?.trim().orEmpty()
-        if (text.isBlank() || text.length > 20000) return
+        if (text.isBlank()) return
         if (ClipboardSyncState.hash(text) == ClipboardSyncState.appliedHash(this)) return
         startServiceForAction(WebSocketService.ACTION_SEND_CLIPBOARD) {
             putExtra(WebSocketService.EXTRA_MESSAGE_BODY, text)
@@ -398,6 +406,10 @@ class MainActivity : AppCompatActivity() {
 
         binding.btnAddTotp.setOnClickListener {
             showAddTotpDialog()
+        }
+
+        binding.btnTotpAccess.setOnClickListener {
+            showRevokeTotpAccessDialog()
         }
 
         binding.btnDisconnect.setOnClickListener {
@@ -793,7 +805,7 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, R.string.file_transfer_disabled, Toast.LENGTH_SHORT).show()
             return
         }
-        if (DeviceStore.getEnabledDevices(this).none { it.allowFileTransfer }) {
+        if (getFileTransferTargetOptions().isEmpty()) {
             Toast.makeText(this, R.string.file_no_target, Toast.LENGTH_SHORT).show()
             return
         }
@@ -808,7 +820,7 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, R.string.file_transfer_disabled, Toast.LENGTH_SHORT).show()
             return
         }
-        if (DeviceStore.getEnabledDevices(this).none { it.allowFileTransfer }) {
+        if (getFileTransferTargetOptions().isEmpty()) {
             Toast.makeText(this, R.string.file_no_target, Toast.LENGTH_SHORT).show()
             return
         }
@@ -819,27 +831,36 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showFileTargetSelectionSheet(onSelected: (List<String>) -> Unit) {
-        val devices = DeviceStore.getEnabledDevices(this)
-            .filter { it.allowFileTransfer }
-            .sortedBy { it.name.lowercase(Locale.ROOT) }
-        if (devices.isEmpty()) {
+        val options = getFileTransferTargetOptions()
+        if (options.isEmpty()) {
             Toast.makeText(this, R.string.file_no_target, Toast.LENGTH_SHORT).show()
             return
         }
-        val selected = BooleanArray(devices.size) { true }
-        val items = devices.map { device ->
+        val selectable = BooleanArray(options.size) { options[it].reachable && options[it].allowed }
+        val selected = BooleanArray(options.size) { selectable[it] }
+        val items = options.map { option ->
+            val device = option.device
             val type = if (device.type.contains("PHONE", ignoreCase = true)) "手机" else "电脑"
             val host = (listOf(device.host) + device.altHosts).firstOrNull { it.isNotBlank() }.orEmpty()
-            listOf(device.name, type, host).filter { it.isNotBlank() }.joinToString(" · ")
+            listOf(
+                device.name,
+                option.statusLabel,
+                type,
+                host,
+                option.reason
+            ).filter { it.isNotBlank() }.joinToString(" · ")
         }
         showMultiChoiceSheet(
             title = getString(R.string.file_target_select),
             message = getString(R.string.file_target_select_desc),
             items = items,
             selected = selected,
+            itemEnabled = selectable,
             positiveText = "继续选择文件",
             onPositive = {
-                val targetIds = devices.filterIndexed { index, _ -> selected[index] }.map { it.id }
+                val targetIds = options
+                    .filterIndexed { index, option -> selected[index] && option.reachable && option.allowed }
+                    .map { it.device.id }
                 if (targetIds.isEmpty()) {
                     pendingFileTransferTargetIds = emptyList()
                     Toast.makeText(this, R.string.file_target_none_selected, Toast.LENGTH_SHORT).show()
@@ -1584,6 +1605,50 @@ class MainActivity : AppCompatActivity() {
         else -> "离线"
     }
 
+    private fun isFileTransferReachable(device: DesktopDevice): Boolean {
+        if (!device.enabled || device.pairingKey.isBlank()) return false
+        return isDeviceOnline(device) ||
+            isDeviceRoutableCandidate(device) ||
+            device.routeNextHopId.isNotBlank() ||
+            device.routeMetric > 0 ||
+            device.routePath.size > 1 ||
+            device.altHosts.any { it.isNotBlank() }
+    }
+
+    private fun getFileTransferTargetOptions(): List<FileTransferTargetOption> {
+        return DeviceStore.getEnabledDevices(this)
+            .filter { it.pairingKey.isNotBlank() }
+            .distinctBy { it.id }
+            .map { device ->
+                val reachable = isFileTransferReachable(device)
+                val allowed = device.allowFileTransfer
+                val statusLabel = when {
+                    isDeviceOnline(device) -> "在线"
+                    reachable -> "可路由"
+                    else -> "离线"
+                }
+                val reason = when {
+                    !reachable -> "当前不可达"
+                    !allowed -> "文件权限未开启"
+                    device.routeNextHopId.isNotBlank() && device.routeNextHopId != device.id ->
+                        "经 ${device.routeNextHopName.ifBlank { device.routeNextHopId }}"
+                    else -> ""
+                }
+                FileTransferTargetOption(
+                    device = device,
+                    reachable = reachable,
+                    allowed = allowed,
+                    statusLabel = statusLabel,
+                    reason = reason
+                )
+            }
+            .sortedWith(
+                compareByDescending<FileTransferTargetOption> { it.reachable && it.allowed }
+                    .thenByDescending { it.reachable }
+                    .thenBy { it.device.name.lowercase(Locale.ROOT) }
+            )
+    }
+
     private fun rebuildTopologyList() {
         val container = binding.topologyList
         container.removeAllViews()
@@ -1995,6 +2060,7 @@ class MainActivity : AppCompatActivity() {
         message: String,
         items: List<String>,
         selected: BooleanArray,
+        itemEnabled: BooleanArray? = null,
         positiveText: String,
         neutralText: String? = null,
         onPositive: () -> Unit,
@@ -2002,24 +2068,30 @@ class MainActivity : AppCompatActivity() {
     ) {
         val (dialog, content) = createBottomSheet(title, message)
         items.forEachIndexed { index, item ->
+            val enabled = itemEnabled?.getOrNull(index) ?: true
             val row = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
                 setBackgroundResource(R.drawable.bg_row)
                 setPadding(10.dp(), 8.dp(), 12.dp(), 8.dp())
+                alpha = if (enabled) 1f else 0.48f
             }
             val checkBox = CheckBox(this).apply {
-                isChecked = selected[index]
+                isChecked = selected[index] && enabled
+                isEnabled = enabled
                 buttonTintList = ColorStateList.valueOf(ContextCompat.getColor(this@MainActivity, R.color.primary))
                 setOnCheckedChangeListener { _, checked -> selected[index] = checked }
             }
             row.setOnClickListener {
-                checkBox.isChecked = !checkBox.isChecked
+                if (enabled) checkBox.isChecked = !checkBox.isChecked
             }
             row.addView(checkBox)
             row.addView(TextView(this).apply {
                 text = item
-                setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_primary))
+                setTextColor(ContextCompat.getColor(
+                    this@MainActivity,
+                    if (enabled) R.color.text_primary else R.color.text_secondary
+                ))
                 textSize = 13f
             }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
             content.addView(row, LinearLayout.LayoutParams(

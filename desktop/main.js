@@ -4204,8 +4204,8 @@ function broadcastTotpSyncToDesktopPeers(seed, action = 'add') {
 
 // 剪贴板轮询周期：略高于 QR 监听，兼顾及时性与 CPU 占用。
 const CLIPBOARD_POLL_INTERVAL_MS = 900
-// 单条同步的剪贴板上限，超长内容（如整段文件）不同步，避免气泡/传输膨胀。
-const CLIPBOARD_MAX_LENGTH = 20000
+// 剪贴板文本 inline 上限；超过后仍按“剪贴板文本”同步，但底层转文件分片传输。
+const CLIPBOARD_MAX_LENGTH = 20 * 1024
 // 首版图片剪贴板用 inline manifest 走现有加密 relay，必须保守限制大小。
 const CLIPBOARD_INLINE_IMAGE_MAX_BYTES = 180 * 1024
 let clipboardWatchTimer = null
@@ -4224,6 +4224,10 @@ let clipboardImageSyncState = { ts: 0, origin: '', hash: '' }
 
 function hashClipText(text) {
   return crypto.createHash('sha256').update(String(text), 'utf8').digest('hex').slice(0, 24)
+}
+
+function clipboardTextByteLength(text) {
+  return Buffer.byteLength(String(text || ''), 'utf8')
 }
 
 function hashBuffer(buffer) {
@@ -4298,10 +4302,18 @@ function pollClipboardForSync() {
     }
     if (text !== lastClipboardText) {
       lastClipboardText = text
-      if (text && text.length <= CLIPBOARD_MAX_LENGTH && hashClipText(text) !== clipboardSyncState.hash) {
-        // 本机新复制：产生新版本并广播
-        rememberClipVersion(Date.now(), getDesktopIdentity().id, text)
-        broadcastClipboardToNodes(text)
+      if (text && hashClipText(text) !== clipboardSyncState.hash) {
+        // 本机新复制：产生新版本并广播。小文本 inline 走消息通道；
+        // 超长文本保持"剪贴板文本"业务语义，但底层转 manifest + 分片拉取。
+        const clipTs = Date.now()
+        rememberClipVersion(clipTs, getDesktopIdentity().id, text)
+        if (clipboardTextByteLength(text) <= CLIPBOARD_MAX_LENGTH) {
+          broadcastClipboardToNodes(text)
+        } else {
+          offerClipboardTextAsFile(text, clipTs, clipboardSyncState.hash).catch(error => {
+            console.error('剪贴板长文本 manifest 同步失败:', error.message)
+          })
+        }
       }
     }
   }
@@ -4359,6 +4371,65 @@ function getDefaultClipboardImageTargetIds() {
     if (canPushContentToNode(peer, CODE_TYPES.CLIPBOARD_IMAGE)) ids.push(peer.id)
   }
   return Array.from(new Set(ids))
+}
+
+function getDefaultClipboardTextTargetIds() {
+  const ids = []
+  for (const phone of getAuthorizedPhones()) {
+    if (phone.enabled === false || phone.revoked === true) continue
+    if (!hasKnownDeliveryPath(phone)) continue
+    if (canPushContentToNode(phone, CODE_TYPES.CLIPBOARD_TEXT)) ids.push(phone.id)
+  }
+  for (const peer of getPairedDesktopPeers()) {
+    if (peer.enabled === false || !hasKnownDeliveryPath(peer)) continue
+    ids.push(peer.id)
+  }
+  return Array.from(new Set(ids))
+}
+
+async function offerClipboardTextAsFile(text, clipTs, shortHash, options = {}) {
+  const defaultTargets = getDefaultClipboardTextTargetIds()
+  const allowedTargets = new Set(defaultTargets)
+  const requestedTargets = Array.isArray(options.targetIds)
+    ? options.targetIds.map(String).filter(id => id && allowedTargets.has(id))
+    : defaultTargets
+  const targets = Array.from(new Set(requestedTargets))
+  if (targets.length === 0) return
+  const bytes = Buffer.from(String(text || ''), 'utf8')
+  if (bytes.length === 0) return
+  const maxBytes = Math.max(1, Number(desktopMessageSettings.maxFileSizeMb || 50)) * 1024 * 1024
+  if (bytes.length > maxBytes) {
+    console.warn(`Clipboard text sync skipped: ${formatBytes(bytes.length)} exceeds ${formatBytes(maxBytes)}`)
+    return
+  }
+  const outDir = path.join(app.getPath('userData'), 'clipboard-text-out')
+  let filePath
+  try {
+    fs.mkdirSync(outDir, { recursive: true })
+    for (const entry of fs.readdirSync(outDir)) {
+      const full = path.join(outDir, entry)
+      try {
+        if (Date.now() - fs.statSync(full).mtimeMs > 30 * 60 * 1000) fs.unlinkSync(full)
+      } catch (_) {}
+    }
+    filePath = path.join(outDir, `clipboard-${clipTs}-${shortHash}.txt`)
+    fs.writeFileSync(filePath, bytes)
+  } catch (e) {
+    console.error('剪贴板长文本暂存失败:', e.message)
+    return
+  }
+  const identity = getDesktopIdentity()
+  const clipOrigin = String(options.origin || identity.id)
+  await initFileTransfer().offerFile(filePath, targets, {
+    type: CODE_TYPES.CLIPBOARD_TEXT,
+    source: '剪贴板',
+    rawPrefix: '剪贴板文本',
+    payloadExtra: {
+      ...buildLocalSourceAddressPayload(),
+      clipVersion: { ts: clipTs, origin: clipOrigin, hash: shortHash, kind: 'text' },
+      clipboardTextEncoding: 'utf-8'
+    }
+  })
 }
 
 // 大图剪贴板发送侧：PNG 先暂存本地（offer 有效期内充当分片源），再按
@@ -4704,7 +4775,7 @@ function broadcastClipboardImageToNodes(pngBuffer, sha256, options = {}) {
 // 返回 true 表示本机状态前进了，调用方据此把该状态继续 gossip 给本机邻居。
 function applyRemoteClipboard(codeInfo, codeData) {
   const text = codeInfo.rawMessage || ''
-  if (!text || text.length > CLIPBOARD_MAX_LENGTH) return false
+  if (!text || clipboardTextByteLength(text) > CLIPBOARD_MAX_LENGTH) return false
   const version = (codeData && codeData.clipVersion) || {}
   // 旧版负载无 clipVersion：退化用消息时间戳参与排序，保持互通
   const ts = Number(version.ts) || Number(codeInfo.timestamp) || 0
@@ -4784,7 +4855,7 @@ function buildClipboardStatePushPayload(targetIds) {
   } catch (_) {
     return null
   }
-  if (!text || text.length > CLIPBOARD_MAX_LENGTH) return null
+  if (!text || clipboardTextByteLength(text) > CLIPBOARD_MAX_LENGTH) return null
   if (hashClipText(text) !== clipboardSyncState.hash) return null
   const identity = getDesktopIdentity()
   const originMessageId = `clip-${clipboardSyncState.origin}-${clipboardSyncState.ts}`
@@ -4810,18 +4881,45 @@ function buildClipboardStatePushPayload(targetIds) {
   }
 }
 
+function offerCurrentClipboardStateAsFile(targetIds) {
+  if (desktopMessageSettings.syncClipboardText !== true) return false
+  if (!clipboardSyncState.ts) return false
+  let text = ''
+  try {
+    text = clipboard.readText() || ''
+  } catch (_) {
+    return false
+  }
+  if (!text || clipboardTextByteLength(text) <= CLIPBOARD_MAX_LENGTH) return false
+  const actualHash = hashClipText(text)
+  if (actualHash !== clipboardSyncState.hash) return false
+  offerClipboardTextAsFile(text, clipboardSyncState.ts, actualHash, {
+    origin: clipboardSyncState.origin || getDesktopIdentity().id,
+    targetIds
+  }).catch(error => {
+    console.error('补推剪贴板长文本失败:', error.message)
+  })
+  return true
+}
+
 function pushClipboardStateToPhone(phone) {
   if (!phone || !canPushContentToNode(phone, CODE_TYPES.CLIPBOARD_TEXT)) return
   if (!phone.pairingKey || !(phone.lastIP || phone.host)) return
   const payload = buildClipboardStatePushPayload([phone.id])
-  if (!payload) return
+  if (!payload) {
+    offerCurrentClipboardStateAsFile([phone.id])
+    return
+  }
   sendRelayEnvelopeToPhone(phone, payload).catch(() => {})
 }
 
 function pushClipboardStateToDesktopPeer(ws, sessionKey, peerId) {
   if (!ws || ws.readyState !== WebSocket.OPEN || !sessionKey) return
   const payload = buildClipboardStatePushPayload([peerId])
-  if (!payload) return
+  if (!payload) {
+    offerCurrentClipboardStateAsFile([peerId])
+    return
+  }
   const encrypted = encryptMessage(JSON.stringify(payload), sessionKey)
   if (!encrypted) return
   try {
@@ -6318,7 +6416,9 @@ async function broadcastFileManifestToNodes(targetIds, basePayload) {
   const targets = new Set((Array.isArray(targetIds) ? targetIds : []).map(String))
   const relayPath = [getDesktopIdentity().id]
   const payloadType = String(basePayload?.type || '')
-  const topic = payloadType === CODE_TYPES.CLIPBOARD_IMAGE
+  const topic = payloadType === CODE_TYPES.CLIPBOARD_TEXT || payloadType === CODE_TYPES.CLIPBOARD
+    ? busEnvelope.TOPICS.CLIPBOARD_TEXT
+    : payloadType === CODE_TYPES.CLIPBOARD_IMAGE
     ? busEnvelope.TOPICS.CLIPBOARD_IMAGE
     : payloadType === CODE_TYPES.CLIPBOARD_FILE
       ? busEnvelope.TOPICS.CLIPBOARD_FILE
@@ -6443,8 +6543,12 @@ function handleVerifyCode(codeData) {
     showCodeBubble(codeInfo)
     showNotification(`🔔 ${codeInfo.appName || '新通知'}`, `${titleText}\n${bodyText}\n来源设备: ${codeInfo.sourceDeviceName}`)
   } else if (codeInfo.type === CODE_TYPES.CLIPBOARD || codeInfo.type === CODE_TYPES.CLIPBOARD_TEXT) {
-    // LWW 应用；状态前进时把同一版本继续 gossip 给本机授权邻居（见剪贴板同步小节）
-    if (applyRemoteClipboard(codeInfo, codeData)) {
+    const textManifest = codeInfo.fileManifest || (codeData && codeData.fileManifest) || {}
+    if (textManifest.inline === false && textManifest.fileId) {
+      // 超长文本：业务上仍是剪贴板文本，底层用文件分片拉取，完成后写剪贴板。
+      handleIncomingClipboardTextManifest(codeInfo, codeData, textManifest)
+    } else if (applyRemoteClipboard(codeInfo, codeData)) {
+      // LWW 应用；状态前进时把同一版本继续 gossip 给本机授权邻居（见剪贴板同步小节）
       gossipClipboardState(codeData)
     }
   } else if (codeInfo.type === CODE_TYPES.CLIPBOARD_IMAGE) {
@@ -6460,6 +6564,50 @@ function handleVerifyCode(codeData) {
     // 接收开关 + 大小上限 + autoAcceptFiles 三道闸；非自动接收则弹确认对话框。
     handleIncomingFileManifest(codeInfo, codeData)
   }
+}
+
+function handleIncomingClipboardTextManifest(codeInfo, codeData, manifest) {
+  const mime = String(manifest.mime || '').toLowerCase()
+  if (mime && !mime.startsWith('text/plain') && !mime.startsWith('text/markdown') && mime !== 'application/octet-stream') return
+  const maxBytes = Math.max(1, Number(desktopMessageSettings.maxFileSizeMb || 50)) * 1024 * 1024
+  const size = Number(manifest.size || 0)
+  if (size <= 0 || size > maxBytes) return
+  const version = (codeData && codeData.clipVersion) || {}
+  const ts = Number(version.ts) || Number(codeInfo.timestamp) || 0
+  const origin = String(version.origin || codeInfo.originDeviceId || codeInfo.sourceDeviceId || '')
+  const shortHash = String(version.hash || manifest.sha256 || '').slice(0, 24)
+  if (shortHash && shortHash === clipboardSyncState.hash) return
+  if (!isNewerClipVersion(ts, origin)) return
+  const inDir = path.join(app.getPath('userData'), 'clipboard-text-in')
+  initFileTransfer().startIncomingPull(manifest, {
+    maxBytes,
+    targetDir: inDir,
+    onComplete: ({ path: finalPath }) => {
+      try {
+        const text = fs.readFileSync(finalPath, 'utf8')
+        if (!text) return
+        const actualHash = hashClipText(text)
+        if (shortHash && actualHash !== shortHash) return
+        if (actualHash === clipboardSyncState.hash) return
+        if (!isNewerClipVersion(ts, origin)) return
+        rememberClipVersion(ts, origin, text)
+        lastClipboardText = text
+        clipboard.writeText(text)
+        const info = { ...codeInfo, rawMessage: text }
+        showCodeBubble(info)
+        showNotification('📋 剪贴板同步', `${text.slice(0, 80)}\n来源设备: ${codeInfo.sourceDeviceName}`)
+        offerClipboardTextAsFile(text, ts, actualHash, { origin }).catch(error => {
+          console.error('剪贴板长文本 gossip 失败:', error.message)
+        })
+      } catch (e) {
+        console.error('剪贴板长文本应用失败:', e.message)
+      } finally {
+        try { fs.unlinkSync(finalPath) } catch (_) {}
+      }
+    }
+  }).catch(err => {
+    console.error('剪贴板长文本拉取失败:', err)
+  })
 }
 
 // 大图剪贴板（>inline 上限）：manifest + 分片拉取，完成后写本机剪贴板。
@@ -6965,9 +7113,34 @@ function normalizeRequestedFileTargetIds(targetIds = []) {
   return Array.from(new Set(requested.filter(id => allowed.has(id))))
 }
 
+function findRouteForTarget(routes = [], targetId = '') {
+  const id = String(targetId || '').trim()
+  if (!id) return null
+  return routes.find(route => String(route.destinationId || route.to || '') === id) || null
+}
+
+function getFileTransferTargetStatus(node = {}, snapshotNode = null, route = null) {
+  if (node.enabled === false) return 'disabled'
+  if (node.revoked === true) return 'revoked'
+  if (node.connected === true || snapshotNode?.status === 'online' || route?.active === true) return 'online'
+  if (
+    snapshotNode?.status === 'reachable' ||
+    route ||
+    node.routable === true ||
+    hasDirectNodeAddress(node) ||
+    hasKnownDeliveryPath(node)
+  ) {
+    return 'reachable'
+  }
+  return 'offline'
+}
+
 function getFileTransferTargets() {
   const identity = getDesktopIdentity()
   const nodes = new Map()
+  const topologySnapshot = getTopologySnapshot()
+  const snapshotNodeById = new Map((topologySnapshot.nodes || []).map(node => [String(node.id || ''), node]))
+  const routes = topologySnapshot.routeTables?.[identity.id] || []
 
   const inferKind = (node, fallback = 'node') => {
     const type = String(node?.deviceType || node?.type || '').toUpperCase()
@@ -7036,14 +7209,27 @@ function getFileTransferTargets() {
     .map(node => {
       const id = String(node.id || '').trim()
       const hosts = collectNetworkHosts(node.lastIP, node.host, node.relayHost, node.tsHost, node.altHosts)
+      const snapshotNode = snapshotNodeById.get(id) || null
+      const route = findRouteForTarget(routes, id)
+      const status = getFileTransferTargetStatus(node, snapshotNode, route)
       const reachable = node.connected === true ||
+        status === 'online' ||
+        status === 'reachable' ||
         node.status === 'online' ||
         hasActiveWsForNode(id) ||
         hosts.length > 0 ||
+        !!route ||
         hasKnownDeliveryPath(node)
       const trusted = !!lookupPeerPairingKey(id)
       const allowed = trusted && canPushContentToNode(node, CODE_TYPES.FILE_TRANSFER)
-      const reason = !trusted ? '未完成可信配对' : (!allowed ? '未允许文件传输' : (!reachable ? '当前不可达' : ''))
+      const routeLabel = route && String(route.nextHopId || '') && String(route.nextHopId || '') !== id
+        ? `经 ${route.nextHopName || route.nextHopId}`
+        : ''
+      const reason = !trusted
+        ? '未完成可信配对'
+        : (!reachable
+            ? '当前不可达'
+            : (!allowed ? '文件传输权限未开启' : routeLabel))
       return {
         id,
         name: node.name || id,
@@ -7051,10 +7237,15 @@ function getFileTransferTargets() {
         kind: node.kind || inferKind(node),
         host: hosts[0] || '',
         lastSeen: node.lastSeen || 0,
+        status,
+        statusLabel: getDeviceStatusLabel(status),
         reachable,
         allowed,
         selected: reachable && allowed,
         reason,
+        routeNextHopId: route?.nextHopId || '',
+        routeNextHopName: route?.nextHopName || '',
+        routeMetric: route?.metric || 0,
         maxFileSizeMb: Number(node.contentPolicy?.maxFileSizeMb || node.maxFileSizeMb || desktopMessageSettings.maxFileSizeMb || 50)
       }
     })

@@ -102,6 +102,7 @@ class WebSocketService : Service() {
 
         const val NOTIFICATION_ID = 1001
         const val CHANNEL_ID = "code_sync_service"
+        private const val MAX_INLINE_CLIPBOARD_TEXT_BYTES = 20 * 1024
         private const val MAX_INLINE_CLIPBOARD_IMAGE_BYTES = 180 * 1024
         const val CONNECTION_STATE_ACTION = "com.codesync.CONNECTION_STATE"
         // 收到桌面节点下发的 TOTP 种子并存库后，发此本地广播通知界面刷新列表
@@ -310,6 +311,10 @@ class WebSocketService : Service() {
             clipOrigin = identity.id
             ClipboardSyncState.remember(this, clipTs, clipOrigin, text)
         }
+        if (text.toByteArray(Charsets.UTF_8).size > MAX_INLINE_CLIPBOARD_TEXT_BYTES) {
+            handleSendClipboardTextAsFile(text, clipTs, clipOrigin)
+            return
+        }
         enqueueAndDeliver(
             code = "",
             source = "剪贴板",
@@ -318,6 +323,94 @@ class WebSocketService : Service() {
             rawMessage = text,
             clipVersionTs = clipTs,
             clipVersionOrigin = clipOrigin
+        )
+    }
+
+    private fun handleSendClipboardTextAsFile(text: String, clipTs: Long, clipOrigin: String) {
+        val targetDevices = targetDevicesForType("clipboard_text")
+        if (targetDevices.isEmpty()) {
+            stopIfNothingPending("没有允许接收剪贴板文本的推送目标")
+            return
+        }
+        val bytes = text.toByteArray(Charsets.UTF_8)
+        val maxBytes = 512L * 1024L * 1024L
+        if (bytes.isEmpty() || bytes.size > maxBytes) {
+            stopIfNothingPending("剪贴板文本超过发送上限")
+            return
+        }
+        val identity = PhoneIdentityStore.get(this)
+        val shortHash = ClipboardSyncState.hash(text)
+        val dir = File(filesDir, "outgoing_clipboard_text").apply { mkdirs() }
+        dir.listFiles()?.forEach { file ->
+            runCatching {
+                if (System.currentTimeMillis() - file.lastModified() > 30 * 60 * 1000L) file.delete()
+            }
+        }
+        val file = File(dir, "clipboard-$clipTs-$shortHash.txt")
+        runCatching { file.writeText(text, Charsets.UTF_8) }.onFailure {
+            stopIfNothingPending("剪贴板文本暂存失败")
+            return
+        }
+        val lanHost = LanDiscovery.localLanHost()
+        val tsHost = LanDiscovery.localTailscaleHost()
+        val host = lanHost.ifBlank { tsHost }
+        val altHosts = listOf(tsHost).filter { it.isNotBlank() && it != host }.distinct()
+        val manifest = FileTransferRegistry.registerOutgoingFile(
+            file = file,
+            name = file.name,
+            mime = "text/plain",
+            identity = identity,
+            targetDeviceIds = targetDevices.map { it.id },
+            host = host,
+            tsHost = tsHost,
+            altHosts = altHosts,
+            relayPort = LanDiscovery.NODE_RELAY_PORT
+        )
+        val fileId = manifest.optString("fileId")
+        val payload = JSONObject()
+            .put("type", "clipboard_text")
+            .put("code", "")
+            .put("source", "剪贴板")
+            .put("label", "剪贴板文本")
+            .put("rawMessage", "剪贴板文本 ${formatBytes(bytes.size.toLong())}")
+            .put("timestamp", clipTs)
+            .put("phoneId", identity.id)
+            .put("phoneName", identity.name)
+            .put("sourceDeviceId", identity.id)
+            .put("sourceDeviceName", identity.name)
+            .put("sourceDeviceType", "ANDROID_PHONE")
+            .put("originDeviceId", identity.id)
+            .put("originDeviceName", identity.name)
+            .put("originMessageId", fileId)
+            .put("relayMessageId", fileId)
+            .put("relayPath", JSONArray().put(identity.id))
+            .put("relayTtl", SMS_RELAY_TTL)
+            .put("relayPolicy", "source_selected_targets")
+            .put("targetDevices", buildTargetTopology(targetDevices))
+            .put("targetDeviceIds", JSONArray(targetDevices.map { it.id }))
+            .put("pushAuthority", "source_device")
+            .put("pushAuthorityDeviceId", identity.id)
+            .put("sourceHost", host)
+            .put("sourceTsHost", tsHost)
+            .put("sourceAltHosts", JSONArray(altHosts))
+            .put(
+                "clipVersion",
+                JSONObject()
+                    .put("ts", clipTs)
+                    .put("origin", clipOrigin.ifBlank { identity.id })
+                    .put("hash", shortHash)
+                    .put("kind", "text")
+            )
+            .put("clipboardTextEncoding", "utf-8")
+            .put("fileManifest", manifest)
+            .toString()
+
+        enqueuePayloadToDevices(
+            payload = payload,
+            targetDevices = targetDevices,
+            type = "clipboard_text",
+            statusMessage = "正在同步剪贴板长文本到 ${targetDevices.size} 个设备节点",
+            msgId = fileId
         )
     }
 

@@ -427,9 +427,12 @@ function setupFileTransferControls() {
     targetList.innerHTML = fileTransferTargets.map(target => {
       const disabled = !target.allowed || !target.reachable
       const checked = target.selected && !disabled
+      const statusText = target.statusLabel || getTopologyStatusLabel(target.status || (target.reachable ? 'reachable' : 'offline'))
       const meta = [
+        statusText,
         getDeviceTypeName(target.type),
         target.host || '',
+        target.routeNextHopName ? `经 ${target.routeNextHopName}` : '',
         target.lastSeen ? `上次同步 ${formatTime(target.lastSeen)}` : '',
         target.reason || ''
       ].filter(Boolean).join(' · ')
