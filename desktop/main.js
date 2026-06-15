@@ -16,6 +16,8 @@ const totpStore = require('./src/main/totp-store')
 const relayClient = require('./src/main/relay-client')
 const busEnvelope = require('./src/main/bus-envelope')
 const { createContentBus } = require('./src/main/content-bus')
+const { createBusReliabilityStore } = require('./src/main/bus-reliability')
+const { createRouteHealthTracker } = require('./src/main/route-manager')
 const { registerDesktopIpc } = require('./src/main/desktop-ipc')
 const updater = require('./src/main/updater')
 const { createFileTransfer } = require('./src/main/file-transfer')
@@ -53,6 +55,9 @@ let topologyLsdb = {
 }
 let topologyDeltaBacklog = []
 let contentBus = null
+let busReliabilityStore = null
+let busOutboxFlushTimer = null
+let routeHealthTracker = createRouteHealthTracker()
 let topologyBroadcastSuppressionDepth = 0
 // 每条活跃连接对应的会话密钥（ws -> sessionKey base64），用于反向加密下发 TOTP 种子同步
 let phoneSessionKeys = new WeakMap()
@@ -106,6 +111,7 @@ const DEFAULT_MESSAGE_SETTINGS = {
 }
 const PAIRING_CONFIG_FILE = 'pairing.json'
 const FILE_TRANSFER_HISTORY_FILE = 'file-transfer-history.json'
+const BUS_RELIABILITY_FILE = 'bus-reliability.json'
 const FILE_TRANSFER_HISTORY_LIMIT = 300
 const gotSingleInstanceLock = app.requestSingleInstanceLock()
 const ICON_PATH = path.join(__dirname, 'assets', 'icon.ico')
@@ -872,6 +878,15 @@ function normalizeLsdbNode(raw = {}) {
   const isPhone = type.includes('PHONE')
   const host = normalizeNetworkHost(raw.host || raw.lastIP || raw.relayHost || '')
   const pairingKeyValue = String(raw.pairingKey || raw.pk || '').trim()
+  const altHosts = Array.isArray(raw.altHosts)
+    ? raw.altHosts.map(normalizeNetworkHost).filter(Boolean)
+    : []
+  const hasAddressOrRoute = !!host ||
+    !!String(raw.tsHost || '').trim() ||
+    altHosts.length > 0 ||
+    !!String(raw.routeNextHopId || '').trim() ||
+    Number(raw.routeMetric || 0) > 0 ||
+    (Array.isArray(raw.routePath) && raw.routePath.length > 1)
   const now = Date.now()
   const updatedAt = normalizeLsdbSeq(raw.updatedAt || raw.lastSeen, now)
   return {
@@ -884,9 +899,7 @@ function normalizeLsdbNode(raw = {}) {
     port: Number(raw.port || raw.relayPort || (isPhone ? 19529 : WS_PORT)),
     pairingKey: pairingKeyValue,
     tsHost: String(raw.tsHost || '').trim(),
-    altHosts: Array.isArray(raw.altHosts)
-      ? raw.altHosts.map(normalizeNetworkHost).filter(Boolean)
-      : [],
+    altHosts,
     networkId: String(raw.networkId || '').trim(),
     autoPaired: raw.autoPaired === true,
     trustSourceId: String(raw.trustSourceId || '').trim(),
@@ -899,7 +912,7 @@ function normalizeLsdbNode(raw = {}) {
     connected: raw.connected === true,
     status: raw.status || (raw.connected ? 'online' : 'offline'),
     authority: raw.authority || 'topology_gossip',
-    routable: raw.routable === true || (!!host && !!pairingKeyValue && raw.enabled !== false && raw.revoked !== true),
+    routable: raw.routable === true || (hasAddressOrRoute && !!pairingKeyValue && raw.enabled !== false && raw.revoked !== true),
     sourceId: String(raw.sourceId || raw.originDeviceId || raw.sourceDeviceId || '').trim(),
     seq: normalizeLsdbSeq(raw.seq || raw.updatedAt, updatedAt),
     updatedAt,
@@ -1095,6 +1108,53 @@ function getFileTransferHistoryPath() {
   return path.join(app.getPath('userData'), FILE_TRANSFER_HISTORY_FILE)
 }
 
+function getBusReliabilityPath() {
+  return path.join(app.getPath('userData'), BUS_RELIABILITY_FILE)
+}
+
+function loadBusReliabilityState() {
+  try {
+    const filePath = getBusReliabilityPath()
+    if (!fs.existsSync(filePath)) return {}
+    return JSON.parse(fs.readFileSync(filePath, 'utf8'))
+  } catch (error) {
+    console.warn('Failed to load bus reliability state:', error.message)
+    return {}
+  }
+}
+
+function saveBusReliabilityState(state) {
+  const filePath = getBusReliabilityPath()
+  const tmpPath = `${filePath}.tmp`
+  try {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true })
+    fs.writeFileSync(tmpPath, JSON.stringify(state || {}, null, 2), 'utf8')
+    fs.renameSync(tmpPath, filePath)
+  } catch (error) {
+    console.warn('Failed to save bus reliability state:', error.message)
+  }
+}
+
+function getBusReliabilityStore() {
+  if (!busReliabilityStore) {
+    busReliabilityStore = createBusReliabilityStore({
+      loadState: loadBusReliabilityState,
+      saveState: saveBusReliabilityState
+    })
+  }
+  return busReliabilityStore
+}
+
+function startBusOutboxFlushTimer() {
+  if (busOutboxFlushTimer) return
+  busOutboxFlushTimer = setInterval(() => {
+    getContentBus().flushOutbox(25).catch(error => {
+      console.warn('Bus outbox flush failed:', error.message)
+    })
+  }, 30 * 1000)
+  busOutboxFlushTimer.unref?.()
+}
+
 function loadFileTransferHistory() {
   try {
     const filePath = getFileTransferHistoryPath()
@@ -1223,6 +1283,7 @@ function canReceiveBusTopic(topic) {
 
 function getContentBus() {
   if (contentBus) return contentBus
+  startBusOutboxFlushTimer()
   contentBus = createContentBus({
     getIdentity: getDesktopIdentity,
     getNetworkId: ensureTrustedNetworkId,
@@ -1246,7 +1307,9 @@ function getContentBus() {
     sendWs: (target, envelope) => sendBusEnvelopeWs(target, envelope),
     sendRelay: (target, envelope, route) => sendBusEnvelopeLegacyRelay(target, envelope, route),
     onReceive: (envelope, context) => dispatchInboundBusEnvelope(envelope, context.lastHopDeviceId || ''),
-    log: message => console.log(message)
+    log: message => console.log(message),
+    reliabilityStore: getBusReliabilityStore(),
+    routeHealth: routeHealthTracker
   })
   return contentBus
 }
@@ -7122,9 +7185,22 @@ function findRouteForTarget(routes = [], targetId = '') {
 function getFileTransferTargetStatus(node = {}, snapshotNode = null, route = null) {
   if (node.enabled === false) return 'disabled'
   if (node.revoked === true) return 'revoked'
-  if (node.connected === true || snapshotNode?.status === 'online' || route?.active === true) return 'online'
+  const id = String(node.id || node.phoneId || '').trim()
+  const nodeStatus = String(node.status || '').toLowerCase()
+  const snapshotStatus = String(snapshotNode?.status || '').toLowerCase()
   if (
-    snapshotNode?.status === 'reachable' ||
+    node.connected === true ||
+    hasActiveWsForNode(id) ||
+    nodeStatus === 'online' ||
+    snapshotStatus === 'online' ||
+    route?.active === true
+  ) {
+    return 'online'
+  }
+  if (
+    nodeStatus === 'reachable' ||
+    snapshotStatus === 'reachable' ||
+    route?.partiallyActive === true ||
     route ||
     node.routable === true ||
     hasDirectNodeAddress(node) ||
@@ -7174,6 +7250,8 @@ function getFileTransferTargets() {
       Number(raw.lastSeen || raw.updatedAt || 0) || 0
     )
     const connected = previous.connected === true || raw.connected === true || hasActiveWsForNode(id)
+    const previousStatus = String(previous.status || '').toLowerCase()
+    const rawStatus = String(raw.status || '').toLowerCase()
     const contentPolicy = normalizePushContentPolicy({
       ...(previous.contentPolicy || previous || {}),
       ...(raw.contentPolicy || raw || {})
@@ -7191,7 +7269,9 @@ function getFileTransferTargets() {
       contentPolicy,
       lastSeen,
       connected,
-      status: connected ? 'online' : (raw.status || previous.status || 'known'),
+      status: connected || previousStatus === 'online' || rawStatus === 'online'
+        ? 'online'
+        : (raw.status || previous.status || 'known'),
       lastIP: raw.lastIP || previous.lastIP || mergedHosts[0] || '',
       host: raw.host || previous.host || mergedHosts[0] || '',
       relayHost: raw.relayHost || previous.relayHost || '',
@@ -7688,6 +7768,11 @@ app.on('window-all-closed', () => {
 app.on('before-quit', () => {
   // 退出前把防抖中未落盘的配对数据写掉
   flushPendingPairingSave()
+  busReliabilityStore?.flushSave?.()
+  if (busOutboxFlushTimer) {
+    clearInterval(busOutboxFlushTimer)
+    busOutboxFlushTimer = null
+  }
   if (topologyBroadcastTimer) {
     clearTimeout(topologyBroadcastTimer)
     topologyBroadcastTimer = null

@@ -15,6 +15,7 @@ import android.util.Base64
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.codesync.MainActivity
+import com.codesync.util.BusReliabilityStore
 import com.codesync.util.ClipboardSyncState
 import com.codesync.util.ContentBus
 import com.codesync.util.CryptoUtil
@@ -220,6 +221,7 @@ class WebSocketService : Service() {
         }
 
         // 按需模型：任务自然结束后会自行 stopSelf，不需要系统自动重启
+        serviceScope.launch { flushBusOutbox() }
         return START_NOT_STICKY
     }
 
@@ -1267,6 +1269,50 @@ class WebSocketService : Service() {
         }
     }
 
+    private fun deliverBusEnvelopeHttp(
+        device: DesktopDevice,
+        busEnvelope: JSONObject,
+        rememberOutbound: Boolean = true
+    ): Boolean {
+        if (device.port <= 0 || device.pairingKey.isBlank()) return false
+        val hosts = candidateHosts(device)
+        if (hosts.isEmpty()) return false
+        val messageId = busEnvelope.optString("messageId")
+        if (rememberOutbound) BusReliabilityStore.rememberOutbound(this, busEnvelope, device.id)
+        val busTransport = ContentBus.wrapTransportEnvelope(this, busEnvelope, device.pairingKey)
+        for (host in hosts) {
+            try {
+                val body = busTransport.toString()
+                    .toRequestBody("application/json; charset=utf-8".toMediaType())
+                val request = Request.Builder()
+                    .url("http://${formatHttpHost(host)}:${device.port}/bus/message")
+                    .post(body)
+                    .build()
+                relayHttpClient.newCall(request).execute().use { response ->
+                    if (response.isSuccessful) {
+                        BusReliabilityStore.markDelivered(this, messageId, device.id)
+                        return true
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Bus HTTP unreachable for ${device.name}@$host: ${e.message}")
+            }
+        }
+        BusReliabilityStore.markFailed(this, messageId, device.id, "bus_http_unreachable")
+        return false
+    }
+
+    private fun flushBusOutbox() {
+        val due = BusReliabilityStore.dueOutbound(this, 10)
+        for (record in due) {
+            val targetId = record.optString("targetNodeId").trim()
+            val envelope = record.optJSONObject("envelope") ?: continue
+            val device = DeviceStore.findDevice(this, targetId) ?: continue
+            if (!device.enabled || !deviceSupportsSoftBus(device)) continue
+            deliverBusEnvelopeHttp(device, envelope, rememberOutbound = false)
+        }
+    }
+
     private fun sendRelayHttp(device: DesktopDevice, payload: String): Boolean {
         if (device.port <= 0 || device.pairingKey.isBlank()) return false
         val hosts = candidateHosts(device)
@@ -1278,22 +1324,7 @@ class WebSocketService : Service() {
                     ContentBus.envelopeFromLegacyPayload(this, JSONObject(payload))
                 }.getOrNull()
                 if (busEnvelope != null) {
-                    val busTransport = ContentBus.wrapTransportEnvelope(this, busEnvelope, device.pairingKey)
-                    for (host in hosts) {
-                        try {
-                            val body = busTransport.toString()
-                                .toRequestBody("application/json; charset=utf-8".toMediaType())
-                            val request = Request.Builder()
-                                .url("http://${formatHttpHost(host)}:${device.port}/bus/message")
-                                .post(body)
-                                .build()
-                            relayHttpClient.newCall(request).execute().use { response ->
-                                if (response.isSuccessful) return true
-                            }
-                        } catch (e: Exception) {
-                            Log.w(TAG, "Bus HTTP unreachable for ${device.name}@$host: ${e.message}")
-                        }
-                    }
+                    if (deliverBusEnvelopeHttp(device, busEnvelope, rememberOutbound = true)) return true
                 }
             }
             // 发送时间戳放在加密负载内（GCM 保证完整性）：接收端拒绝超出
@@ -1956,13 +1987,24 @@ class WebSocketService : Service() {
                 val node = nodes.optJSONObject(i) ?: continue
                 val id = node.optString("id").trim()
                 val type = node.optString("type", node.optString("deviceType", "")).trim()
-                val host = node.optString("host").trim()
+                val directHost = node.optString("host").trim()
+                val altHosts = (jsonArrayToList(node.optJSONArray("altHosts")) +
+                    listOfNotNull(node.optString("tsHost").trim().takeIf { it.isNotBlank() }))
+                    .map { it.trim() }
+                    .filter { it.isNotBlank() }
+                    .distinct()
+                val host = directHost.ifBlank { altHosts.firstOrNull().orEmpty() }
                 val normalizedType = type.ifBlank { "UNKNOWN_DEVICE" }
                 val isPhone = normalizedType.uppercase(Locale.ROOT).contains("PHONE")
                 val port = node.optInt("port", if (isPhone) LanDiscovery.NODE_RELAY_PORT else 19527)
                 val pairingKey = node.optString("pairingKey", node.optString("pk", "")).trim()
                 val route = node.optJSONObject("route") ?: routeByDestination[id]
-                if (id.isBlank() || id == identity.id || host.isBlank() || pairingKey.isBlank()) continue
+                val routePath = jsonArrayToList(route?.optJSONArray("path"))
+                val hasRoute = (route?.optInt("metric", 0) ?: 0) > 0 ||
+                    route?.optString("nextHopId").orEmpty().isNotBlank() ||
+                    routePath.size > 1
+                if (id.isBlank() || id == identity.id || pairingKey.isBlank()) continue
+                if (host.isBlank() && !hasRoute) continue
                 DeviceStore.upsertDevice(
                     context = this,
                     host = host,
@@ -1974,15 +2016,13 @@ class WebSocketService : Service() {
                     routeMetric = route?.optInt("metric", 0) ?: 0,
                     routeNextHopId = route?.optString("nextHopId").orEmpty(),
                     routeNextHopName = route?.optString("nextHopName").orEmpty(),
-                    routePath = jsonArrayToList(route?.optJSONArray("path")),
+                    routePath = routePath,
                     // 路由新鲜度以「整包路由表的计算时间」为准（同一包内统一），而不是
                     // 单条边的 updatedAt——后者来自 lastSeen，可能比已存值旧，
                     // 会被 DeviceStore 的新鲜度比较误判为过期路由
                     routeUpdatedAt = sync.optLong("updatedAt", 0L).takeIf { it > 0L }
                         ?: route?.optLong("updatedAt", 0L) ?: 0L,
-                    altHosts = (jsonArrayToList(node.optJSONArray("altHosts")) +
-                        listOfNotNull(node.optString("tsHost").trim().takeIf { it.isNotBlank() }))
-                        .distinct(),
+                    altHosts = altHosts.filter { it != host },
                     policyAllowSmsCodes = node.optBoolean("allowSmsCodes", true),
                     policyAllowSmsMessages = node.optBoolean("allowSmsMessages", true),
                     policyAllowNotifications = node.optBoolean("allowNotifications", true),

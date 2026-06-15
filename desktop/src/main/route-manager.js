@@ -8,6 +8,10 @@ const TRANSPORT_PRIORITY = Object.freeze({
   legacy_http: 50
 })
 
+const DEFAULT_ROUTE_FAILURE_PENALTY = 25
+const DEFAULT_ROUTE_COOLDOWN_MS = 30 * 1000
+const DEFAULT_ROUTE_HEALTH_TTL_MS = 10 * 60 * 1000
+
 function isTailscaleAddress(host) {
   const parts = String(host || '').trim().split('.')
   if (parts.length !== 4) return false
@@ -96,10 +100,93 @@ function chooseBestRoute(input) {
   return buildPeerRoutes(input)[0] || null
 }
 
+function routeHealthKey(targetId, route = {}) {
+  return [
+    String(targetId || route.targetId || '').trim(),
+    String(route.transportType || '').trim(),
+    String(route.nextHopId || '').trim(),
+    String(route.host || '').trim(),
+    String(route.port || '').trim()
+  ].join('|')
+}
+
+function createRouteHealthTracker(options = {}) {
+  const {
+    failurePenalty = DEFAULT_ROUTE_FAILURE_PENALTY,
+    cooldownMs = DEFAULT_ROUTE_COOLDOWN_MS,
+    ttlMs = DEFAULT_ROUTE_HEALTH_TTL_MS
+  } = options
+  const states = new Map()
+
+  function prune(now = Date.now()) {
+    for (const [key, state] of states) {
+      const updatedAt = Math.max(Number(state.lastSuccessAt || 0), Number(state.lastFailureAt || 0))
+      if (updatedAt && now - updatedAt > ttlMs) states.delete(key)
+    }
+  }
+
+  function recordResult(targetId, route, ok) {
+    const key = routeHealthKey(targetId, route)
+    if (!key.trim()) return
+    const now = Date.now()
+    const existing = states.get(key) || { failures: 0, successes: 0, lastSuccessAt: 0, lastFailureAt: 0 }
+    if (ok) {
+      states.set(key, {
+        ...existing,
+        failures: 0,
+        successes: existing.successes + 1,
+        lastSuccessAt: now,
+        lastFailureAt: existing.lastFailureAt || 0
+      })
+    } else {
+      states.set(key, {
+        ...existing,
+        failures: existing.failures + 1,
+        lastFailureAt: now
+      })
+    }
+    prune(now)
+  }
+
+  function scoreRoute(targetId, route) {
+    const state = states.get(routeHealthKey(targetId, route))
+    if (!state) return Number(route.metric || 0)
+    const now = Date.now()
+    const coolingDown = state.lastFailureAt && now - state.lastFailureAt < cooldownMs
+    const penalty = (state.failures || 0) * failurePenalty + (coolingDown ? failurePenalty : 0)
+    const successBonus = state.lastSuccessAt && !coolingDown ? Math.min(5, state.successes || 0) : 0
+    return Number(route.metric || 0) + penalty - successBonus
+  }
+
+  function rankRoutes(targetId, routes = []) {
+    prune()
+    return routes
+      .map(route => ({ ...route, healthMetric: scoreRoute(targetId, route) }))
+      .sort((a, b) =>
+        a.healthMetric - b.healthMetric ||
+        Number(a.metric || 0) - Number(b.metric || 0) ||
+        String(a.transportType).localeCompare(String(b.transportType))
+      )
+  }
+
+  function snapshot() {
+    prune()
+    return Array.from(states.entries()).map(([key, value]) => ({ key, ...value }))
+  }
+
+  return {
+    recordResult,
+    rankRoutes,
+    snapshot
+  }
+}
+
 module.exports = {
   TRANSPORT_PRIORITY,
   isTailscaleAddress,
   hostCandidates,
   buildPeerRoutes,
-  chooseBestRoute
+  chooseBestRoute,
+  routeHealthKey,
+  createRouteHealthTracker
 }

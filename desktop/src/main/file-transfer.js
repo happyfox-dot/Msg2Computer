@@ -24,6 +24,7 @@ const DEFAULT_CHUNK_BYTES = 4 * 1024 * 1024 // 4MB
 const DEFAULT_OFFER_TTL_MS = 30 * 60 * 1000 // offer 30 分钟过期
 const NONCE_TTL_MS = 5 * 60 * 1000
 const NONCE_LIMIT = 500
+const DEFAULT_PARALLEL_PULLS = 3
 
 // 极简扩展名 → mime（仅用于展示，不参与安全判定）
 const MIME_BY_EXT = {
@@ -117,6 +118,50 @@ function readFileRange(absPath, from, to) {
   })
 }
 
+function buildBlockPlan(size, chunkSize) {
+  const blocks = []
+  let offset = 0
+  let index = 0
+  while (offset < size) {
+    const to = Math.min(offset + chunkSize - 1, size - 1)
+    blocks.push({ index, from: offset, to, length: to - offset + 1 })
+    offset = to + 1
+    index += 1
+  }
+  return blocks
+}
+
+function loadIncomingSidecar(sidecarPath, manifest, size, chunkSize) {
+  try {
+    if (!fs.existsSync(sidecarPath)) return new Set()
+    const parsed = JSON.parse(fs.readFileSync(sidecarPath, 'utf8'))
+    if (parsed.fileId !== manifest.fileId) return new Set()
+    if (String(parsed.sha256 || '') !== String(manifest.sha256 || '')) return new Set()
+    if (Number(parsed.size || 0) !== Number(size)) return new Set()
+    if (Number(parsed.chunkSize || 0) !== Number(chunkSize)) return new Set()
+    return new Set(Array.isArray(parsed.completedBlocks)
+      ? parsed.completedBlocks.map(Number).filter(Number.isInteger)
+      : [])
+  } catch (_) {
+    return new Set()
+  }
+}
+
+function saveIncomingSidecar(sidecarPath, manifest, size, chunkSize, completedBlocks) {
+  try {
+    fs.mkdirSync(path.dirname(sidecarPath), { recursive: true })
+    fs.writeFileSync(sidecarPath, JSON.stringify({
+      version: 1,
+      fileId: manifest.fileId,
+      sha256: manifest.sha256 || '',
+      size,
+      chunkSize,
+      completedBlocks: Array.from(completedBlocks).sort((a, b) => a - b),
+      updatedAt: Date.now()
+    }), 'utf8')
+  } catch (_) {}
+}
+
 function createFileTransfer(deps = {}) {
   const {
     getIdentity,
@@ -132,6 +177,7 @@ function createFileTransfer(deps = {}) {
     downloadDir,
     tmpDir,
     maxChunkBytes = DEFAULT_CHUNK_BYTES,
+    maxParallelPulls = DEFAULT_PARALLEL_PULLS,
     offerTtlMs = DEFAULT_OFFER_TTL_MS,
     onComplete = () => {},
     onProgress = () => {},
@@ -201,6 +247,8 @@ function createFileTransfer(deps = {}) {
     const name = path.basename(absPath)
     const mime = guessMime(name)
     const chunkSize = maxChunkBytes
+    const chunkEncodings = options.allowPlainChunks === false ? ['aes-gcm'] : ['none', 'aes-gcm']
+    const blockCount = Math.ceil(size / chunkSize)
     const expiresAt = ts + offerTtlMs
     const targets = Array.isArray(targetIds) ? targetIds.map(String).filter(Boolean) : []
     const payloadExtra = options.payloadExtra && typeof options.payloadExtra === 'object'
@@ -216,7 +264,7 @@ function createFileTransfer(deps = {}) {
       chunkSize,
       expiresAt,
       targetDeviceIds: new Set(targets),
-      chunkEncodings: new Set(['none', 'aes-gcm'])
+      chunkEncodings: new Set(chunkEncodings)
     })
 
     const sourceHost = String(options.sourceHost || payloadExtra.sourceHost || '').trim()
@@ -232,10 +280,14 @@ function createFileTransfer(deps = {}) {
       size,
       sha256,
       chunkSize,
+      blockSize: chunkSize,
+      blockCount,
+      transferProtocol: 'codebridge-block-v1',
+      resumeSupported: true,
       originDeviceId: identity.id,
       expiresAt,
       inline: false,
-      chunkEncodings: ['none', 'aes-gcm']
+      chunkEncodings
     }
     if (sourceHost) manifest.host = sourceHost
     if (sourceTsHost) manifest.tsHost = sourceTsHost
@@ -335,6 +387,10 @@ function createFileTransfer(deps = {}) {
       try {
         if (t.tmpPath && fs.existsSync(t.tmpPath)) fs.unlinkSync(t.tmpPath)
       } catch (_) {}
+      try {
+        const sidecarPath = `${t.tmpPath}.json`
+        if (fs.existsSync(sidecarPath)) fs.unlinkSync(sidecarPath)
+      } catch (_) {}
     }
     incomingTransfers.delete(fileId)
   }
@@ -374,6 +430,15 @@ function createFileTransfer(deps = {}) {
     const name = sanitizeFileName(manifest.name)
     const usePlainChunks = Array.isArray(manifest.chunkEncodings) && manifest.chunkEncodings.includes('none')
     const tmpPath = path.join(tmpDir, `${fileId}.part`)
+    const sidecarPath = `${tmpPath}.json`
+    const blocks = buildBlockPlan(size, chunkSize)
+    const completedBlocks = loadIncomingSidecar(sidecarPath, manifest, size, chunkSize)
+    if (!fs.existsSync(tmpPath)) completedBlocks.clear()
+    for (const index of Array.from(completedBlocks)) {
+      if (!blocks[index]) completedBlocks.delete(index)
+    }
+    const completedBytes = () => Array.from(completedBlocks)
+      .reduce((sum, index) => sum + (blocks[index]?.length || 0), 0)
     try {
       fs.mkdirSync(tmpDir, { recursive: true })
       fs.mkdirSync(saveDir, { recursive: true })
@@ -386,9 +451,8 @@ function createFileTransfer(deps = {}) {
       size,
       sha256: String(manifest.sha256 || ''),
       chunkSize,
-      received: 0,
+      received: completedBytes(),
       source,
-      hash: crypto.createHash('sha256'),
       active: true,
       expiresAt: Number(manifest.expiresAt) || Date.now() + offerTtlMs
     }
@@ -396,7 +460,10 @@ function createFileTransfer(deps = {}) {
 
     let fd
     try {
-      fd = fs.openSync(tmpPath, 'w')
+      fd = fs.openSync(tmpPath, fs.existsSync(tmpPath) ? 'r+' : 'w+')
+      const stat = fs.fstatSync(fd)
+      if (stat.size !== size) fs.ftruncateSync(fd, size)
+      saveIncomingSidecar(sidecarPath, manifest, size, chunkSize, completedBlocks)
     } catch (e) {
       onError({ phase: 'pull', fileId, error: `无法创建临时文件: ${e.message}` })
       incomingTransfers.delete(fileId)
@@ -442,8 +509,39 @@ function createFileTransfer(deps = {}) {
         return null
       }
 
-      let offset = record.received
-      while (offset < size && record.active) {
+      const pendingBlocks = blocks.filter(block => !completedBlocks.has(block.index))
+      let nextPendingIndex = 0
+      const parallelism = Math.max(1, Math.min(4, Number(options.parallelism || maxParallelPulls) || 1))
+      const worker = async () => {
+        while (record.active) {
+          const block = pendingBlocks[nextPendingIndex++]
+          if (!block) return
+          const offset = block.from
+          const to = block.to
+          const resp = await fetchChunk(offset, to)
+          if (!resp) {
+            throw new Error(`chunk pull failed: all transports unreachable @${offset}`)
+          }
+          const plain = usePlainChunks ? resp.body : decryptBytes(resp.body, source.pairingKey)
+          if (!plain) throw new Error(`chunk decrypt failed @${offset}`)
+          if (plain.length !== block.length) {
+            throw new Error(`chunk length mismatch expected=${block.length} got=${plain.length} @${offset}`)
+          }
+          fs.writeSync(fd, plain, 0, plain.length, offset)
+          completedBlocks.add(block.index)
+          record.received = completedBytes()
+          saveIncomingSidecar(sidecarPath, manifest, size, chunkSize, completedBlocks)
+          onProgress({ fileId, name, received: record.received, size })
+        }
+      }
+      await Promise.all(Array.from(
+        { length: Math.min(parallelism, pendingBlocks.length || 1) },
+        () => worker()
+      ))
+      if (completedBlocks.size !== blocks.length) {
+        throw new Error(`incomplete transfer blocks=${completedBlocks.size}/${blocks.length}`)
+      }
+      while (false) {
         const to = Math.min(offset + chunkSize - 1, size - 1)
         const resp = await fetchChunk(offset, to)
         if (!resp) {
@@ -464,7 +562,7 @@ function createFileTransfer(deps = {}) {
     } catch (e) {
       try { fs.closeSync(fd) } catch (_) {}
       onError({ phase: 'pull', fileId, error: e.message })
-      cleanupIncoming(fileId)
+      incomingTransfers.delete(fileId)
       return false
     }
 
@@ -476,7 +574,7 @@ function createFileTransfer(deps = {}) {
     }
 
     // 校验 sha256 重组
-    const actualHash = record.hash.digest('hex')
+    const { sha256: actualHash } = await hashFile(tmpPath)
     if (record.sha256 && !timingSafeStrEqual(actualHash, record.sha256)) {
       onError({ phase: 'pull', fileId, error: `sha256 校验失败，丢弃 (期望 ${record.sha256.slice(0, 12)} 实得 ${actualHash.slice(0, 12)})` })
       cleanupIncoming(fileId)
@@ -484,6 +582,9 @@ function createFileTransfer(deps = {}) {
     }
 
     // 移动到目标目录（目录分享按消毒后的 relativePath 重建子目录），重名加序号
+    try {
+      if (fs.existsSync(sidecarPath)) fs.unlinkSync(sidecarPath)
+    } catch (_) {}
     const relativeDir = safeRelativeDir(manifest.relativePath)
     const finalDir = relativeDir ? path.join(saveDir, relativeDir) : saveDir
     try { fs.mkdirSync(finalDir, { recursive: true }) } catch (_) {}

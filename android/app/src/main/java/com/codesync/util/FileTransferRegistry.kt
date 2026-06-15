@@ -31,7 +31,8 @@ object FileTransferRegistry {
         val sha256: String,
         val chunkSize: Int,
         val expiresAt: Long,
-        val targetDeviceIds: Set<String>
+        val targetDeviceIds: Set<String>,
+        val chunkEncodings: Set<String>
     )
 
     private val outgoingTransfers = ConcurrentHashMap<String, OutgoingTransfer>()
@@ -55,6 +56,7 @@ object FileTransferRegistry {
         val sha256 = sha256File(file)
         val fileId = "file-${identity.id}-$now-${sha256.take(24)}"
         val targets = targetDeviceIds.map { it.trim() }.filter { it.isNotBlank() }.toSet()
+        val chunkEncodings = setOf("none", "aes-gcm")
         val record = OutgoingTransfer(
             file = file,
             name = sanitizeFileName(name.ifBlank { file.name }),
@@ -63,7 +65,8 @@ object FileTransferRegistry {
             sha256 = sha256,
             chunkSize = CHUNK_BYTES,
             expiresAt = now + OFFER_TTL_MS,
-            targetDeviceIds = targets
+            targetDeviceIds = targets,
+            chunkEncodings = chunkEncodings
         )
         outgoingTransfers[fileId] = record
         return JSONObject()
@@ -73,7 +76,11 @@ object FileTransferRegistry {
             .put("size", record.size)
             .put("sha256", record.sha256)
             .put("chunkSize", record.chunkSize)
-            .put("chunkEncodings", JSONArray(listOf("none", "aes-gcm")))
+            .put("blockSize", record.chunkSize)
+            .put("blockCount", ((record.size + record.chunkSize - 1) / record.chunkSize).toInt())
+            .put("transferProtocol", "codebridge-block-v1")
+            .put("resumeSupported", true)
+            .put("chunkEncodings", JSONArray(chunkEncodings.toList()))
             .put("originDeviceId", identity.id)
             .put("originDeviceName", identity.name)
             .put("host", host)
@@ -136,7 +143,11 @@ object FileTransferRegistry {
             raf.seek(from)
             raf.readFully(plain)
         }
-        val body = if (chunkEncoding == "none") plain else CryptoUtil.encryptBytes(plain, sourceKey)
+        val body = if (chunkEncoding == "none" && "none" in transfer.chunkEncodings) {
+            plain
+        } else {
+            CryptoUtil.encryptBytes(plain, sourceKey)
+        }
         return ChunkResponse(
             status = 206,
             body = body,

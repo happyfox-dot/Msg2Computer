@@ -108,7 +108,7 @@ object TopologyStore {
             .put("enabled", true)
             .put("connected", true)
             .put("status", "online")
-            .put("routable", localHost.isNotBlank())
+            .put("routable", localHost.isNotBlank() || localTsHost.isNotBlank())
             .put("authority", "local_phone")
             .put("seq", now)
             .put("updatedAt", now)
@@ -146,7 +146,7 @@ object TopologyStore {
                 .put("autoAcceptFiles", device.autoAcceptFiles)
                 .put("connected", false)
                 .put("status", if (device.enabled) "known" else "disabled")
-                .put("routable", device.enabled && device.host.isNotBlank() && device.pairingKey.isNotBlank())
+                .put("routable", isDeviceRoutable(device))
                 .put("authority", "device_store")
                 .put("seq", device.updatedAt)
                 .put("updatedAt", device.updatedAt)
@@ -174,7 +174,7 @@ object TopologyStore {
                 .put("maxFileSizeMb", device.maxFileSizeMb)
                 .put("autoAcceptFiles", device.autoAcceptFiles)
                 .put("active", false)
-                .put("routable", device.enabled && device.host.isNotBlank() && device.pairingKey.isNotBlank())
+                .put("routable", isDeviceRoutable(device))
                 .put("authority", "device_store")
                 .put("seq", device.updatedAt)
                 .put("updatedAt", device.updatedAt)
@@ -307,7 +307,7 @@ object TopologyStore {
         val nodesById = toObjectMap(loadArray(context, KEY_NODES), "id")
         val linksById = toObjectMap(loadArray(context, KEY_LINKS), "id")
         val isPhone = isPhoneType(device.type)
-        val routable = enabled && !revoked && device.host.isNotBlank() && device.pairingKey.isNotBlank()
+        val routable = isDeviceRoutable(device, enabled, revoked)
 
         nodesById[device.id] = JSONObject()
             .put("id", device.id)
@@ -419,7 +419,13 @@ object TopologyStore {
             .put("pairingKey", raw.optString("pairingKey", raw.optString("pk")).trim())
             .put("enabled", raw.optBoolean("enabled", true))
             .put("revoked", raw.optBoolean("revoked", false))
-            .put("routable", raw.optBoolean("routable", host.isNotBlank() && raw.optString("pairingKey", raw.optString("pk")).isNotBlank()))
+            .put("routable", raw.optBoolean(
+                "routable",
+                rawNodeHasAddressOrRoute(raw, host) &&
+                    raw.optString("pairingKey", raw.optString("pk")).isNotBlank() &&
+                    raw.optBoolean("enabled", true) &&
+                    !raw.optBoolean("revoked", false)
+            ))
             .put("seq", raw.optLong("seq", updatedAt))
             .put("updatedAt", updatedAt)
             .put("lastSeen", raw.optLong("lastSeen", updatedAt))
@@ -449,9 +455,15 @@ object TopologyStore {
     private fun upsertDeviceFromNode(context: Context, node: JSONObject) {
         val id = node.optString("id").trim()
         val type = node.optString("type").trim()
-        val host = node.optString("host").trim()
+        val directHost = node.optString("host").trim()
+        val nodeAltHosts = (jsonArrayToList(node.optJSONArray("altHosts")) +
+            listOfNotNull(node.optString("tsHost").takeIf { it.isNotBlank() }))
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .distinct()
+        val host = directHost.ifBlank { nodeAltHosts.firstOrNull().orEmpty() }
         val pairingKey = node.optString("pairingKey").trim()
-        if (id.isBlank() || host.isBlank() || pairingKey.isBlank()) return
+        if (id.isBlank() || pairingKey.isBlank()) return
         if (!isDeviceType(type)) return
         // gossip 视角的可用性只决定「是否值得为它新建条目」；对已存在的设备
         // 不改写本地 enabled 开关（归本机用户所有，见 DeviceStore.upsertDevice）
@@ -464,12 +476,11 @@ object TopologyStore {
             host = host,
             port = node.optInt("port", if (isPhoneType(type)) LanDiscovery.NODE_RELAY_PORT else 19527),
             pairingKey = pairingKey,
-            name = node.optString("name", "Device $host").ifBlank { "Device $host" },
+            name = node.optString("name", "Device ${host.ifBlank { id }}").ifBlank { "Device ${host.ifBlank { id }}" },
             deviceId = id,
             deviceType = type,
             routeUpdatedAt = node.optLong("updatedAt", 0L),
-            altHosts = jsonArrayToList(node.optJSONArray("altHosts")) +
-                listOfNotNull(node.optString("tsHost").takeIf { it.isNotBlank() }),
+            altHosts = nodeAltHosts.filter { it != host },
             networkId = node.optString("networkId"),
             autoPaired = node.optBoolean("autoPaired", false),
             trustSourceId = node.optString("trustSourceId"),
@@ -521,6 +532,26 @@ object TopologyStore {
     private fun isDeviceType(type: String): Boolean {
         val value = type.uppercase(Locale.ROOT)
         return value.contains("PHONE") || value.contains("DESKTOP")
+    }
+
+    private fun isDeviceRoutable(
+        device: DesktopDevice,
+        enabled: Boolean = device.enabled,
+        revoked: Boolean = false
+    ): Boolean {
+        if (!enabled || revoked || device.pairingKey.isBlank()) return false
+        if (device.host.isNotBlank() || device.altHosts.any { it.isNotBlank() }) return true
+        return device.routeNextHopId.isNotBlank() ||
+            device.routeMetric > 0 ||
+            device.routePath.size > 1
+    }
+
+    private fun rawNodeHasAddressOrRoute(raw: JSONObject, host: String): Boolean {
+        if (host.isNotBlank()) return true
+        if (raw.optString("tsHost").isNotBlank() || raw.optString("relayHost").isNotBlank()) return true
+        if (jsonArrayToList(raw.optJSONArray("altHosts")).any { it.isNotBlank() }) return true
+        if (raw.optString("routeNextHopId").isNotBlank() || raw.optInt("routeMetric", 0) > 0) return true
+        return jsonArrayToList(raw.optJSONArray("routePath")).size > 1
     }
 
     private fun isTrustedSource(context: Context, sourceId: String): Boolean {

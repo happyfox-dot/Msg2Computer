@@ -73,6 +73,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   onLanDevicesChanged: (callback) => {
     ipcRenderer.on('lan-devices-changed', (event, data) => callback(data))
   },
+  onTopologyChanged: (callback) => {
+    ipcRenderer.on('topology-changed', () => callback())
+  },
   onLanJoinRequest: (callback) => {
     ipcRenderer.on('lan-join-request', (event, data) => callback(data))
   },

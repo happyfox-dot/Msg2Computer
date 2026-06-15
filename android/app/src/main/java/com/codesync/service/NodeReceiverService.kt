@@ -21,12 +21,14 @@ import com.codesync.MainActivity
 import com.codesync.R
 import com.codesync.util.ClipboardHistoryStore
 import com.codesync.util.ClipboardSyncState
+import com.codesync.util.BusReliabilityStore
 import com.codesync.util.ContentBus
 import com.codesync.util.CryptoUtil
 import com.codesync.util.DeviceStore
 import com.codesync.util.FileTransferCoordinator
 import com.codesync.util.FileTransferHistoryStore
 import com.codesync.util.FileTransferRegistry
+import com.codesync.util.FileTransferStateStore
 import com.codesync.util.LanDiscovery
 import com.codesync.util.LanJoinClient
 import com.codesync.util.LanJoinCoordinator
@@ -42,12 +44,15 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
-import java.io.FileOutputStream
+import java.io.RandomAccessFile
 import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.ServerSocket
@@ -57,6 +62,7 @@ import java.net.URLDecoder
 import java.net.URLEncoder
 import java.security.MessageDigest
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicInteger
 
 class NodeReceiverService : Service() {
     companion object {
@@ -67,6 +73,10 @@ class NodeReceiverService : Service() {
         private const val MAX_INLINE_CLIPBOARD_IMAGE_BYTES = 180 * 1024
         private const val FILE_TRANSFER_CHUNK_BYTES = 4 * 1024 * 1024
         private const val FILE_TRANSFER_TIMEOUT_MS = 20_000
+        private const val FILE_TRANSFER_PARALLEL_PULLS = 2
+        private const val FILE_TRANSFER_BLOCK_RETRIES = 3
+        const val ACTION_RETRY_FILE_TRANSFER = "com.codesync.RETRY_FILE_TRANSFER"
+        const val EXTRA_FILE_ID = "file_id"
         private const val RECENT_IDS_LIMIT = 200
         private const val PREFS_NAME = "node_relay_dedup"
         private const val KEY_RECENT_IDS = "recent_ids"
@@ -105,6 +115,8 @@ class NodeReceiverService : Service() {
         val sourceName: String
     )
 
+    private class FileTransferPausedException : RuntimeException("file_transfer_paused")
+
     private data class HttpRequest(
         val method: String,
         val path: String,
@@ -119,12 +131,31 @@ class NodeReceiverService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startForeground(NOTIFICATION_ID, buildNotification())
+        if (intent?.action == ACTION_RETRY_FILE_TRANSFER) {
+            handleRetryFileTransfer(intent)
+        }
         if (!running) {
             running = true
             serviceScope.launch { listenLoop() }
         }
         startLanResponder()
         return START_STICKY
+    }
+
+    private fun handleRetryFileTransfer(intent: Intent) {
+        val fileId = intent.getStringExtra(EXTRA_FILE_ID).orEmpty()
+        val task = FileTransferStateStore.get(this, fileId) ?: return
+        if (task.payload.isBlank()) return
+        FileTransferStateStore.resume(this, fileId)
+        serviceScope.launch {
+            val payload = runCatching { JSONObject(task.payload) }.getOrNull() ?: return@launch
+            notifyFileTransferRequested(payload)
+            val received = pullIncomingFileTransfer(payload)
+            if (received != null) {
+                notifyFileTransferComplete(received)
+                WebSocketService.reportExternalStatus(this@NodeReceiverService, "已接收文件：${received.name}")
+            }
+        }
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -616,6 +647,124 @@ class NodeReceiverService : Service() {
         return 200
     }
 
+    private fun handleDecodedBusPayload(payload: JSONObject, lastHopDeviceId: String): Int {
+        val identity = PhoneIdentityStore.get(this)
+        if (lastHopDeviceId.isNotBlank() && payload.optString("lastHopDeviceId").isBlank()) {
+            payload.put("lastHopDeviceId", lastHopDeviceId)
+        }
+        val payloadType = payload.optString("type")
+        if (!isSupportedPayload(payloadType)) return 202
+
+        val messageId = payload.optString("originMessageId")
+            .ifBlank { payload.optString("relayMessageId") }
+            .ifBlank { payload.optString("msgId") }
+        if (messageId.isBlank()) return 400
+
+        val relayPath = payload.optJSONArray("relayPath") ?: JSONArray()
+        if (jsonArrayContains(relayPath, identity.id)) return 202
+
+        val targetDeviceIds = payload.optJSONArray("targetDeviceIds")
+        val isLocalTarget = targetDeviceIds == null ||
+            targetDeviceIds.length() == 0 ||
+            jsonArrayContains(targetDeviceIds, identity.id)
+        if (!isLocalTarget) {
+            Log.d(TAG, "Bus target scope does not include this node; relay only")
+        }
+
+        if (isTopologyPayload(payloadType)) {
+            val changed = TopologyStore.applyDelta(this, payload)
+            if (changed) {
+                sendBroadcast(Intent(WebSocketService.TOTP_SYNCED_ACTION))
+                WebSocketService.reportExternalStatus(this, "已更新拓扑控制面")
+            }
+        } else if (isUserMessagePayload(payloadType)) {
+            val sourceName = payload.optString("sourceDeviceName", payload.optString("phoneName", "未知设备"))
+            if (isLocalTarget && SettingsStore.shouldReceiveContent(this, payloadType)) {
+                if (isClipboardTextPayload(payloadType)) {
+                    val textManifest = payload.optJSONObject("fileManifest")
+                    if (textManifest != null && !textManifest.optBoolean("inline", true)) {
+                        serviceScope.launch {
+                            if (pullRemoteClipboardText(payload)) {
+                                notifyUserMessageRelay(payload)
+                                WebSocketService.reportExternalStatus(
+                                    this@NodeReceiverService,
+                                    receivedStatusMessage(payloadType, sourceName)
+                                )
+                                rewriteClipboardGossipTargets(payload)
+                            }
+                        }
+                    } else if (applyRemoteClipboard(payload)) {
+                        notifyUserMessageRelay(payload)
+                        WebSocketService.reportExternalStatus(this, receivedStatusMessage(payloadType, sourceName))
+                        rewriteClipboardGossipTargets(payload)
+                    }
+                } else if (payloadType == "clipboard_image") {
+                    val imageManifest = payload.optJSONObject("fileManifest")
+                    if (imageManifest != null && !imageManifest.optBoolean("inline", true)) {
+                        serviceScope.launch {
+                            if (pullRemoteClipboardImage(payload)) {
+                                notifyUserMessageRelay(payload)
+                                WebSocketService.reportExternalStatus(
+                                    this@NodeReceiverService,
+                                    receivedStatusMessage(payloadType, sourceName)
+                                )
+                            }
+                        }
+                    } else if (applyRemoteClipboardImage(payload)) {
+                        notifyUserMessageRelay(payload)
+                        WebSocketService.reportExternalStatus(this, receivedStatusMessage(payloadType, sourceName))
+                        rewriteClipboardImageGossipTargets(payload)
+                    }
+                } else if (payloadType == "file_transfer" || payloadType == "clipboard_file") {
+                    serviceScope.launch {
+                        notifyFileTransferRequested(payload)
+                        val decision = FileTransferCoordinator.requestApproval(this@NodeReceiverService, payload)
+                        if (!decision.accepted) {
+                            WebSocketService.reportExternalStatus(
+                                this@NodeReceiverService,
+                                "已拒绝文件同步：$sourceName"
+                            )
+                            return@launch
+                        }
+                        val received = pullIncomingFileTransfer(payload)
+                        if (received != null) {
+                            notifyFileTransferComplete(received)
+                            WebSocketService.reportExternalStatus(
+                                this@NodeReceiverService,
+                                "已接收文件：${received.name}"
+                            )
+                        }
+                    }
+                } else {
+                    notifyUserMessageRelay(payload)
+                    WebSocketService.reportExternalStatus(this, receivedStatusMessage(payloadType, sourceName))
+                }
+            } else {
+                Log.d(TAG, "Local receive policy disabled for $payloadType; relay continues if needed")
+            }
+        } else if (isLocalTarget) {
+            handleTotpRelayPayload(payload)
+        }
+
+        val ttl = payload.optInt("relayTtl", 0)
+        if (ttl > 0 && !isTopologyPayload(payloadType)) {
+            val forwardPayload = JSONObject(payload.toString())
+            val forwardPath = forwardPayload.optJSONArray("relayPath") ?: JSONArray()
+            if (!jsonArrayContains(forwardPath, identity.id)) forwardPath.put(identity.id)
+            forwardPayload.put("relayPath", forwardPath)
+            val relayIntent = Intent(this, WebSocketService::class.java).apply {
+                action = WebSocketService.ACTION_RELAY_SMS
+                putExtra(WebSocketService.EXTRA_RELAY_PAYLOAD, forwardPayload.toString())
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(relayIntent)
+            } else {
+                startService(relayIntent)
+            }
+        }
+        return 200
+    }
+
     private fun handleBusEnvelope(transport: JSONObject): Pair<Int, JSONObject> {
         val identity = PhoneIdentityStore.get(this)
         val parsed = ContentBus.parseTransportEnvelope(this, transport) { senderId ->
@@ -642,16 +791,11 @@ class NodeReceiverService : Service() {
         val legacyPayload = ContentBus.legacyPayloadFromEnvelope(envelope)
         // 转回 relay 信封时补打 relaySentAt（缺失时 handleRelayEnvelope 会跳过重放窗口校验）
         legacyPayload.put("relaySentAt", System.currentTimeMillis())
-        val encryptedPayload = CryptoUtil.encrypt(legacyPayload.toString(), identity.pairingKey)
-        val nonce = CryptoUtil.generateNonce()
-        val relay = JSONObject()
-            .put("type", "codebridge_relay")
-            .put("version", 1)
-            .put("senderId", senderId)
-            .put("nonce", nonce)
-            .put("payload", encryptedPayload)
-            .put("authToken", CryptoUtil.hmacSha256Base64(identity.pairingKey, "$senderId|$nonce|$encryptedPayload"))
-        val status = handleRelayEnvelope(relay)
+        val status = if (BusReliabilityStore.rememberInbound(this, envelope)) {
+            handleDecodedBusPayload(legacyPayload, senderId)
+        } else {
+            202
+        }
         return status to JSONObject()
             .put("type", "bus_ack")
             .put("accepted", status in 200..299)
@@ -984,7 +1128,10 @@ class NodeReceiverService : Service() {
         val dir = relativeSubDir(File(downloadsRoot, subDirectoryName), manifest.optString("relativePath"))
             .apply { mkdirs() }
         val partFile = File(dir, "$fileId.part")
-        val digest = MessageDigest.getInstance("SHA-256")
+        val sidecarFile = File(dir, "$fileId.part.json")
+        val blocks = buildTransferBlocks(size, chunkSize)
+        val completedBlocks = loadTransferSidecar(sidecarFile, manifest, size, chunkSize)
+        if (!partFile.isFile) completedBlocks.clear()
 
         // 拉取通道：直连源设备优先，其后是可信节点代理（多跳场景，代理只
         // 转发字节，鉴权与分片加密仍在本机与源设备之间端到端完成）。
@@ -1013,67 +1160,129 @@ class NodeReceiverService : Service() {
             Log.w(TAG, "文件拉取失败：源不可直达且没有可用代理节点")
             return null
         }
-        var routeIndex = 0
         val progressNotificationId = "pull-$fileId".hashCode()
         var lastProgressAt = 0L
 
-        return try {
-            FileOutputStream(partFile).use { output ->
-                var offset = 0L
-                while (offset < size) {
-                    val to = minOf(offset + chunkSize - 1, size - 1)
-                    var encrypted: ByteArray? = null
-                    while (routeIndex < routes.size) {
-                        val (label, urlBase) = routes[routeIndex]
-                        // nonce 每次请求重新生成：上一通道可能已把 nonce 送达源设备
-                        val nonce = CryptoUtil.generateNonce()
-                        val authToken = CryptoUtil.hmacSha256Base64(
-                            transferKey,
-                            "${identity.id}|$nonce|$fileId|$offset-$to"
-                        )
-                        val encodingQuery = if (usePlainChunks) "&chunkEncoding=none" else ""
-                        val query = "from=$offset&to=$to" +
-                            "&senderId=${urlEncode(identity.id)}" +
-                            "&nonce=${urlEncode(nonce)}" +
-                            "&authToken=${urlEncode(authToken)}" +
-                            encodingQuery
-                        val url = if (label.startsWith("direct")) "$urlBase?$query" else "$urlBase?$query&hop=3"
-                        encrypted = runCatching { httpGetBytes(url) }.getOrNull()
-                        if (encrypted != null) break
-                        Log.w(TAG, "分片通道不可用 $label，切换下一通道")
-                        routeIndex += 1
+        fun fetchPlainBlock(block: TransferBlock): ByteArray {
+            var lastError = "unknown"
+            repeat(FILE_TRANSFER_BLOCK_RETRIES) { attempt ->
+                if (FileTransferStateStore.isPaused(this, fileId)) {
+                    throw FileTransferPausedException()
+                }
+                for ((label, urlBase) in routes) {
+                    if (FileTransferStateStore.isPaused(this, fileId)) {
+                        throw FileTransferPausedException()
                     }
-                    if (encrypted == null) {
-                        throw IllegalStateException("分片拉取失败（所有通道均不可达）@$offset")
+                    val nonce = CryptoUtil.generateNonce()
+                    val authToken = CryptoUtil.hmacSha256Base64(
+                        transferKey,
+                        "${identity.id}|$nonce|$fileId|${block.from}-${block.to}"
+                    )
+                    val encodingQuery = if (usePlainChunks) "&chunkEncoding=none" else ""
+                    val query = "from=${block.from}&to=${block.to}" +
+                        "&senderId=${urlEncode(identity.id)}" +
+                        "&nonce=${urlEncode(nonce)}" +
+                        "&authToken=${urlEncode(authToken)}" +
+                        encodingQuery
+                    val url = if (label.startsWith("direct")) "$urlBase?$query" else "$urlBase?$query&hop=3"
+                    val encrypted = runCatching { httpGetBytes(url) }
+                        .onFailure { lastError = "$label:${it.message ?: it.javaClass.simpleName}" }
+                        .getOrNull()
+                        ?: continue
+                    val plain = if (usePlainChunks) {
+                        encrypted
+                    } else {
+                        runCatching { CryptoUtil.decryptBytes(encrypted, transferKey) }
+                            .onFailure { lastError = "$label:decrypt_failed" }
+                            .getOrNull()
+                            ?: continue
                     }
-                    val plain = if (usePlainChunks) encrypted else CryptoUtil.decryptBytes(encrypted, transferKey)
-                    val expectedLen = (to - offset + 1).toInt()
+                    val expectedLen = block.length.toInt()
                     if (plain.size != expectedLen) {
-                        throw IllegalStateException("chunk length mismatch expected=$expectedLen got=${plain.size}")
+                        lastError = "$label:chunk_length_mismatch expected=$expectedLen got=${plain.size}"
+                        continue
                     }
-                    output.write(plain)
-                    digest.update(plain)
-                    offset += plain.size
-                    // 进度通知（节流 ≥500ms，末片必发）
-                    val now = System.currentTimeMillis()
-                    if (now - lastProgressAt >= 500 || offset >= size) {
-                        lastProgressAt = now
-                        notifyFileTransferProgress(progressNotificationId, name, offset, size)
+                    return plain
+                }
+                if (attempt < FILE_TRANSFER_BLOCK_RETRIES - 1) {
+                    Thread.sleep((250L * (attempt + 1)).coerceAtMost(1_000L))
+                }
+            }
+            throw IllegalStateException("block ${block.index} failed after $FILE_TRANSFER_BLOCK_RETRIES retries: $lastError")
+        }
+
+        return try {
+            RandomAccessFile(partFile, "rw").use { output ->
+                output.setLength(size)
+                saveTransferSidecar(sidecarFile, manifest, size, chunkSize, completedBlocks)
+                val receivedBefore = completedBlockBytes(blocks, completedBlocks)
+                FileTransferStateStore.startOrUpdate(this, payload, receivedBefore, size, partFile.absolutePath)
+                if (FileTransferStateStore.isPaused(this, fileId)) {
+                    throw FileTransferPausedException()
+                }
+
+                val pendingBlocks = blocks.filter { it.index !in completedBlocks }
+                val nextBlock = AtomicInteger(0)
+                val stateLock = Any()
+                val parallelism = manifest.optInt("parallelPulls", FILE_TRANSFER_PARALLEL_PULLS)
+                    .coerceIn(1, FILE_TRANSFER_PARALLEL_PULLS)
+                if (pendingBlocks.isNotEmpty()) {
+                    runBlocking {
+                        (0 until minOf(parallelism, pendingBlocks.size)).map {
+                            async(Dispatchers.IO) {
+                                while (true) {
+                                    val block = pendingBlocks.getOrNull(nextBlock.getAndIncrement()) ?: break
+                                    if (FileTransferStateStore.isPaused(this@NodeReceiverService, fileId)) {
+                                        throw FileTransferPausedException()
+                                    }
+                                    val plain = fetchPlainBlock(block)
+                                    if (FileTransferStateStore.isPaused(this@NodeReceiverService, fileId)) {
+                                        throw FileTransferPausedException()
+                                    }
+                                    synchronized(stateLock) {
+                                        if (block.index !in completedBlocks) {
+                                            output.seek(block.from)
+                                            output.write(plain)
+                                            completedBlocks.add(block.index)
+                                            saveTransferSidecar(sidecarFile, manifest, size, chunkSize, completedBlocks)
+                                            val now = System.currentTimeMillis()
+                                            val receivedBytes = completedBlockBytes(blocks, completedBlocks)
+                                            FileTransferStateStore.updateProgress(
+                                                this@NodeReceiverService,
+                                                fileId,
+                                                receivedBytes,
+                                                size
+                                            )
+                                            if (now - lastProgressAt >= 500 || receivedBytes >= size) {
+                                                lastProgressAt = now
+                                                notifyFileTransferProgress(progressNotificationId, name, receivedBytes, size)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }.awaitAll()
                     }
                 }
             }
-            val actualHash = digest.digest().joinToString("") { "%02x".format(it) }
+            if (completedBlocks.size != blocks.size) {
+                throw IllegalStateException("incomplete transfer blocks=${completedBlocks.size}/${blocks.size}")
+            }
+            val actualHash = sha256File(partFile)
             if (expectedHash.isNotBlank() && !MessageDigest.isEqual(
                     expectedHash.toByteArray(Charsets.UTF_8),
                     actualHash.toByteArray(Charsets.UTF_8)
                 )
             ) {
                 partFile.delete()
+                sidecarFile.delete()
+                FileTransferStateStore.markFailed(this, fileId, "hash_mismatch")
                 getSystemService(NotificationManager::class.java).cancel(progressNotificationId)
                 Log.w(TAG, "文件 hash 校验失败 expected=${expectedHash.take(12)} actual=${actualHash.take(12)}")
                 return null
             }
             val finalFile = uniqueFile(dir, name)
+            sidecarFile.delete()
             if (!partFile.renameTo(finalFile)) {
                 partFile.copyTo(finalFile, overwrite = true)
                 partFile.delete()
@@ -1092,6 +1301,7 @@ class NodeReceiverService : Service() {
                     sourceDeviceName = source.name
                 )
             }
+            FileTransferStateStore.markCompleted(this, fileId, finalFile.absolutePath)
             ReceivedFile(
                 name = finalFile.name,
                 file = finalFile,
@@ -1100,8 +1310,13 @@ class NodeReceiverService : Service() {
                 sourceId = source.id,
                 sourceName = source.name
             )
+        } catch (e: FileTransferPausedException) {
+            FileTransferStateStore.pause(this, fileId)
+            getSystemService(NotificationManager::class.java).cancel(progressNotificationId)
+            Log.i(TAG, "File transfer paused: $fileId")
+            null
         } catch (e: Exception) {
-            runCatching { partFile.delete() }
+            FileTransferStateStore.markFailed(this, fileId, e.message ?: e.javaClass.simpleName)
             getSystemService(NotificationManager::class.java).cancel(progressNotificationId)
             Log.e(TAG, "文件拉取失败: ${e.message}", e)
             null
@@ -1109,6 +1324,83 @@ class NodeReceiverService : Service() {
     }
 
     /** relativePath 含文件名（最后一段丢弃），其余各段消毒后映射为子目录。 */
+    private data class TransferBlock(val index: Int, val from: Long, val to: Long) {
+        val length: Long get() = to - from + 1
+    }
+
+    private fun buildTransferBlocks(size: Long, chunkSize: Long): List<TransferBlock> {
+        val blocks = mutableListOf<TransferBlock>()
+        var offset = 0L
+        var index = 0
+        while (offset < size) {
+            val to = minOf(offset + chunkSize - 1, size - 1)
+            blocks.add(TransferBlock(index, offset, to))
+            offset = to + 1
+            index += 1
+        }
+        return blocks
+    }
+
+    private fun loadTransferSidecar(
+        sidecarFile: File,
+        manifest: JSONObject,
+        size: Long,
+        chunkSize: Long
+    ): MutableSet<Int> {
+        return runCatching {
+            if (!sidecarFile.isFile) return@runCatching mutableSetOf()
+            val json = JSONObject(sidecarFile.readText(Charsets.UTF_8))
+            if (json.optString("fileId") != manifest.optString("fileId")) return@runCatching mutableSetOf()
+            if (json.optString("sha256") != manifest.optString("sha256")) return@runCatching mutableSetOf()
+            if (json.optLong("size") != size || json.optLong("chunkSize") != chunkSize) {
+                return@runCatching mutableSetOf()
+            }
+            jsonArrayToList(json.optJSONArray("completedBlocks"))
+                .mapNotNull { it.toIntOrNull() }
+                .toMutableSet()
+        }.getOrElse { mutableSetOf() }
+    }
+
+    private fun saveTransferSidecar(
+        sidecarFile: File,
+        manifest: JSONObject,
+        size: Long,
+        chunkSize: Long,
+        completedBlocks: Set<Int>
+    ) {
+        runCatching {
+            sidecarFile.parentFile?.mkdirs()
+            sidecarFile.writeText(
+                JSONObject()
+                    .put("version", 1)
+                    .put("fileId", manifest.optString("fileId"))
+                    .put("sha256", manifest.optString("sha256"))
+                    .put("size", size)
+                    .put("chunkSize", chunkSize)
+                    .put("completedBlocks", JSONArray(completedBlocks.sorted()))
+                    .put("updatedAt", System.currentTimeMillis())
+                    .toString(),
+                Charsets.UTF_8
+            )
+        }
+    }
+
+    private fun completedBlockBytes(blocks: List<TransferBlock>, completedBlocks: Set<Int>): Long =
+        completedBlocks.sumOf { index -> blocks.getOrNull(index)?.length ?: 0L }
+
+    private fun sha256File(file: File): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        file.inputStream().use { input ->
+            val buffer = ByteArray(128 * 1024)
+            while (true) {
+                val read = input.read(buffer)
+                if (read <= 0) break
+                digest.update(buffer, 0, read)
+            }
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
+    }
+
     private fun relativeSubDir(baseDir: File, relativePath: String): File {
         var dir = baseDir
         relativePath.split('/', '\\')

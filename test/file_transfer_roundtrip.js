@@ -123,6 +123,106 @@ async function main() {
   if (sha256File(downloadedPath) !== sha256File(sourcePath)) throw new Error('hash mismatch')
 
   // ===== 用例 2：relativePath 重建目录树（目录分享） =====
+  let resumeManifest = null
+  const resumeSource = path.join(tmp, 'resume.bin')
+  fs.writeFileSync(resumeSource, crypto.randomBytes(900 * 1024 + 17))
+  const resumeSender = createFileTransfer({
+    getIdentity: () => ({ id: senderId, name: 'Desktop A', type: 'WINDOWS_DESKTOP' }),
+    encryptBytes,
+    decryptBytes,
+    hmacBase64,
+    generateNonce: () => crypto.randomBytes(16).toString('base64'),
+    sendManifest: async (targets, payload) => {
+      resumeManifest = payload.fileManifest
+      return targets.length
+    },
+    lookupPeerKey: id => id === receiverId ? key : null,
+    resolveSource: () => null,
+    httpGet: async () => null,
+    downloadDir: downloads,
+    tmpDir: incomingTmp,
+    maxChunkBytes: 128 * 1024
+  })
+  await resumeSender.offerFile(resumeSource, [receiverId], {
+    payloadExtra: { sourceHost: '127.0.0.1' }
+  })
+  if (!resumeManifest) throw new Error('resume manifest missing')
+  let servedResumeChunks = 0
+  const serveResume = async reqPath => {
+    const url = new URL(reqPath, 'http://127.0.0.1')
+    const result = await resumeSender.serveFileChunk({
+      fileId: decodeURIComponent(url.pathname.slice('/file/'.length)),
+      from: url.searchParams.get('from'),
+      to: url.searchParams.get('to'),
+      senderId: url.searchParams.get('senderId'),
+      nonce: url.searchParams.get('nonce'),
+      authToken: url.searchParams.get('authToken'),
+      chunkEncoding: url.searchParams.get('chunkEncoding') || 'aes-gcm'
+    })
+    return { status: result.status, body: result.body }
+  }
+  const interruptedReceiver = createFileTransfer({
+    getIdentity: () => ({ id: receiverId, name: 'Phone B', type: 'ANDROID_PHONE' }),
+    encryptBytes,
+    decryptBytes,
+    hmacBase64,
+    generateNonce: () => crypto.randomBytes(16).toString('base64'),
+    sendManifest: async () => 0,
+    lookupPeerKey: () => null,
+    resolveSource: () => ({ id: senderId, name: 'Desktop A', host: '127.0.0.1', port: 19529, pairingKey: key }),
+    httpGet: async ({ path: reqPath }) => {
+      servedResumeChunks += 1
+      if (servedResumeChunks > 2) return null
+      return serveResume(reqPath)
+    },
+    downloadDir: downloads,
+    tmpDir: incomingTmp,
+    maxChunkBytes: 128 * 1024,
+    maxParallelPulls: 1
+  })
+  const firstResume = await interruptedReceiver.startIncomingPull(resumeManifest, {
+    maxBytes: 10 * 1024 * 1024,
+    parallelism: 1
+  })
+  if (firstResume) throw new Error('interrupted resume transfer unexpectedly completed')
+  const sidecarPath = path.join(incomingTmp, `${resumeManifest.fileId}.part.json`)
+  if (!fs.existsSync(sidecarPath)) throw new Error('resume sidecar missing after interruption')
+  const completedBeforeResume = JSON.parse(fs.readFileSync(sidecarPath, 'utf8')).completedBlocks.length
+  if (completedBeforeResume < 1) throw new Error('resume sidecar did not record completed blocks')
+
+  let resumedRequests = 0
+  const resumedReceiver = createFileTransfer({
+    getIdentity: () => ({ id: receiverId, name: 'Phone B', type: 'ANDROID_PHONE' }),
+    encryptBytes,
+    decryptBytes,
+    hmacBase64,
+    generateNonce: () => crypto.randomBytes(16).toString('base64'),
+    sendManifest: async () => 0,
+    lookupPeerKey: () => null,
+    resolveSource: () => ({ id: senderId, name: 'Desktop A', host: '127.0.0.1', port: 19529, pairingKey: key }),
+    httpGet: async ({ path: reqPath }) => {
+      resumedRequests += 1
+      return serveResume(reqPath)
+    },
+    downloadDir: downloads,
+    tmpDir: incomingTmp,
+    maxChunkBytes: 128 * 1024,
+    maxParallelPulls: 1
+  })
+  const resumePulled = await resumedReceiver.startIncomingPull(resumeManifest, {
+    maxBytes: 10 * 1024 * 1024,
+    parallelism: 1
+  })
+  if (!resumePulled) throw new Error('resume pull failed')
+  if (fs.existsSync(sidecarPath)) throw new Error('resume sidecar not cleaned after success')
+  const resumeDownloaded = fs.readdirSync(downloads).find(name => name === path.basename(resumeSource))
+  if (!resumeDownloaded) throw new Error('resume download missing')
+  if (sha256File(path.join(downloads, resumeDownloaded)) !== sha256File(resumeSource)) {
+    throw new Error('resume hash mismatch')
+  }
+  const totalBlocks = Math.ceil(resumeManifest.size / resumeManifest.chunkSize)
+  if (resumedRequests >= totalBlocks) throw new Error('resume did not skip completed blocks')
+
   let dirManifest = null
   const dirSource = path.join(tmp, 'tree.bin')
   fs.writeFileSync(dirSource, crypto.randomBytes(64 * 1024 + 7))
@@ -194,7 +294,7 @@ async function main() {
   if (!fs.existsSync(treePath)) throw new Error(`relativePath tree missing: ${treePath}`)
   if (sha256File(treePath) !== sha256File(dirSource)) throw new Error('tree hash mismatch')
 
-  console.log('file-transfer roundtrip: 3 passed, 0 failed')
+  console.log('file-transfer roundtrip: 4 passed, 0 failed')
 }
 
 main().catch(error => {

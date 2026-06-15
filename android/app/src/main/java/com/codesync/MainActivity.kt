@@ -49,6 +49,8 @@ import com.codesync.util.ClipboardSyncState
 import com.codesync.util.FileTransferCoordinator
 import com.codesync.util.FileTransferHistoryStore
 import com.codesync.util.FileTransferRegistry
+import com.codesync.util.FileTransferStateStore
+import com.codesync.util.FileTransferTask
 import com.codesync.util.GoogleAuthMigrationParser
 import com.codesync.util.LanDiscoveredDevice
 import com.codesync.util.LanDiscovery
@@ -190,9 +192,16 @@ class MainActivity : AppCompatActivity() {
 
     private val fileTransferReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
-            if (intent?.action != FileTransferCoordinator.ACTION_FILE_TRANSFER_REQUEST) return
-            val requestId = intent.getStringExtra(FileTransferCoordinator.EXTRA_REQUEST_ID).orEmpty()
-            if (requestId.isNotBlank()) showFileTransferRequest(requestId)
+            when (intent?.action) {
+                FileTransferCoordinator.ACTION_FILE_TRANSFER_REQUEST -> {
+                    val requestId = intent.getStringExtra(FileTransferCoordinator.EXTRA_REQUEST_ID).orEmpty()
+                    if (requestId.isNotBlank()) showFileTransferRequest(requestId)
+                }
+                FileTransferStateStore.ACTION_FILE_TRANSFER_STATE_CHANGED -> {
+                    renderClipboardHistory()
+                    refreshConnectionSnapshot()
+                }
+            }
         }
     }
 
@@ -230,7 +239,10 @@ class MainActivity : AppCompatActivity() {
         ContextCompat.registerReceiver(
             this,
             fileTransferReceiver,
-            IntentFilter(FileTransferCoordinator.ACTION_FILE_TRANSFER_REQUEST),
+            IntentFilter().apply {
+                addAction(FileTransferCoordinator.ACTION_FILE_TRANSFER_REQUEST)
+                addAction(FileTransferStateStore.ACTION_FILE_TRANSFER_STATE_CHANGED)
+            },
             ContextCompat.RECEIVER_NOT_EXPORTED
         )
         handleLanJoinIntent(intent)
@@ -845,9 +857,10 @@ class MainActivity : AppCompatActivity() {
             listOf(
                 device.name,
                 option.statusLabel,
+                if (option.allowed) "文件权限已开启" else "文件权限未开启",
+                option.reason,
                 type,
-                host,
-                option.reason
+                host
             ).filter { it.isNotBlank() }.joinToString(" · ")
         }
         showMultiChoiceSheet(
@@ -873,7 +886,20 @@ class MainActivity : AppCompatActivity() {
 
     private fun showFileReceiveHistory() {
         val history = FileTransferHistoryStore.get(this)
+        val activeTasks = FileTransferStateStore.getActive(this)
         val (dialog, content) = createBottomSheet(getString(R.string.file_receive_history))
+        if (activeTasks.isNotEmpty()) {
+            content.addView(TextView(this).apply {
+                text = "进行中的文件传输"
+                setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_primary))
+                textSize = 15f
+                setTypeface(typeface, android.graphics.Typeface.BOLD)
+                setPadding(0, 14.dp(), 0, 2.dp())
+            })
+            activeTasks.take(20).forEach { task ->
+                addFileTransferTaskRow(content, dialog, task)
+            }
+        }
         if (history.isEmpty()) {
             content.addView(TextView(this).apply {
                 text = getString(R.string.file_history_empty)
@@ -938,6 +964,111 @@ class MainActivity : AppCompatActivity() {
             dialog.dismiss()
         }
         dialog.show()
+    }
+
+    private fun addFileTransferTaskRow(parent: LinearLayout, dialog: BottomSheetDialog, task: FileTransferTask) {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundResource(R.drawable.bg_row)
+            setPadding(12.dp(), 10.dp(), 12.dp(), 10.dp())
+        }
+        row.addView(TextView(this).apply {
+            text = task.name
+            setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_primary))
+            textSize = 14f
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+            maxLines = 2
+        })
+        val progressPercent = if (task.size > 0L) {
+            ((task.received * 100L) / task.size).toInt().coerceIn(0, 100)
+        } else {
+            0
+        }
+        row.addView(ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 100
+            progress = progressPercent
+            setPadding(0, 8.dp(), 0, 0)
+        })
+        row.addView(TextView(this).apply {
+            val time = if (task.updatedAt > 0L) {
+                SimpleDateFormat("MM-dd HH:mm:ss", Locale.getDefault()).format(Date(task.updatedAt))
+            } else {
+                ""
+            }
+            text = listOf(
+                fileTransferStatusLabel(task.status),
+                "${formatFileSize(task.received)} / ${formatFileSize(task.size)}",
+                task.sourceDeviceName,
+                time
+            ).filter { it.isNotBlank() }.joinToString(" · ")
+            setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_secondary))
+            textSize = 12f
+            setPadding(0, 5.dp(), 0, 0)
+        })
+        if (task.error.isNotBlank()) {
+            row.addView(TextView(this).apply {
+                text = "错误：${task.error}"
+                setTextColor(ContextCompat.getColor(this@MainActivity, R.color.danger))
+                textSize = 12f
+                setPadding(0, 5.dp(), 0, 0)
+            })
+        }
+        when (task.status) {
+            FileTransferStateStore.STATUS_RUNNING,
+            FileTransferStateStore.STATUS_PENDING -> {
+                addSheetButton(row, "暂停", outlined = true) {
+                    FileTransferStateStore.pause(this, task.fileId)
+                    Toast.makeText(this, "已暂停文件接收", Toast.LENGTH_SHORT).show()
+                    dialog.dismiss()
+                    showFileReceiveHistory()
+                }
+            }
+            FileTransferStateStore.STATUS_PAUSED -> {
+                addSheetButton(row, "继续", outlined = true) {
+                    resumeFileTransfer(task.fileId)
+                    Toast.makeText(this, "正在继续接收文件", Toast.LENGTH_SHORT).show()
+                    dialog.dismiss()
+                    showFileReceiveHistory()
+                }
+            }
+            FileTransferStateStore.STATUS_FAILED -> {
+                addSheetButton(row, "失败重试", outlined = true) {
+                    resumeFileTransfer(task.fileId)
+                    Toast.makeText(this, "正在重试文件接收", Toast.LENGTH_SHORT).show()
+                    dialog.dismiss()
+                    showFileReceiveHistory()
+                }
+            }
+        }
+        parent.addView(row, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply {
+            topMargin = 8.dp()
+        })
+    }
+
+    private fun fileTransferStatusLabel(status: String): String =
+        when (status) {
+            FileTransferStateStore.STATUS_PENDING -> "等待中"
+            FileTransferStateStore.STATUS_RUNNING -> "接收中"
+            FileTransferStateStore.STATUS_PAUSED -> "已暂停"
+            FileTransferStateStore.STATUS_FAILED -> "失败"
+            FileTransferStateStore.STATUS_COMPLETED -> "已完成"
+            else -> status.ifBlank { "未知" }
+        }
+
+    private fun resumeFileTransfer(fileId: String) {
+        FileTransferStateStore.resume(this, fileId)
+        val intent = Intent(this, NodeReceiverService::class.java).apply {
+            action = NodeReceiverService.ACTION_RETRY_FILE_TRANSFER
+            putExtra(NodeReceiverService.EXTRA_FILE_ID, fileId)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(intent)
+        } else {
+            startService(intent)
+        }
     }
 
     private fun renderClipboardHistory() {
@@ -1588,8 +1719,19 @@ class MainActivity : AppCompatActivity() {
     private fun isDeviceOnline(device: DesktopDevice): Boolean =
         WebSocketService.connectedDeviceIds.contains(device.id)
 
+    private fun isReachableTopologyStatus(status: String): Boolean =
+        status == "online" || status == "reachable"
+
     private fun isDeviceRoutableCandidate(device: DesktopDevice): Boolean =
-        device.enabled && device.host.isNotBlank() && device.pairingKey.isNotBlank()
+        device.enabled &&
+            device.pairingKey.isNotBlank() &&
+            (
+                device.host.isNotBlank() ||
+                    device.altHosts.any { it.isNotBlank() } ||
+                    device.routeNextHopId.isNotBlank() ||
+                    device.routeMetric > 0 ||
+                    device.routePath.size > 1
+            )
 
     private fun getTopologyDeviceStatus(device: DesktopDevice): String = when {
         !device.enabled -> "disabled"
@@ -1606,13 +1748,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun isFileTransferReachable(device: DesktopDevice): Boolean {
-        if (!device.enabled || device.pairingKey.isBlank()) return false
-        return isDeviceOnline(device) ||
-            isDeviceRoutableCandidate(device) ||
-            device.routeNextHopId.isNotBlank() ||
-            device.routeMetric > 0 ||
-            device.routePath.size > 1 ||
-            device.altHosts.any { it.isNotBlank() }
+        return isReachableTopologyStatus(getTopologyDeviceStatus(device))
     }
 
     private fun getFileTransferTargetOptions(): List<FileTransferTargetOption> {
@@ -1620,20 +1756,23 @@ class MainActivity : AppCompatActivity() {
             .filter { it.pairingKey.isNotBlank() }
             .distinctBy { it.id }
             .map { device ->
+                val topologyStatus = getTopologyDeviceStatus(device)
                 val reachable = isFileTransferReachable(device)
                 val allowed = device.allowFileTransfer
-                val statusLabel = when {
-                    isDeviceOnline(device) -> "在线"
-                    reachable -> "可路由"
+                val statusLabel = when (topologyStatus) {
+                    "online" -> "在线连接"
+                    "reachable" -> "可路由"
+                    "disabled" -> "已禁用"
                     else -> "离线"
                 }
-                val reason = when {
-                    !reachable -> "当前不可达"
-                    !allowed -> "文件权限未开启"
-                    device.routeNextHopId.isNotBlank() && device.routeNextHopId != device.id ->
-                        "经 ${device.routeNextHopName.ifBlank { device.routeNextHopId }}"
-                    else -> ""
-                }
+                val reason = buildList {
+                    if (!reachable) add("当前不可达")
+                    if (device.routeNextHopId.isNotBlank() && device.routeNextHopId != device.id) {
+                        add("经 ${device.routeNextHopName.ifBlank { device.routeNextHopId }}")
+                    } else if (device.routeMetric > 0) {
+                        add("SPF metric ${device.routeMetric}")
+                    }
+                }.joinToString(" · ")
                 FileTransferTargetOption(
                     device = device,
                     reachable = reachable,

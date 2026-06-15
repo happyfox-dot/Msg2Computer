@@ -69,7 +69,7 @@
     <string name="send_folder">发送文件夹</string>
     <string name="file_receive_history">接收文件历史</string>
     <string name="file_target_select">选择接收节点</string>
-    <string name="file_target_select_desc">本次文件只会发送给勾选的可信设备节点。</string>
+    <string name="file_target_select_desc">本次文件只会发送给勾选的可信设备节点。灰色节点表示当前不可达，或本机对该节点的文件传输权限未开启。</string>
     <string name="file_target_none_selected">请至少选择一个接收节点</string>
     <string name="file_history_empty">暂无接收文件历史</string>
     <string name="file_transfer_disabled">请先开启文件发送开关</string>

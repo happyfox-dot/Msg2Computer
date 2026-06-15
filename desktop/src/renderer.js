@@ -613,6 +613,18 @@ function setupFileTransferControls() {
     fileTransferHistory = Array.isArray(history) ? history : []
     renderFileHistory()
   })
+  let fileTargetsRefreshTimer = null
+  const scheduleFileTargetsRefresh = () => {
+    if (fileTargetsRefreshTimer) clearTimeout(fileTargetsRefreshTimer)
+    fileTargetsRefreshTimer = setTimeout(() => {
+      fileTargetsRefreshTimer = null
+      loadFileTargets()
+    }, 300)
+  }
+  window.electronAPI.onPhonesChanged?.(scheduleFileTargetsRefresh)
+  window.electronAPI.onDesktopPeersChanged?.(scheduleFileTargetsRefresh)
+  window.electronAPI.onLanDevicesChanged?.(scheduleFileTargetsRefresh)
+  window.electronAPI.onTopologyChanged?.(scheduleFileTargetsRefresh)
   loadFileTargets()
   loadFileHistory()
 }

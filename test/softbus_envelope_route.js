@@ -1,6 +1,7 @@
 const { TOPICS, fromLegacyPayload, toLegacyPayload } = require('../desktop/src/main/bus-envelope')
 const routeManager = require('../desktop/src/main/route-manager')
 const { createContentBus } = require('../desktop/src/main/content-bus')
+const { createBusReliabilityStore } = require('../desktop/src/main/bus-reliability')
 
 let pass = 0
 let fail = 0
@@ -94,6 +95,62 @@ async function main() {
   })
   ok(relayResult.delivered === 1, 'content bus delivered via relay route')
   ok(relayRoutes[0].nextHopId === 'desktop-b', 'relay route exposes next hop')
+
+  const health = routeManager.createRouteHealthTracker({ failurePenalty: 100, cooldownMs: 60_000 })
+  const healthRoutes = routeManager.buildPeerRoutes({
+    target: { id: 'phone-health', host: '192.168.1.10', tsHost: '100.90.1.2', pairingKey: 'k' }
+  })
+  health.recordResult('phone-health', healthRoutes[0], false)
+  const ranked = health.rankRoutes('phone-health', healthRoutes)
+  ok(ranked[0].transportType !== healthRoutes[0].transportType || ranked[0].host !== healthRoutes[0].host, 'failed route is downgraded')
+
+  let savedReliabilityState = {}
+  const reliabilityStore = createBusReliabilityStore({
+    loadState: () => savedReliabilityState,
+    saveState: state => { savedReliabilityState = state },
+    retryBaseMs: 0
+  })
+  let retryAttempts = 0
+  const reliableBus = createContentBus({
+    getIdentity: () => identity,
+    getNetworkId: () => 'net-1',
+    getTargetNode: id => ({ id, host: '192.168.1.11', port: 19529, pairingKey: 'k' }),
+    getTopologyRoutes: () => [],
+    hasActiveWs: () => false,
+    canPush: () => true,
+    canReceive: () => true,
+    sendDirect: async () => {
+      retryAttempts += 1
+      return retryAttempts > 1
+    },
+    sendWs: () => false,
+    sendRelay: async () => false,
+    reliabilityStore
+  })
+  const reliableResult = await reliableBus.publish(TOPICS.SMS_CODE, {
+    type: 'sms',
+    code: '654321',
+    originMessageId: 'retry-msg-1',
+    targetDeviceIds: ['phone-retry']
+  })
+  ok(reliableResult.delivered === 0, 'failed publish is not delivered immediately')
+  ok(reliabilityStore.size().outbox === 1, 'failed publish stays in outbox')
+  const retryResult = await reliableBus.flushOutbox()
+  ok(retryResult.delivered === 1, 'outbox retry delivers pending message')
+  ok(reliabilityStore.size().outbox === 0, 'delivered retry leaves outbox')
+
+  let inboundCount = 0
+  const inboundReliability = createBusReliabilityStore()
+  const receiveBus = createContentBus({
+    getIdentity: () => identity,
+    getNetworkId: () => 'net-1',
+    canReceive: () => true,
+    onReceive: () => { inboundCount += 1 },
+    reliabilityStore: inboundReliability
+  })
+  receiveBus.receiveEnvelope(envelope)
+  receiveBus.receiveEnvelope(envelope)
+  ok(inboundCount === 1, 'bus seen cache suppresses duplicate inbound envelope')
 
   console.log(`softbus envelope/route: ${pass} passed, ${fail} failed`)
   process.exit(fail === 0 ? 0 : 1)

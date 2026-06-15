@@ -61,9 +61,18 @@ object DeviceStore {
             val array = JSONArray(raw)
             for (i in 0 until array.length()) {
                 val item = array.optJSONObject(i) ?: continue
-                val host = item.optString("host")
-                val pairingKey = item.optString("pairingKey")
-                if (host.isBlank() || pairingKey.isBlank()) continue
+                val host = item.optString("host").trim()
+                val pairingKey = item.optString("pairingKey").trim()
+                val routeMetric = item.optInt("routeMetric", 0)
+                val routeNextHopId = item.optString("routeNextHopId").trim()
+                val routeNextHopName = item.optString("routeNextHopName").trim()
+                val routePath = jsonArrayToList(item.optJSONArray("routePath"))
+                val altHosts = jsonArrayToList(item.optJSONArray("altHosts"))
+                    .map { it.trim() }
+                    .filter { it.isNotBlank() && it != host }
+                    .distinct()
+                val hasRoute = routeMetric > 0 || routeNextHopId.isNotBlank() || routePath.size > 1
+                if (pairingKey.isBlank() || (host.isBlank() && altHosts.isEmpty() && !hasRoute)) continue
 
                 devices.add(
                     DesktopDevice(
@@ -76,10 +85,10 @@ object DeviceStore {
                         enabled = item.optBoolean("enabled", true),
                         lastSyncAt = item.optLong("lastSyncAt", 0L),
                         updatedAt = item.optLong("updatedAt", System.currentTimeMillis()),
-                        routeMetric = item.optInt("routeMetric", 0),
-                        routeNextHopId = item.optString("routeNextHopId"),
-                        routeNextHopName = item.optString("routeNextHopName"),
-                        routePath = jsonArrayToList(item.optJSONArray("routePath")),
+                        routeMetric = routeMetric,
+                        routeNextHopId = routeNextHopId,
+                        routeNextHopName = routeNextHopName,
+                        routePath = routePath,
                         routeUpdatedAt = item.optLong("routeUpdatedAt", 0L),
                         allowSmsCodes = item.optBoolean("allowSmsCodes", true),
                         allowSmsMessages = item.optBoolean("allowSmsMessages", true),
@@ -97,7 +106,7 @@ object DeviceStore {
                         allowFileTransfer = item.optBoolean("allowFileTransfer", false),
                         maxFileSizeMb = item.optInt("maxFileSizeMb", 50).coerceIn(1, 512),
                         autoAcceptFiles = item.optBoolean("autoAcceptFiles", false),
-                        altHosts = jsonArrayToList(item.optJSONArray("altHosts")),
+                        altHosts = altHosts,
                         networkId = item.optString("networkId"),
                         autoPaired = item.optBoolean("autoPaired", false),
                         trustSourceId = item.optString("trustSourceId"),
@@ -160,11 +169,13 @@ object DeviceStore {
         val now = System.currentTimeMillis()
         val normalizedId = deviceId.ifBlank { "" }
         val index = devices.indexOfFirst {
-            (normalizedId.isNotBlank() && it.id == normalizedId) || (it.host == host && it.port == port)
+            (normalizedId.isNotBlank() && it.id == normalizedId) ||
+                (host.isNotBlank() && it.host == host && it.port == port)
         }
 
         val device = if (index >= 0) {
             val existing = devices[index]
+            val mergedHost = host.ifBlank { existing.host }
             // 路由新鲜度门（OSPF LSA 规则的简化版）：只有携带不早于已存时间戳的
             // 路由信息才允许覆盖路由字段。routeUpdatedAt=0 表示本次调用不携带路由
             // （配对/扫码等流程），完整保留原有路由。旧实现会把 routeMetric 无条件
@@ -174,7 +185,7 @@ object DeviceStore {
                 id = normalizedId.ifBlank { existing.id },
                 name = name.ifBlank { existing.name },
                 type = deviceType.ifBlank { existing.type },
-                host = host,
+                host = mergedHost,
                 port = port,
                 pairingKey = pairingKey,
                 enabled = enabled ?: existing.enabled,
@@ -196,7 +207,9 @@ object DeviceStore {
                 maxFileSizeMb = existing.maxFileSizeMb,
                 autoAcceptFiles = existing.autoAcceptFiles,
                 // 备用地址不参与新鲜度比较：本次没带就保留旧值（主地址变化时剔除重复）
-                altHosts = altHosts.ifEmpty { existing.altHosts }.filter { it.isNotBlank() && it != host }.distinct(),
+                altHosts = (altHosts + existing.altHosts)
+                    .filter { it.isNotBlank() && it != mergedHost }
+                    .distinct(),
                 networkId = networkId.ifBlank { existing.networkId },
                 autoPaired = autoPaired || existing.autoPaired,
                 trustSourceId = trustSourceId.ifBlank { existing.trustSourceId },
