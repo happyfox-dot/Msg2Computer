@@ -777,9 +777,10 @@ class MainActivity : AppCompatActivity() {
         }
         lifecycleScope.launch {
             val prepared = withContext(Dispatchers.IO) {
-                runCatching { prepareClipboardImagePng(uri) }
+                runCatching { prepareClipboardImageFile(uri) }
             }
-            prepared.onSuccess { file ->
+            prepared.onSuccess { image ->
+                val file = image.file
                 PhoneIdentityStore.get(this@MainActivity).let { identity ->
                     ClipboardHistoryStore.addFile(
                         context = this@MainActivity,
@@ -787,7 +788,7 @@ class MainActivity : AppCompatActivity() {
                         direction = "outgoing",
                         title = file.name,
                         path = file.absolutePath,
-                        mime = "image/png",
+                        mime = image.mime,
                         size = file.length(),
                         sourceDeviceId = identity.id,
                         sourceDeviceName = identity.name
@@ -797,7 +798,7 @@ class MainActivity : AppCompatActivity() {
                     putExtra(WebSocketService.EXTRA_CONTENT_TYPE, "clipboard_image")
                     putExtra(WebSocketService.EXTRA_FILE_PATH, file.absolutePath)
                     putExtra(WebSocketService.EXTRA_FILE_NAME, file.name)
-                    putExtra(WebSocketService.EXTRA_FILE_MIME, "image/png")
+                    putExtra(WebSocketService.EXTRA_FILE_MIME, image.mime)
                 }
                 Toast.makeText(this@MainActivity, "图片剪贴板已发送", Toast.LENGTH_SHORT).show()
                 renderClipboardHistory()
@@ -1414,19 +1415,26 @@ class MainActivity : AppCompatActivity() {
         return outputFile
     }
 
-    private fun prepareClipboardImagePng(uri: Uri): File {
+    private data class PreparedClipboardImage(val file: File, val mime: String)
+
+    private fun prepareClipboardImageFile(uri: Uri): PreparedClipboardImage {
         val bitmap = contentResolver.openInputStream(uri)?.use { input ->
             BitmapFactory.decodeStream(input)
         } ?: error("invalid_image")
         val dir = File(filesDir, "outgoing_clipboard_images").apply { mkdirs() }
-        val outputFile = uniqueFile(dir, "clipboard-${System.currentTimeMillis()}.png")
+        val usePng = bitmap.hasAlpha()
+        val mime = if (usePng) "image/png" else "image/jpeg"
+        val ext = if (usePng) "png" else "jpg"
+        val format = if (usePng) android.graphics.Bitmap.CompressFormat.PNG else android.graphics.Bitmap.CompressFormat.JPEG
+        val quality = if (usePng) 100 else 90
+        val outputFile = uniqueFile(dir, "clipboard-${System.currentTimeMillis()}.$ext")
         FileOutputStream(outputFile).use { output ->
-            if (!bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, output)) {
+            if (!bitmap.compress(format, quality, output)) {
                 error("encode_failed")
             }
         }
         bitmap.recycle()
-        return outputFile
+        return PreparedClipboardImage(outputFile, mime)
     }
 
     private fun queryDisplayName(uri: Uri): String {
@@ -1766,6 +1774,7 @@ class MainActivity : AppCompatActivity() {
                     else -> "离线"
                 }
                 val reason = buildList {
+                    if (!allowed) add("文件传输权限未开启")
                     if (!reachable) add("当前不可达")
                     if (device.routeNextHopId.isNotBlank() && device.routeNextHopId != device.id) {
                         add("经 ${device.routeNextHopName.ifBlank { device.routeNextHopId }}")

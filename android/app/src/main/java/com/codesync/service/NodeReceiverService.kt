@@ -70,10 +70,10 @@ class NodeReceiverService : Service() {
         private const val NOTIFICATION_ID = 1002
         private const val CHANNEL_ID = "code_sync_node_receiver"
         private const val MAX_BODY_BYTES = 512 * 1024
-        private const val MAX_INLINE_CLIPBOARD_IMAGE_BYTES = 180 * 1024
+        private const val MAX_INLINE_CLIPBOARD_IMAGE_BYTES = 768 * 1024
         private const val FILE_TRANSFER_CHUNK_BYTES = 4 * 1024 * 1024
         private const val FILE_TRANSFER_TIMEOUT_MS = 20_000
-        private const val FILE_TRANSFER_PARALLEL_PULLS = 2
+        private const val FILE_TRANSFER_PARALLEL_PULLS = 4
         private const val FILE_TRANSFER_BLOCK_RETRIES = 3
         const val ACTION_RETRY_FILE_TRANSFER = "com.codesync.RETRY_FILE_TRANSFER"
         const val EXTRA_FILE_ID = "file_id"
@@ -1160,6 +1160,18 @@ class NodeReceiverService : Service() {
             Log.w(TAG, "文件拉取失败：源不可直达且没有可用代理节点")
             return null
         }
+        val routeFailures = java.util.concurrent.ConcurrentHashMap<String, Int>()
+        fun orderedRoutes(): List<Pair<String, String>> =
+            routes.sortedWith(
+                compareBy<Pair<String, String>> { routeFailures[it.first] ?: 0 }
+                    .thenBy { if (it.first.startsWith("direct")) 0 else 1 }
+            )
+        fun markRouteSuccess(label: String) {
+            routeFailures[label] = 0
+        }
+        fun markRouteFailure(label: String) {
+            routeFailures[label] = (routeFailures[label] ?: 0) + 1
+        }
         val progressNotificationId = "pull-$fileId".hashCode()
         var lastProgressAt = 0L
 
@@ -1169,7 +1181,7 @@ class NodeReceiverService : Service() {
                 if (FileTransferStateStore.isPaused(this, fileId)) {
                     throw FileTransferPausedException()
                 }
-                for ((label, urlBase) in routes) {
+                for ((label, urlBase) in orderedRoutes()) {
                     if (FileTransferStateStore.isPaused(this, fileId)) {
                         throw FileTransferPausedException()
                     }
@@ -1186,22 +1198,30 @@ class NodeReceiverService : Service() {
                         encodingQuery
                     val url = if (label.startsWith("direct")) "$urlBase?$query" else "$urlBase?$query&hop=3"
                     val encrypted = runCatching { httpGetBytes(url) }
-                        .onFailure { lastError = "$label:${it.message ?: it.javaClass.simpleName}" }
+                        .onFailure {
+                            lastError = "$label:${it.message ?: it.javaClass.simpleName}"
+                            markRouteFailure(label)
+                        }
                         .getOrNull()
                         ?: continue
                     val plain = if (usePlainChunks) {
                         encrypted
                     } else {
                         runCatching { CryptoUtil.decryptBytes(encrypted, transferKey) }
-                            .onFailure { lastError = "$label:decrypt_failed" }
+                            .onFailure {
+                                lastError = "$label:decrypt_failed"
+                                markRouteFailure(label)
+                            }
                             .getOrNull()
                             ?: continue
                     }
                     val expectedLen = block.length.toInt()
                     if (plain.size != expectedLen) {
                         lastError = "$label:chunk_length_mismatch expected=$expectedLen got=${plain.size}"
+                        markRouteFailure(label)
                         continue
                     }
+                    markRouteSuccess(label)
                     return plain
                 }
                 if (attempt < FILE_TRANSFER_BLOCK_RETRIES - 1) {
@@ -1574,9 +1594,22 @@ class NodeReceiverService : Service() {
      */
     // 大图剪贴板：LWW 预检 → 分片拉取 → 写剪贴板。与文件传输不同：不弹确认框
     //（已受 shouldReceiveContent 的图片剪贴板开关把关），不留存下载目录，应用后即删。
+    private fun normalizeClipboardImageMime(mime: String): String {
+        val value = mime.lowercase(Locale.ROOT)
+        return when (value) {
+            "image/jpeg", "image/jpg" -> "image/jpeg"
+            "image/png" -> "image/png"
+            else -> ""
+        }
+    }
+
+    private fun clipboardImageExtension(mime: String): String =
+        if (normalizeClipboardImageMime(mime) == "image/jpeg") "jpg" else "png"
+
     private fun pullRemoteClipboardImage(payload: JSONObject): Boolean {
         val manifest = payload.optJSONObject("fileManifest") ?: return false
-        if (manifest.optString("mime") != "image/png") return false
+        val mime = normalizeClipboardImageMime(manifest.optString("mime"))
+        if (mime.isBlank()) return false
         val version = payload.optJSONObject("clipVersion")
         val shortHash = manifest.optString("sha256").take(24)
         val ts = (version?.optLong("ts", 0L) ?: 0L).takeIf { it > 0L }
@@ -1592,7 +1625,7 @@ class NodeReceiverService : Service() {
         val bytes = runCatching { received.file.readBytes() }.getOrNull()
         runCatching { received.file.delete() }
         if (bytes == null || bytes.isEmpty()) return false
-        val clipboardFile = writeClipboardImage(bytes, ts, shortHash) ?: return false
+        val clipboardFile = writeClipboardImage(bytes, ts, shortHash, mime) ?: return false
         rememberClipboardImageVersion(ts, origin, shortHash)
         rememberClipboardImageHistory(payload, clipboardFile, bytes.size.toLong(), ts, origin)
         return true
@@ -1632,7 +1665,8 @@ class NodeReceiverService : Service() {
 
     private fun applyRemoteClipboardImage(payload: JSONObject): Boolean {
         val manifest = payload.optJSONObject("fileManifest") ?: return false
-        if (manifest.optString("mime") != "image/png") return false
+        val mime = normalizeClipboardImageMime(manifest.optString("mime"))
+        if (mime.isBlank()) return false
         if (!manifest.optBoolean("inline", true)) return false
         val dataBase64 = payload.optString("dataBase64")
         if (dataBase64.isBlank()) return false
@@ -1656,16 +1690,20 @@ class NodeReceiverService : Service() {
         val origin = version?.optString("origin").orEmpty()
             .ifBlank { payload.optString("originDeviceId", payload.optString("sourceDeviceId")) }
         if (!isNewerClipboardImageVersion(ts, origin, shortHash)) return false
-        val clipboardFile = writeClipboardImage(bytes, ts, shortHash) ?: return false
+        val clipboardFile = writeClipboardImage(bytes, ts, shortHash, mime) ?: return false
         rememberClipboardImageVersion(ts, origin, shortHash)
         rememberClipboardImageHistory(payload, clipboardFile, bytes.size.toLong(), ts, origin)
         return true
     }
 
-    private fun writeClipboardImage(bytes: ByteArray, ts: Long, shortHash: String): File? {
+    private fun writeClipboardImage(bytes: ByteArray, ts: Long, shortHash: String, mime: String): File? {
         return runCatching {
             val dir = File(filesDir, "clipboard_images").apply { mkdirs() }
-            val file = File(dir, "clipboard-${ts.takeIf { it > 0L } ?: System.currentTimeMillis()}-$shortHash.png")
+            val normalizedMime = normalizeClipboardImageMime(mime).ifBlank { "image/png" }
+            val file = File(
+                dir,
+                "clipboard-${ts.takeIf { it > 0L } ?: System.currentTimeMillis()}-$shortHash.${clipboardImageExtension(normalizedMime)}"
+            )
             file.writeBytes(bytes)
             val uri: Uri = FileProvider.getUriForFile(
                 this,
@@ -1674,7 +1712,7 @@ class NodeReceiverService : Service() {
             )
             val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
             val clip = ClipData(
-                ClipDescription("codebridge_clipboard_image", arrayOf("image/png")),
+                ClipDescription("codebridge_clipboard_image", arrayOf(normalizedMime)),
                 ClipData.Item(uri)
             )
             clipboard.setPrimaryClip(clip)
@@ -1698,7 +1736,8 @@ class NodeReceiverService : Service() {
             title = payload.optJSONObject("fileManifest")?.optString("name").orEmpty()
                 .ifBlank { "剪贴板图片" },
             path = file.absolutePath,
-            mime = "image/png",
+            mime = normalizeClipboardImageMime(payload.optJSONObject("fileManifest")?.optString("mime").orEmpty())
+                .ifBlank { "image/png" },
             size = size,
             sourceDeviceId = origin,
             sourceDeviceName = payload.optString("originDeviceName")

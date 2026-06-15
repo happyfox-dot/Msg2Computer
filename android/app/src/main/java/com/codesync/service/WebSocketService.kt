@@ -104,7 +104,7 @@ class WebSocketService : Service() {
         const val NOTIFICATION_ID = 1001
         const val CHANNEL_ID = "code_sync_service"
         private const val MAX_INLINE_CLIPBOARD_TEXT_BYTES = 20 * 1024
-        private const val MAX_INLINE_CLIPBOARD_IMAGE_BYTES = 180 * 1024
+        private const val MAX_INLINE_CLIPBOARD_IMAGE_BYTES = 768 * 1024
         const val CONNECTION_STATE_ACTION = "com.codesync.CONNECTION_STATE"
         // 收到桌面节点下发的 TOTP 种子并存库后，发此本地广播通知界面刷新列表
         const val TOTP_SYNCED_ACTION = "com.codesync.TOTP_SYNCED"
@@ -549,13 +549,16 @@ class WebSocketService : Service() {
         val fullHash = sha256Hex(bytes)
         val shortHash = fullHash.take(24)
         val clipTs = System.currentTimeMillis()
+        val mime = intent.getStringExtra(EXTRA_FILE_MIME).orEmpty()
+            .ifBlank { if (file.extension.equals("jpg", ignoreCase = true) || file.extension.equals("jpeg", ignoreCase = true)) "image/jpeg" else "image/png" }
+        val defaultExt = if (mime.equals("image/jpeg", ignoreCase = true)) "jpg" else "png"
         val fileName = intent.getStringExtra(EXTRA_FILE_NAME).orEmpty()
-            .ifBlank { "clipboard-$clipTs.png" }
+            .ifBlank { "clipboard-$clipTs.$defaultExt" }
         val msgId = "clip-img-${identity.id}-$clipTs-$shortHash"
         val manifest = JSONObject()
             .put("fileId", msgId)
             .put("name", fileName)
-            .put("mime", "image/png")
+            .put("mime", mime)
             .put("size", bytes.size)
             .put("sha256", fullHash)
             .put("originDeviceId", identity.id)
@@ -621,6 +624,8 @@ class WebSocketService : Service() {
         val identity = PhoneIdentityStore.get(this)
         val clipTs = System.currentTimeMillis()
         val fileName = intent.getStringExtra(EXTRA_FILE_NAME).orEmpty().ifBlank { file.name }
+        val mime = intent.getStringExtra(EXTRA_FILE_MIME).orEmpty()
+            .ifBlank { if (file.extension.equals("jpg", ignoreCase = true) || file.extension.equals("jpeg", ignoreCase = true)) "image/jpeg" else "image/png" }
         val lanHost = LanDiscovery.localLanHost()
         val tsHost = LanDiscovery.localTailscaleHost()
         val host = lanHost.ifBlank { tsHost }
@@ -628,7 +633,7 @@ class WebSocketService : Service() {
         val manifest = FileTransferRegistry.registerOutgoingFile(
             file = file,
             name = fileName,
-            mime = "image/png",
+            mime = mime,
             identity = identity,
             targetDeviceIds = targetDevices.map { it.id },
             host = host,

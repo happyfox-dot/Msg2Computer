@@ -427,6 +427,7 @@ function setupFileTransferControls() {
     targetList.innerHTML = fileTransferTargets.map(target => {
       const disabled = !target.allowed || !target.reachable
       const checked = target.selected && !disabled
+      const rowStateClass = !target.reachable ? 'disabled offline' : (!target.allowed ? 'permission-disabled' : '')
       const statusText = target.statusLabel || getTopologyStatusLabel(target.status || (target.reachable ? 'reachable' : 'offline'))
       const meta = [
         statusText,
@@ -437,7 +438,7 @@ function setupFileTransferControls() {
         target.reason || ''
       ].filter(Boolean).join(' · ')
       return `
-        <label class="file-target-row ${disabled ? 'disabled' : ''}">
+        <label class="file-target-row ${rowStateClass}">
           <input type="checkbox" data-file-target-id="${escapeHtml(target.id)}" ${checked ? 'checked' : ''} ${disabled ? 'disabled' : ''}>
           <span class="file-target-icon">${getDeviceIcon(target.type)}</span>
           <span class="file-target-main">

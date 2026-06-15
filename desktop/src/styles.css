@@ -1276,6 +1276,10 @@ body {
   opacity: 0.48;
   cursor: not-allowed;
 }
+.file-target-row.permission-disabled {
+  opacity: 0.72;
+  cursor: not-allowed;
+}
 .file-target-icon {
   font-size: 16px;
 }

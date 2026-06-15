@@ -24,7 +24,7 @@ const DEFAULT_CHUNK_BYTES = 4 * 1024 * 1024 // 4MB
 const DEFAULT_OFFER_TTL_MS = 30 * 60 * 1000 // offer 30 分钟过期
 const NONCE_TTL_MS = 5 * 60 * 1000
 const NONCE_LIMIT = 500
-const DEFAULT_PARALLEL_PULLS = 3
+const DEFAULT_PARALLEL_PULLS = 4
 
 // 极简扩展名 → mime（仅用于展示，不参与安全判定）
 const MIME_BY_EXT = {
@@ -486,8 +486,16 @@ function createFileTransfer(deps = {}) {
       for (const cand of relayCandidates) {
         transports.push({ kind: 'proxy', host: cand.host, port: cand.port, label: `proxy:${cand.id}` })
       }
+      const transportFailures = new Map()
+      const orderedTransports = () => transports.slice().sort((a, b) => {
+        const failDiff = (transportFailures.get(a.label) || 0) - (transportFailures.get(b.label) || 0)
+        if (failDiff !== 0) return failDiff
+        return a.kind === b.kind ? 0 : (a.kind === 'direct' ? -1 : 1)
+      })
+      const markTransportSuccess = label => transportFailures.set(label, 0)
+      const markTransportFailure = label => transportFailures.set(label, (transportFailures.get(label) || 0) + 1)
       const fetchChunk = async (offset, to) => {
-        for (const transport of transports) {
+        for (const transport of orderedTransports()) {
           for (let attempt = 0; attempt < 2; attempt++) {
             // nonce 每次请求重新生成：上一通道可能已把 nonce 送达源设备
             const nonce = generateNonce()
@@ -502,8 +510,13 @@ function createFileTransfer(deps = {}) {
               ? `/file/${fileIdEnc}?${query}`
               : `/file/proxy/${originIdEnc}/${fileIdEnc}?${query}&hop=3`
             const resp = await httpGet({ host: transport.host, port: transport.port, path: reqPath, timeoutMs: 20000 })
-            if (resp && resp.status === 206 && Buffer.isBuffer(resp.body)) return resp
+            if (resp && resp.status === 206 && Buffer.isBuffer(resp.body)) {
+              markTransportSuccess(transport.label)
+              return resp
+            }
+            markTransportFailure(transport.label)
           }
+          markTransportFailure(transport.label)
           log(`分片通道不可用 ${transport.label}，尝试下一通道`)
         }
         return null

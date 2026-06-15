@@ -4270,7 +4270,8 @@ const CLIPBOARD_POLL_INTERVAL_MS = 900
 // 剪贴板文本 inline 上限；超过后仍按“剪贴板文本”同步，但底层转文件分片传输。
 const CLIPBOARD_MAX_LENGTH = 20 * 1024
 // 首版图片剪贴板用 inline manifest 走现有加密 relay，必须保守限制大小。
-const CLIPBOARD_INLINE_IMAGE_MAX_BYTES = 180 * 1024
+const CLIPBOARD_INLINE_IMAGE_MAX_BYTES = 768 * 1024
+const CLIPBOARD_IMAGE_JPEG_QUALITY = 90
 let clipboardWatchTimer = null
 // 上一次本机剪贴板内容快照：用于检测变化。
 let lastClipboardText = ''
@@ -4295,6 +4296,31 @@ function clipboardTextByteLength(text) {
 
 function hashBuffer(buffer) {
   return crypto.createHash('sha256').update(buffer).digest('hex')
+}
+
+function normalizeClipboardImageMime(mime = '') {
+  const value = String(mime || '').toLowerCase()
+  if (value === 'image/jpeg' || value === 'image/jpg') return 'image/jpeg'
+  if (value === 'image/png') return 'image/png'
+  return ''
+}
+
+function clipboardImageExtension(mime = '') {
+  return normalizeClipboardImageMime(mime) === 'image/jpeg' ? 'jpg' : 'png'
+}
+
+function encodeClipboardImageForSync(image) {
+  if (!image || image.isEmpty()) return null
+  try {
+    const jpeg = image.toJPEG(CLIPBOARD_IMAGE_JPEG_QUALITY)
+    if (Buffer.isBuffer(jpeg) && jpeg.length > 0) {
+      return { buffer: jpeg, mime: 'image/jpeg', ext: 'jpg' }
+    }
+  } catch (_) {}
+  const png = image.toPNG()
+  return Buffer.isBuffer(png) && png.length > 0
+    ? { buffer: png, mime: 'image/png', ext: 'png' }
+    : null
 }
 
 function isNewerClipVersion(ts, origin) {
@@ -4333,7 +4359,8 @@ function startClipboardSyncWatcher() {
   try {
     lastClipboardText = clipboard.readText() || ''
     const image = clipboard.readImage()
-    lastClipboardImageHash = image && !image.isEmpty() ? hashBuffer(image.toPNG()).slice(0, 24) : ''
+    const encodedImage = encodeClipboardImageForSync(image)
+    lastClipboardImageHash = encodedImage ? hashBuffer(encodedImage.buffer).slice(0, 24) : ''
     lastClipboardFileSignature = getClipboardFileSignature(readClipboardFilePaths())
   } catch (_) {
     lastClipboardText = ''
@@ -4401,25 +4428,27 @@ function pollClipboardImageForSync() {
     lastClipboardImageHash = ''
     return
   }
-  const png = image.toPNG()
-  const hash = hashBuffer(png)
+  const encodedImage = encodeClipboardImageForSync(image)
+  if (!encodedImage) return
+  const imageBuffer = encodedImage.buffer
+  const hash = hashBuffer(imageBuffer)
   const shortHash = hash.slice(0, 24)
   if (shortHash === lastClipboardImageHash) return
   lastClipboardImageHash = shortHash
   if (shortHash === clipboardImageSyncState.hash) return
-  if (png.length > CLIPBOARD_INLINE_IMAGE_MAX_BYTES) {
+  if (imageBuffer.length > CLIPBOARD_INLINE_IMAGE_MAX_BYTES) {
     // 大图回退：不整包 inline 进 relay 消息，转 manifest + 分片拉取
     //（与文件传输同通道），接收端拉完写剪贴板。版本先行登记，
     // 避免轮询期间把同一张图重复 offer。
     const clipTs = Date.now()
     rememberClipImageVersion(clipTs, getDesktopIdentity().id, shortHash)
-    offerClipboardImageAsFile(png, clipTs, shortHash).catch(error => {
+    offerClipboardImageAsFile(imageBuffer, clipTs, shortHash, encodedImage).catch(error => {
       console.error('剪贴板大图 manifest 同步失败:', error.message)
     })
     return
   }
   rememberClipImageVersion(Date.now(), getDesktopIdentity().id, shortHash)
-  broadcastClipboardImageToNodes(png, hash)
+  broadcastClipboardImageToNodes(imageBuffer, hash, encodedImage)
 }
 
 function getDefaultClipboardImageTargetIds() {
@@ -4507,7 +4536,7 @@ function buildLocalSourceAddressPayload() {
   }
 }
 
-async function offerClipboardImageAsFile(pngBuffer, clipTs, shortHash) {
+async function offerClipboardImageAsFile(imageBuffer, clipTs, shortHash, imageInfo = {}) {
   const targets = getDefaultClipboardImageTargetIds()
   if (targets.length === 0) {
     console.warn('剪贴板大图同步跳过：没有启用图片剪贴板的推送目标')
@@ -4524,8 +4553,9 @@ async function offerClipboardImageAsFile(pngBuffer, clipTs, shortHash) {
         if (Date.now() - fs.statSync(full).mtimeMs > 30 * 60 * 1000) fs.unlinkSync(full)
       } catch (_) {}
     }
-    filePath = path.join(outDir, `clipboard-${clipTs}-${shortHash}.png`)
-    fs.writeFileSync(filePath, pngBuffer)
+    const ext = imageInfo.ext || clipboardImageExtension(imageInfo.mime)
+    filePath = path.join(outDir, `clipboard-${clipTs}-${shortHash}.${ext}`)
+    fs.writeFileSync(filePath, imageBuffer)
   } catch (e) {
     console.error('剪贴板大图暂存失败:', e.message)
     return
@@ -4729,9 +4759,11 @@ function broadcastClipboardToNodes(text, options = {}) {
   }
 }
 
-function broadcastClipboardImageToNodes(pngBuffer, sha256, options = {}) {
-  if (!Buffer.isBuffer(pngBuffer) || pngBuffer.length === 0) return
-  if (pngBuffer.length > CLIPBOARD_INLINE_IMAGE_MAX_BYTES) return
+function broadcastClipboardImageToNodes(imageBuffer, sha256, options = {}) {
+  if (!Buffer.isBuffer(imageBuffer) || imageBuffer.length === 0) return
+  if (imageBuffer.length > CLIPBOARD_INLINE_IMAGE_MAX_BYTES) return
+  const mime = normalizeClipboardImageMime(options.mime) || 'image/png'
+  const ext = options.ext || clipboardImageExtension(mime)
   const identity = getDesktopIdentity()
   const clipTs = Number(options.ts) || clipboardImageSyncState.ts || Date.now()
   const clipOrigin = String(options.origin || clipboardImageSyncState.origin || identity.id)
@@ -4747,14 +4779,14 @@ function broadcastClipboardImageToNodes(pngBuffer, sha256, options = {}) {
     .filter(id => !exclude.has(id))
   if (targetDeviceIds.length === 0) return
 
-  const fullHash = sha256 || hashBuffer(pngBuffer)
+  const fullHash = sha256 || hashBuffer(imageBuffer)
   const shortHash = fullHash.slice(0, 24)
   const originMessageId = `clip-img-${clipOrigin}-${clipTs}-${shortHash}`
   const manifest = {
     fileId: originMessageId,
-    name: `clipboard-${clipTs}.png`,
-    mime: 'image/png',
-    size: pngBuffer.length,
+    name: `clipboard-${clipTs}.${ext}`,
+    mime,
+    size: imageBuffer.length,
     sha256: fullHash,
     originDeviceId: clipOrigin,
     targetDeviceIds,
@@ -4766,7 +4798,7 @@ function broadcastClipboardImageToNodes(pngBuffer, sha256, options = {}) {
     code: '',
     source: '剪贴板图片',
     label: manifest.name,
-    rawMessage: `剪贴板图片 ${formatBytes(pngBuffer.length)}`,
+    rawMessage: `剪贴板图片 ${formatBytes(imageBuffer.length)}`,
     timestamp: clipTs,
     phoneId: clipOrigin,
     phoneName: originDeviceName,
@@ -4779,7 +4811,7 @@ function broadcastClipboardImageToNodes(pngBuffer, sha256, options = {}) {
     relayMessageId: originMessageId,
     clipVersion: { ts: clipTs, origin: clipOrigin, hash: shortHash, kind: 'image' },
     fileManifest: manifest,
-    dataBase64: pngBuffer.toString('base64'),
+    dataBase64: imageBuffer.toString('base64'),
     relayPath,
     // gossip 续传携带衰减后的入站 TTL（options.ttl）；原发（本机新复制/上线补推）
     // 不传 ttl，用满 TTL。避免每跳重置导致 TTL 安全网失效（见剪贴板文本同款修复）。
@@ -4857,7 +4889,7 @@ function applyRemoteClipboard(codeInfo, codeData) {
 function applyRemoteClipboardImage(codeInfo, codeData) {
   const manifest = codeInfo.fileManifest || codeData.fileManifest || {}
   const dataBase64 = String(codeInfo.dataBase64 || codeData.dataBase64 || '')
-  if (!dataBase64 || manifest.mime !== 'image/png') return false
+  if (!dataBase64 || !normalizeClipboardImageMime(manifest.mime)) return false
   const maxBytes = Math.max(1, Number(desktopMessageSettings.maxFileSizeMb || 50)) * 1024 * 1024
   const size = Number(manifest.size || 0)
   if (size <= 0 || size > maxBytes || size > CLIPBOARD_INLINE_IMAGE_MAX_BYTES) return false
@@ -6677,7 +6709,7 @@ function handleIncomingClipboardTextManifest(codeInfo, codeData, manifest) {
 // 与文件传输不同：不弹确认框（已受 syncClipboardImage 接收开关把关）、
 // 不落下载目录、应用后即删。拉取前先做 LWW 预检，避免下载旧版本。
 function handleIncomingClipboardImageManifest(codeInfo, codeData, manifest) {
-  if (manifest.mime !== 'image/png') return
+  if (!normalizeClipboardImageMime(manifest.mime)) return
   const maxBytes = Math.max(1, Number(desktopMessageSettings.maxFileSizeMb || 50)) * 1024 * 1024
   const size = Number(manifest.size || 0)
   if (size <= 0 || size > maxBytes) return
@@ -6847,7 +6879,7 @@ function showNotification(title, body, options = {}) {
 function gossipClipboardImageState(codeData) {
   const dataBase64 = String(codeData.dataBase64 || '')
   const manifest = codeData.fileManifest || {}
-  if (!dataBase64 || manifest.mime !== 'image/png') return
+  if (!dataBase64 || !normalizeClipboardImageMime(manifest.mime)) return
   const buffer = Buffer.from(dataBase64, 'base64')
   if (!buffer.length || buffer.length > CLIPBOARD_INLINE_IMAGE_MAX_BYTES) return
   const version = codeData.clipVersion || {}
@@ -7023,7 +7055,8 @@ function hasDirectNodeAddress(node = {}) {
 
 function hasKnownDeliveryPath(node = {}) {
   const id = String(node.id || node.phoneId || '').trim()
-  if (!id || !node.pairingKey) return false
+  const pairingKey = node.pairingKey || lookupPeerPairingKey(id)
+  if (!id || !pairingKey) return false
   if (hasDirectNodeAddress(node) || hasActiveWsForNode(id)) return true
   try {
     const identity = getDesktopIdentity()
