@@ -14,6 +14,7 @@ data class DesktopDevice(
     val pairingKey: String,
     val enabled: Boolean,
     val lastSyncAt: Long,
+    val connectionUpdatedAt: Long,
     val updatedAt: Long,
     val routeMetric: Int,
     val routeNextHopId: String,
@@ -47,6 +48,7 @@ data class DesktopDevice(
 object DeviceStore {
     private const val PREFS_NAME = "paired_desktop_devices"
     private const val KEY_DEVICES = "devices"
+    private const val DESKTOP_WS_PORT = 19527
     private const val KEY_CLIPBOARD_IMAGE_POLICY_V3 = "clipboard_image_policy_v3"
     // 剪贴板策略 v2 一次性迁移标记：v1 存储里的 allowClipboard:false 是旧默认值
     // 而非用户选择，首次读取时统一翻转为新默认 true（此后用户的显式关闭原样保留）
@@ -74,16 +76,18 @@ object DeviceStore {
                 val hasRoute = routeMetric > 0 || routeNextHopId.isNotBlank() || routePath.size > 1
                 if (pairingKey.isBlank() || (host.isBlank() && altHosts.isEmpty() && !hasRoute)) continue
 
+                val deviceType = item.optString("type", "WINDOWS_DESKTOP")
                 devices.add(
                     DesktopDevice(
                         id = item.optString("id", UUID.randomUUID().toString()),
                         name = item.optString("name", host),
-                        type = item.optString("type", "WINDOWS_DESKTOP"),
+                        type = deviceType,
                         host = host,
-                        port = item.optInt("port", 19527),
+                        port = normalizePortForType(deviceType, item.optInt("port", defaultPortForType(deviceType))),
                         pairingKey = pairingKey,
                         enabled = item.optBoolean("enabled", true),
                         lastSyncAt = item.optLong("lastSyncAt", 0L),
+                        connectionUpdatedAt = item.optLong("connectionUpdatedAt", 0L),
                         updatedAt = item.optLong("updatedAt", System.currentTimeMillis()),
                         routeMetric = routeMetric,
                         routeNextHopId = routeNextHopId,
@@ -168,9 +172,11 @@ object DeviceStore {
         val devices = getDevices(context).toMutableList()
         val now = System.currentTimeMillis()
         val normalizedId = deviceId.ifBlank { "" }
+        val normalizedType = deviceType.ifBlank { "WINDOWS_DESKTOP" }
+        val normalizedPort = normalizePortForType(normalizedType, port)
         val index = devices.indexOfFirst {
             (normalizedId.isNotBlank() && it.id == normalizedId) ||
-                (host.isNotBlank() && it.host == host && it.port == port)
+                (host.isNotBlank() && it.host == host && it.port == normalizedPort)
         }
 
         val device = if (index >= 0) {
@@ -184,12 +190,13 @@ object DeviceStore {
             existing.copy(
                 id = normalizedId.ifBlank { existing.id },
                 name = name.ifBlank { existing.name },
-                type = deviceType.ifBlank { existing.type },
+                type = normalizedType.ifBlank { existing.type },
                 host = mergedHost,
-                port = port,
+                port = normalizedPort,
                 pairingKey = pairingKey,
                 enabled = enabled ?: existing.enabled,
                 lastSyncAt = existing.lastSyncAt,
+                connectionUpdatedAt = existing.connectionUpdatedAt,
                 updatedAt = now,
                 routeMetric = if (incomingRouteFresh) routeMetric else existing.routeMetric,
                 routeNextHopId = if (incomingRouteFresh) routeNextHopId else existing.routeNextHopId,
@@ -221,12 +228,13 @@ object DeviceStore {
             DesktopDevice(
                 id = normalizedId.ifBlank { UUID.randomUUID().toString() },
                 name = name,
-                type = deviceType.ifBlank { "WINDOWS_DESKTOP" },
+                type = normalizedType,
                 host = host,
-                port = port,
+                port = normalizedPort,
                 pairingKey = pairingKey,
                 enabled = enabled ?: true,
                 lastSyncAt = 0L,
+                connectionUpdatedAt = 0L,
                 updatedAt = now,
                 routeMetric = routeMetric,
                 routeNextHopId = routeNextHopId,
@@ -254,12 +262,58 @@ object DeviceStore {
         }
 
         if (index >= 0) {
+            if (!hasEffectiveDeviceChange(devices[index], device)) return devices[index]
             devices[index] = device
         } else {
             devices.add(device)
         }
         saveDevices(context, devices)
         return device
+    }
+
+    private fun defaultPortForType(type: String): Int =
+        if (type.uppercase().contains("PHONE")) LanDiscovery.NODE_RELAY_PORT else DESKTOP_WS_PORT
+
+    private fun normalizePortForType(type: String, port: Int): Int {
+        val isPhone = type.uppercase().contains("PHONE")
+        if (isPhone) return if (port > 0) port else LanDiscovery.NODE_RELAY_PORT
+        return when {
+            port <= 0 -> DESKTOP_WS_PORT
+            port == LanDiscovery.NODE_RELAY_PORT -> DESKTOP_WS_PORT
+            else -> port
+        }
+    }
+
+    private fun hasEffectiveDeviceChange(old: DesktopDevice, next: DesktopDevice): Boolean {
+        return old.id != next.id ||
+            old.name != next.name ||
+            old.type != next.type ||
+            old.host != next.host ||
+            old.port != next.port ||
+            old.pairingKey != next.pairingKey ||
+            old.enabled != next.enabled ||
+            old.routeMetric != next.routeMetric ||
+            old.routeNextHopId != next.routeNextHopId ||
+            old.routeNextHopName != next.routeNextHopName ||
+            old.routePath != next.routePath ||
+            old.routeUpdatedAt != next.routeUpdatedAt ||
+            old.allowSmsCodes != next.allowSmsCodes ||
+            old.allowSmsMessages != next.allowSmsMessages ||
+            old.allowNotifications != next.allowNotifications ||
+            old.allowTotp != next.allowTotp ||
+            old.allowClipboard != next.allowClipboard ||
+            old.allowClipboardImage != next.allowClipboardImage ||
+            old.allowClipboardFile != next.allowClipboardFile ||
+            old.allowFileTransfer != next.allowFileTransfer ||
+            old.maxFileSizeMb != next.maxFileSizeMb ||
+            old.autoAcceptFiles != next.autoAcceptFiles ||
+            old.altHosts != next.altHosts ||
+            old.networkId != next.networkId ||
+            old.autoPaired != next.autoPaired ||
+            old.trustSourceId != next.trustSourceId ||
+            old.trustLevel != next.trustLevel ||
+            old.acceptedAt != next.acceptedAt ||
+            old.capabilities != next.capabilities
     }
 
     fun setDeviceEnabled(context: Context, id: String, enabled: Boolean) {
@@ -312,8 +366,30 @@ object DeviceStore {
         saveDevices(context, devices)
     }
 
+    fun markDeviceConnectionChanged(context: Context, id: String, timestamp: Long = System.currentTimeMillis()) {
+        val devices = getDevices(context).map {
+            if (it.id == id) it.copy(connectionUpdatedAt = timestamp) else it
+        }
+        saveDevices(context, devices)
+    }
+
     fun removeDevice(context: Context, id: String) {
         saveDevices(context, getDevices(context).filterNot { it.id == id })
+    }
+
+    fun rewriteNetworkId(context: Context, targetNetworkId: String, mergeFromNetworkIds: List<String>) {
+        val target = targetNetworkId.trim()
+        if (target.isBlank()) return
+        val mergeFrom = mergeFromNetworkIds.map { it.trim() }.filter { it.isNotBlank() && it != target }.toSet()
+        val devices = getDevices(context).map { device ->
+            val current = device.networkId.trim()
+            if (current.isBlank() || current == target || current in mergeFrom) {
+                device.copy(networkId = target, updatedAt = System.currentTimeMillis())
+            } else {
+                device
+            }
+        }
+        saveDevices(context, devices)
     }
 
     private fun saveDevices(context: Context, devices: List<DesktopDevice>) {
@@ -329,6 +405,7 @@ object DeviceStore {
                     .put("pairingKey", device.pairingKey)
                     .put("enabled", device.enabled)
                     .put("lastSyncAt", device.lastSyncAt)
+                    .put("connectionUpdatedAt", device.connectionUpdatedAt)
                     .put("updatedAt", device.updatedAt)
                     .put("routeMetric", device.routeMetric)
                     .put("routeNextHopId", device.routeNextHopId)

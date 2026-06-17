@@ -45,6 +45,7 @@ let localNotifyServer = null
 let localEventToken = ''
 let lanJoinKeyPair = null
 let trustedNetworkId = ''
+let pendingNetworkMergeFromIds = new Set()
 let allowLanJoinRequests = true
 let pendingLanJoinRequests = new Map()
 let discoveredLanDevices = new Map()
@@ -64,6 +65,7 @@ let phoneSessionKeys = new WeakMap()
 let totpSeeds = new Map()
 let totpDeleteTombstones = []
 let fileTransferHistory = []
+let fileTransferDownloadDir = ''
 let desktopMessageSettings = {
   receiveSmsCodes: true,
   receiveAllSms: true,
@@ -72,7 +74,7 @@ let desktopMessageSettings = {
   // 开启后桌面自动把本机剪贴板变化推送给已配对节点，并接受其它节点同步过来的剪贴板。
   syncClipboard: false,
   syncClipboardText: false,
-  syncClipboardImage: false,
+  syncClipboardImage: true,
   syncClipboardFile: false,
   receiveFileTransfer: false,
   autoAcceptFiles: false,
@@ -103,7 +105,7 @@ const DEFAULT_MESSAGE_SETTINGS = {
   // 剪贴板同步默认关闭：剪贴板常含密码等敏感内容，需用户显式启用
   syncClipboard: false,
   syncClipboardText: false,
-  syncClipboardImage: false,
+  syncClipboardImage: true,
   syncClipboardFile: false,
   receiveFileTransfer: false,
   autoAcceptFiles: false,
@@ -611,6 +613,9 @@ function createTray() {
 const RECENT_DELIVERY_LIMIT = 300
 const recentDeliveryKeys = new Set()
 const recentDeliveryQueue = []
+const RECENT_CLIPBOARD_UI_LIMIT = 1000
+const recentClipboardUiKeys = new Set()
+const recentClipboardUiQueue = []
 
 function deliveryDedupKey(phoneId, msgId, payload = null) {
   const sourceId = String(
@@ -647,6 +652,70 @@ function rememberDelivery(phoneId, msgId, payload = null) {
   }
 }
 
+function isClipboardStateType(type) {
+  return type === CODE_TYPES.CLIPBOARD ||
+    type === CODE_TYPES.CLIPBOARD_TEXT ||
+    type === CODE_TYPES.CLIPBOARD_IMAGE
+}
+
+function clipboardBusinessKey(payload = {}) {
+  const type = String(payload.contentType || payload.type || '').trim()
+  if (!isClipboardStateType(type) &&
+      type !== CODE_TYPES.CLIPBOARD_FILE &&
+      type !== CODE_TYPES.FILE_TRANSFER) {
+    return ''
+  }
+  const version = payload.clipVersion && typeof payload.clipVersion === 'object'
+    ? payload.clipVersion
+    : {}
+  const manifest = payload.fileManifest && typeof payload.fileManifest === 'object'
+    ? payload.fileManifest
+    : {}
+  const origin = String(
+    version.origin ||
+    payload.originDeviceId ||
+    payload.sourceDeviceId ||
+    payload.phoneId ||
+    ''
+  ).trim()
+  const ts = String(version.ts || payload.timestamp || '').trim()
+  const manifestHash = String(
+    version.hash ||
+    manifest.sha256 ||
+    manifest.fileId ||
+    payload.originMessageId ||
+    payload.relayMessageId ||
+    payload.msgId ||
+    ''
+  ).trim()
+  const text = String(payload.rawMessage || payload.messageBody || payload.body || '')
+  const contentHash = manifestHash || (text ? hashClipText(text) : '')
+  if (!origin && !ts && !contentHash) return ''
+  return [
+    'clipboard',
+    type || 'unknown',
+    String(version.kind || '').trim(),
+    origin,
+    ts,
+    contentHash
+  ].join('|')
+}
+
+function hasRecentClipboardUi(payload = {}) {
+  const key = clipboardBusinessKey(payload)
+  return key ? recentClipboardUiKeys.has(key) : false
+}
+
+function rememberRecentClipboardUi(payload = {}) {
+  const key = clipboardBusinessKey(payload)
+  if (!key || recentClipboardUiKeys.has(key)) return
+  recentClipboardUiKeys.add(key)
+  recentClipboardUiQueue.push(key)
+  while (recentClipboardUiQueue.length > RECENT_CLIPBOARD_UI_LIMIT) {
+    recentClipboardUiKeys.delete(recentClipboardUiQueue.shift())
+  }
+}
+
 function getDesktopIdentity() {
   try {
     return {
@@ -676,6 +745,99 @@ function generateTrustedNetworkId() {
 function ensureTrustedNetworkId() {
   if (!trustedNetworkId) trustedNetworkId = generateTrustedNetworkId()
   return trustedNetworkId
+}
+
+function uniqueNetworkIds(values = []) {
+  return Array.from(new Set(
+    values
+      .map(value => String(value || '').trim())
+      .filter(Boolean)
+  ))
+}
+
+function normalizeNetworkMergeIds(value) {
+  if (Array.isArray(value)) return uniqueNetworkIds(value)
+  if (value && typeof value === 'object') {
+    if (Array.isArray(value.mergeFromNetworkIds)) return normalizeNetworkMergeIds(value.mergeFromNetworkIds)
+    if (Array.isArray(value.networkAliases)) return normalizeNetworkMergeIds(value.networkAliases)
+  }
+  return []
+}
+
+function rewriteStoredNetworkIds(targetNetworkId, mergeFromNetworkIds = []) {
+  const target = String(targetNetworkId || '').trim()
+  if (!target) return []
+  const mergeFrom = uniqueNetworkIds(mergeFromNetworkIds).filter(id => id !== target)
+  const shouldRewrite = id => {
+    const value = String(id || '').trim()
+    return !value || value === target || mergeFrom.includes(value)
+  }
+
+  for (const phone of authorizedPhones.values()) {
+    if (shouldRewrite(phone.networkId)) phone.networkId = target
+  }
+  for (const peer of pairedDesktopPeers.values()) {
+    if (shouldRewrite(peer.networkId)) peer.networkId = target
+  }
+  for (const node of topologyLsdb.nodes.values()) {
+    if (shouldRewrite(node.networkId)) {
+      node.networkId = target
+      node.updatedAt = Date.now()
+      node.seq = nextLsdbSequence()
+    }
+  }
+  topologyDeltaBacklog = topologyDeltaBacklog.map(delta => {
+    const copy = JSON.parse(JSON.stringify(delta))
+    if (shouldRewrite(copy.networkId)) copy.networkId = target
+    if (Array.isArray(copy.nodes)) {
+      copy.nodes = copy.nodes.map(node => {
+        const next = { ...node }
+        if (shouldRewrite(next.networkId)) next.networkId = target
+        return next
+      })
+    }
+    return copy
+  })
+  return mergeFrom
+}
+
+function mergeTrustedNetworkId(targetNetworkId, mergeFromNetworkIds = []) {
+  const target = String(targetNetworkId || '').trim()
+  if (!target) return []
+  const previous = String(trustedNetworkId || '').trim()
+  const mergeFrom = uniqueNetworkIds([previous, ...mergeFromNetworkIds]).filter(id => id && id !== target)
+  trustedNetworkId = target
+  rewriteStoredNetworkIds(target, mergeFrom)
+  mergeFrom.forEach(id => pendingNetworkMergeFromIds.add(id))
+  savePairingKey()
+  return mergeFrom
+}
+
+function rewriteTopologyDeltaNetwork(rawDelta, targetNetworkId, mergeFromNetworkIds = []) {
+  if (!rawDelta || typeof rawDelta !== 'object') return rawDelta
+  const target = String(targetNetworkId || '').trim()
+  if (!target) return rawDelta
+  const mergeFrom = uniqueNetworkIds([
+    rawDelta.networkId,
+    ...normalizeNetworkMergeIds(rawDelta.mergeFromNetworkIds || []),
+    ...mergeFromNetworkIds
+  ]).filter(id => id && id !== target)
+  const delta = JSON.parse(JSON.stringify(rawDelta))
+  delta.networkId = target
+  if (mergeFrom.length > 0) {
+    delta.networkMerge = true
+    delta.mergeFromNetworkIds = mergeFrom
+    delta.mergedAt = Date.now()
+  }
+  if (Array.isArray(delta.nodes)) {
+    delta.nodes = delta.nodes.map(node => ({
+      ...node,
+      networkId: target,
+      autoPaired: node.autoPaired === true || node.trustLevel === 'trusted_lan',
+      trustLevel: node.trustLevel || 'trusted_lan'
+    }))
+  }
+  return delta
 }
 
 function getLanJoinKeyPair() {
@@ -871,6 +1033,74 @@ function normalizeLsdbSeq(value, fallback = Date.now()) {
   return Number.isFinite(number) && number > 0 ? Math.round(number) : fallback
 }
 
+const TOPOLOGY_VOLATILE_FIELDS = new Set([
+  'seq',
+  'updatedAt',
+  'lastSeen',
+  'expiresAt',
+  'connected',
+  'status',
+  'active'
+])
+
+function normalizeTopologyPort(type, port) {
+  const value = Number(port)
+  const isPhone = String(type || '').includes('PHONE')
+  if (isPhone) {
+    return Number.isFinite(value) && value > 0 ? Math.round(value) : JOIN_PORT
+  }
+  if (!Number.isFinite(value) || value <= 0 || Math.round(value) === JOIN_PORT) {
+    return WS_PORT
+  }
+  return Math.round(value)
+}
+
+function normalizeTopologyRelayPort(type, raw = {}) {
+  const isPhone = String(type || '').includes('PHONE')
+  const value = Number(raw.relayPort || raw.joinPort || (isPhone ? raw.port : JOIN_PORT))
+  return Number.isFinite(value) && value > 0 ? Math.round(value) : JOIN_PORT
+}
+
+function topologySemanticFingerprint(value, ignoredKeys = TOPOLOGY_VOLATILE_FIELDS) {
+  if (Array.isArray(value)) {
+    return `[${value.map(item => topologySemanticFingerprint(item, ignoredKeys)).join(',')}]`
+  }
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value)
+      .filter(key => !ignoredKeys.has(key))
+      .sort()
+      .map(key => `${key}:${topologySemanticFingerprint(value[key], ignoredKeys)}`)
+      .join(',')}}`
+  }
+  return JSON.stringify(value ?? null)
+}
+
+function isSemanticTopologyUpdate(incoming, existing) {
+  if (!existing) return true
+  const incomingSeq = normalizeLsdbSeq(incoming.seq || incoming.updatedAt, 0)
+  const existingSeq = normalizeLsdbSeq(existing.seq || existing.updatedAt, 0)
+  if (incomingSeq > 0 && existingSeq > 0 && incomingSeq < existingSeq) return false
+  return topologySemanticFingerprint(incoming) !== topologySemanticFingerprint(existing)
+}
+
+function isTopologyVolatileRefresh(incoming, existing) {
+  if (!existing) return false
+  const incomingSeq = normalizeLsdbSeq(incoming.seq || incoming.updatedAt, 0)
+  const existingSeq = normalizeLsdbSeq(existing.seq || existing.updatedAt, 0)
+  return incomingSeq > existingSeq &&
+    topologySemanticFingerprint(incoming) === topologySemanticFingerprint(existing)
+}
+
+function refreshTopologyVolatileFields(existing, incoming) {
+  const refreshed = { ...(existing || {}) }
+  for (const key of TOPOLOGY_VOLATILE_FIELDS) {
+    if (Object.prototype.hasOwnProperty.call(incoming, key)) {
+      refreshed[key] = incoming[key]
+    }
+  }
+  return refreshed
+}
+
 function normalizeLsdbNode(raw = {}) {
   const id = String(raw.id || raw.deviceId || '').trim()
   if (!id) return null
@@ -896,7 +1126,9 @@ function normalizeLsdbNode(raw = {}) {
     role: raw.role || (type.includes('DESKTOP') ? 'desktop' : (isPhone ? 'phone' : 'peer')),
     host,
     lastIP: normalizeNetworkHost(raw.lastIP || host),
-    port: Number(raw.port || raw.relayPort || (isPhone ? 19529 : WS_PORT)),
+    port: normalizeTopologyPort(type, raw.wsPort || raw.port || raw.relayPort),
+    wsPort: isPhone ? undefined : normalizeTopologyPort(type, raw.wsPort || raw.port || WS_PORT),
+    relayPort: normalizeTopologyRelayPort(type, raw),
     pairingKey: pairingKeyValue,
     tsHost: String(raw.tsHost || '').trim(),
     altHosts,
@@ -952,20 +1184,30 @@ function upsertTopologyLsdbNode(rawNode) {
   const node = normalizeLsdbNode(rawNode)
   if (!node) return false
   const existing = topologyLsdb.nodes.get(node.id)
-  if (existing && normalizeLsdbSeq(existing.seq, 0) >= node.seq) return false
   const merged = existing ? { ...existing, ...node, pairingKey: node.pairingKey || existing.pairingKey } : node
-  topologyLsdb.nodes.set(node.id, merged)
-  return JSON.stringify(existing || {}) !== JSON.stringify(merged)
+  if (isSemanticTopologyUpdate(merged, existing)) {
+    topologyLsdb.nodes.set(node.id, merged)
+    return true
+  }
+  if (isTopologyVolatileRefresh(merged, existing)) {
+    topologyLsdb.nodes.set(node.id, refreshTopologyVolatileFields(existing, merged))
+  }
+  return false
 }
 
 function upsertTopologyLsdbLink(rawLink) {
   const link = normalizeLsdbLink(rawLink)
   if (!link) return false
   const existing = topologyLsdb.links.get(link.id)
-  if (existing && normalizeLsdbSeq(existing.seq, 0) >= link.seq) return false
   const merged = existing ? { ...existing, ...link } : link
-  topologyLsdb.links.set(link.id, merged)
-  return JSON.stringify(existing || {}) !== JSON.stringify(merged)
+  if (isSemanticTopologyUpdate(merged, existing)) {
+    topologyLsdb.links.set(link.id, merged)
+    return true
+  }
+  if (isTopologyVolatileRefresh(merged, existing)) {
+    topologyLsdb.links.set(link.id, refreshTopologyVolatileFields(existing, merged))
+  }
+  return false
 }
 
 function pruneTopologyLsdb() {
@@ -1261,6 +1503,62 @@ function normalizePushContentPolicy(policy = {}) {
   return messageRouter.normalizePushContentPolicy(policy)
 }
 
+function mergeContentPolicyForDuplicateNode(nodeId, preferred = {}) {
+  const records = [
+    topologyLsdb.nodes.get(String(nodeId || '').trim()),
+    authorizedPhones.get(String(nodeId || '').trim()),
+    pairedDesktopPeers.get(String(nodeId || '').trim()),
+    preferred
+  ].filter(Boolean)
+  const merged = normalizePushContentPolicy(preferred.contentPolicy || preferred || {})
+  for (const record of records) {
+    const policy = normalizePushContentPolicy(record.contentPolicy || record || {})
+    if (policy.allowClipboardFile === true) merged.allowClipboardFile = true
+    if (policy.allowFileTransfer === true) merged.allowFileTransfer = true
+    if (policy.autoAcceptFiles === true) merged.autoAcceptFiles = true
+    merged.maxFileSizeMb = Math.max(
+      Number(merged.maxFileSizeMb || 50) || 50,
+      Number(policy.maxFileSizeMb || 50) || 50
+    )
+  }
+  return normalizePushContentPolicy(merged)
+}
+
+function mergeTrustedNodeRecord(nodeId, preferred = {}) {
+  const id = String(nodeId || preferred.id || preferred.phoneId || '').trim()
+  if (!id) return preferred
+  const phone = authorizedPhones.get(id)
+  const peer = pairedDesktopPeers.get(id)
+  const lsdbNode = topologyLsdb.nodes.get(id)
+  const records = [lsdbNode, phone, peer, preferred].filter(Boolean)
+  const base = records.reduce((acc, record) => ({ ...acc, ...record }), {})
+  const hosts = collectNetworkHosts(
+    ...records.flatMap(record => [
+      record.lastIP,
+      record.host,
+      record.relayHost,
+      record.tsHost,
+      record.altHosts
+    ])
+  )
+  const primaryHost = normalizeNetworkHost(preferred.host || preferred.lastIP || base.host || base.lastIP || hosts[0] || '')
+  const pairingKeyValue = preferred.pairingKey || peer?.pairingKey || phone?.pairingKey || lsdbNode?.pairingKey || ''
+  return {
+    ...base,
+    ...preferred,
+    id,
+    phoneId: preferred.phoneId || base.phoneId || id,
+    pairingKey: pairingKeyValue,
+    contentPolicy: mergeContentPolicyForDuplicateNode(id, preferred),
+    host: primaryHost || hosts[0] || '',
+    lastIP: normalizeNetworkHost(preferred.lastIP || base.lastIP || primaryHost || hosts[0] || ''),
+    relayHost: normalizeNetworkHost(preferred.relayHost || base.relayHost || ''),
+    tsHost: normalizeNetworkHost(preferred.tsHost || base.tsHost || ''),
+    altHosts: hosts.filter(host => host && host !== primaryHost),
+    relayPort: Number(preferred.relayPort || base.relayPort || preferred.port || base.port) || JOIN_PORT
+  }
+}
+
 function canPushContentToNode(target, type) {
   return messageRouter.canPushContentToNode(target, type, CODE_TYPES)
 }
@@ -1358,6 +1656,7 @@ function loadOrCreatePairingKey() {
           acceptedAt: Number(phone.acceptedAt || 0) || 0,
           capabilities: phone.capabilities && typeof phone.capabilities === 'object' ? phone.capabilities : {},
           contentPolicy: normalizePushContentPolicy(upgradeContentPolicy(phone)),
+          connectionUpdatedAt: Number(phone.connectionUpdatedAt || 0) || 0,
           connected: false
         }
       ]).filter(([id]) => !!id))
@@ -1382,6 +1681,7 @@ function loadOrCreatePairingKey() {
           acceptedAt: Number(peer.acceptedAt || 0) || 0,
           capabilities: peer.capabilities && typeof peer.capabilities === 'object' ? peer.capabilities : {},
           contentPolicy: normalizePushContentPolicy(upgradeContentPolicy(peer)),
+          connectionUpdatedAt: Number(peer.connectionUpdatedAt || 0) || 0,
           connected: false
         }
       ]).filter(([id, peer]) => !!id && !!peer.host && !!peer.pairingKey))
@@ -1396,7 +1696,12 @@ function loadOrCreatePairingKey() {
         ...item,
         secret: unprotectSecret(item.secret)
       })).filter(Boolean)
-      desktopMessageSettings = normalizeMessageSettings(saved.messageSettings || {})
+      const savedMessageSettings = { ...(saved.messageSettings || {}) }
+      if (savedPolicyVersion < 4) {
+        savedMessageSettings.syncClipboardImage = true
+      }
+      desktopMessageSettings = normalizeMessageSettings(savedMessageSettings)
+      fileTransferDownloadDir = normalizeFileTransferDownloadDir(saved.fileTransferDownloadDir || '')
       clipboardSyncState = normalizeClipboardSyncState(saved.clipboardSyncState || {})
       clipboardImageSyncState = normalizeClipboardSyncState(saved.clipboardImageSyncState || {})
       trustedNetworkId = String(saved.networkId || saved.trustedNetworkId || '').trim()
@@ -1467,7 +1772,7 @@ function flushPairingConfigToDisk() {
       tmpPath,
       JSON.stringify({
         // 内容策略格式版本：v2 起 allowClipboard 默认 true（见 loadOrCreatePairingKey 迁移）
-        policyVersion: 3,
+        policyVersion: 4,
         networkId: ensureTrustedNetworkId(),
         allowLanJoinRequests,
         localEventToken: protectSecret(ensureLocalEventToken()),
@@ -1492,6 +1797,7 @@ function flushPairingConfigToDisk() {
           acceptedAt: phone.acceptedAt || 0,
           capabilities: phone.capabilities || {},
           contentPolicy: normalizePushContentPolicy(phone.contentPolicy || phone),
+          connectionUpdatedAt: phone.connectionUpdatedAt || 0,
           pairingKey: protectSecret(phone.pairingKey)
         })),
         desktopPeers: getPairedDesktopPeers().map(peer => ({
@@ -1512,6 +1818,7 @@ function flushPairingConfigToDisk() {
           trustLevel: peer.trustLevel || '',
           acceptedAt: peer.acceptedAt || 0,
           capabilities: peer.capabilities || {},
+          connectionUpdatedAt: peer.connectionUpdatedAt || 0,
           contentPolicy: normalizePushContentPolicy(peer.contentPolicy || peer)
         })),
         totpSeeds: getStoredTotpSeeds(),
@@ -1519,6 +1826,7 @@ function flushPairingConfigToDisk() {
         topologyLsdb: exportTopologyLsdb(),
         topologyDeltaBacklog: exportTopologyDeltaBacklog(),
         messageSettings: normalizeMessageSettings(desktopMessageSettings),
+        fileTransferDownloadDir: fileTransferDownloadDir || '',
         // 剪贴板 LWW 版本（仅哈希不含明文）：跨重启保持，避免补推用旧值盖新值
         clipboardSyncState: { ...clipboardSyncState },
         clipboardImageSyncState: { ...clipboardImageSyncState },
@@ -1530,6 +1838,79 @@ function flushPairingConfigToDisk() {
   } catch (e) {
     console.error('Failed to save pairing config:', e)
   }
+}
+
+function normalizeFileTransferDownloadDir(value = '') {
+  const raw = String(value || '').trim()
+  if (!raw) return ''
+  try {
+    const resolved = path.resolve(raw)
+    return path.isAbsolute(resolved) ? resolved : ''
+  } catch (_) {
+    return ''
+  }
+}
+
+function defaultFileTransferDownloadDir() {
+  try {
+    return app.getPath('downloads')
+  } catch (_) {
+    return path.join(app.getPath('userData'), 'downloads')
+  }
+}
+
+function getFileTransferDownloadDir() {
+  return normalizeFileTransferDownloadDir(fileTransferDownloadDir) || defaultFileTransferDownloadDir()
+}
+
+function resetFileTransferManager() {
+  if (!fileTransfer) return
+  try {
+    fileTransfer.cancelAll?.()
+  } catch (_) {
+    // Best-effort: changing the receive directory should not block the UI.
+  }
+  fileTransfer = null
+}
+
+function fileTransferSettingsSnapshot() {
+  const customDownloadDir = normalizeFileTransferDownloadDir(fileTransferDownloadDir)
+  return {
+    downloadDir: customDownloadDir || defaultFileTransferDownloadDir(),
+    customDownloadDir,
+    usingDefault: !customDownloadDir
+  }
+}
+
+async function chooseFileTransferDownloadDir() {
+  const result = await dialog.showOpenDialog(mainWindow || undefined, {
+    title: '选择文件接收保存目录',
+    properties: ['openDirectory', 'createDirectory']
+  })
+  if (result.canceled || !result.filePaths?.[0]) {
+    return fileTransferSettingsSnapshot()
+  }
+  fileTransferDownloadDir = normalizeFileTransferDownloadDir(result.filePaths[0])
+  savePairingKey()
+  resetFileTransferManager()
+  return fileTransferSettingsSnapshot()
+}
+
+function setFileTransferDownloadDir(dir = '') {
+  fileTransferDownloadDir = normalizeFileTransferDownloadDir(dir)
+  savePairingKey()
+  resetFileTransferManager()
+  return fileTransferSettingsSnapshot()
+}
+
+async function openFileTransferDownloadDir() {
+  const dir = getFileTransferDownloadDir()
+  try {
+    fs.mkdirSync(dir, { recursive: true })
+  } catch (error) {
+    return { success: false, error: error.message || '无法创建目录' }
+  }
+  return openLocalPath(dir, false)
 }
 
 async function regeneratePairingKey() {
@@ -1679,11 +2060,13 @@ function notifyPhonesChanged(options = {}) {
   }
 }
 
-function notifyDesktopPeersChanged() {
+function notifyDesktopPeersChanged(options = {}) {
   if (mainWindow) {
     mainWindow.webContents.send('desktop-peers-changed', getPairedDesktopPeers())
   }
-  scheduleTopologyBroadcast()
+  if (options.topologyChanged !== false) {
+    scheduleTopologyBroadcast()
+  }
 }
 
 function upsertAuthorizedPhone({
@@ -1727,6 +2110,7 @@ function upsertAuthorizedPhone({
     acceptedAt: Number(acceptedAt || existing?.acceptedAt || 0) || 0,
     capabilities: capabilities && typeof capabilities === 'object' ? capabilities : (existing?.capabilities || {}),
     contentPolicy: normalizePushContentPolicy(contentPolicy || existing?.contentPolicy || existing || {}),
+    connectionUpdatedAt: existing?.connectionUpdatedAt || 0,
     connected: existing?.connected === true
   }
   const topologyChanged = !existing ||
@@ -1735,6 +2119,10 @@ function upsertAuthorizedPhone({
     String(existing.pairingKey || '') !== String(phone.pairingKey || '') ||
     String(existing.tsHost || '') !== String(phone.tsHost || '') ||
     String(existing.networkId || '') !== String(phone.networkId || '') ||
+    existing.autoPaired !== phone.autoPaired ||
+    String(existing.trustSourceId || '') !== String(phone.trustSourceId || '') ||
+    String(existing.trustLevel || '') !== String(phone.trustLevel || '') ||
+    Number(existing.acceptedAt || 0) !== Number(phone.acceptedAt || 0) ||
     String(existing.deviceType || '') !== String(phone.deviceType || '') ||
     JSON.stringify(normalizePushContentPolicy(existing.contentPolicy || existing || {})) !== JSON.stringify(phone.contentPolicy || {}) ||
     JSON.stringify(existing.capabilities || {}) !== JSON.stringify(phone.capabilities || {})
@@ -1747,14 +2135,15 @@ function upsertAuthorizedPhone({
 function normalizeDesktopPeer(pairingData) {
   const id = String(pairingData?.id || pairingData?.deviceId || '').trim()
   const host = String(pairingData?.host || '').trim()
-  const port = Number(pairingData?.port || WS_PORT)
+  const deviceType = normalizeDeviceType(pairingData?.deviceType || pairingData?.type, 'WINDOWS_DESKTOP')
+  const port = normalizeTopologyPort(deviceType, pairingData?.wsPort || pairingData?.port || WS_PORT)
   const pairingKeyValue = String(pairingData?.pairingKey || pairingData?.pk || '').trim()
   if (!id || !host || !pairingKeyValue || !Number.isFinite(port)) return null
 
   return {
     id,
-    name: String(pairingData.name || pairingData.deviceName || 'Desktop PC').trim(),
-    deviceType: normalizeDeviceType(pairingData.deviceType || pairingData.type, 'WINDOWS_DESKTOP'),
+    name: String(pairingData?.name || pairingData?.deviceName || 'Desktop PC').trim(),
+    deviceType,
     host,
     port,
     pairingKey: pairingKeyValue,
@@ -1799,11 +2188,26 @@ function upsertPairedDesktopPeer(pairingData) {
     acceptedAt: normalized.acceptedAt || existing?.acceptedAt || 0,
     capabilities: Object.keys(normalized.capabilities || {}).length > 0 ? normalized.capabilities : (existing?.capabilities || {}),
     contentPolicy: normalizePushContentPolicy(normalized.contentPolicy || existing?.contentPolicy || existing || {}),
+    connectionUpdatedAt: existing?.connectionUpdatedAt || 0,
     connected: existing?.connected === true
   }
+  const topologyChanged = !existing ||
+    String(existing.name || '') !== String(peer.name || '') ||
+    String(existing.host || '') !== String(peer.host || '') ||
+    Number(existing.port || 0) !== Number(peer.port || 0) ||
+    String(existing.pairingKey || '') !== String(peer.pairingKey || '') ||
+    String(existing.tsHost || '') !== String(peer.tsHost || '') ||
+    String(existing.networkId || '') !== String(peer.networkId || '') ||
+    existing.enabled !== peer.enabled ||
+    String(existing.deviceType || '') !== String(peer.deviceType || '') ||
+    String(existing.trustSourceId || '') !== String(peer.trustSourceId || '') ||
+    String(existing.trustLevel || '') !== String(peer.trustLevel || '') ||
+    Number(existing.acceptedAt || 0) !== Number(peer.acceptedAt || 0) ||
+    JSON.stringify(normalizePushContentPolicy(existing.contentPolicy || existing || {})) !== JSON.stringify(peer.contentPolicy || {}) ||
+    JSON.stringify(existing.capabilities || {}) !== JSON.stringify(peer.capabilities || {})
   pairedDesktopPeers.set(peer.id, peer)
   savePairingKey()
-  notifyDesktopPeersChanged()
+  notifyDesktopPeersChanged({ topologyChanged })
   return peer
 }
 
@@ -1877,9 +2281,21 @@ function normalizeDiscoveredLanDevice(payload, remoteAddress) {
 
 function rememberDiscoveredLanDevice(device) {
   if (!device || !device.id) return
-  discoveredLanDevices.set(device.id, device)
+  discoveredLanDevices.set(device.id, decorateDiscoveredLanDevice(device))
   if (mainWindow) {
     mainWindow.webContents.send('lan-devices-changed', getDiscoveredLanDevices())
+  }
+}
+
+function decorateDiscoveredLanDevice(device) {
+  if (!device || !device.id) return device
+  const isTrusted = isKnownTrustedNode(device.id)
+  if (!isTrusted) return device
+  return {
+    ...device,
+    trustStatus: 'trusted',
+    canPair: false,
+    canRequestJoin: false
   }
 }
 
@@ -1891,6 +2307,7 @@ function getDiscoveredLanDevices() {
     }
   }
   return Array.from(discoveredLanDevices.values())
+    .map(decorateDiscoveredLanDevice)
     .sort((a, b) => (b.discoveredAt || 0) - (a.discoveredAt || 0))
 }
 
@@ -2060,14 +2477,16 @@ function getTrustedPeerCount() {
     Array.from(pairedDesktopPeers.values()).filter(peer => peer?.pairingKey && peer.enabled !== false).length
 }
 
-function adoptTrustedNetworkId(networkId) {
+function adoptTrustedNetworkId(networkId, options = {}) {
   const incoming = String(networkId || '').trim()
   if (!incoming) return ensureTrustedNetworkId()
   const existing = String(trustedNetworkId || '').trim()
   if (existing && existing !== incoming && getTrustedPeerCount() > 0) {
-    throw new Error('network_id_mismatch')
+    if (options.allowMerge !== true) throw new Error('network_id_mismatch')
+    mergeTrustedNetworkId(incoming, options.mergeFromNetworkIds || [])
+    return trustedNetworkId
   }
-  trustedNetworkId = incoming
+  mergeTrustedNetworkId(incoming, options.mergeFromNetworkIds || [])
   savePairingKey()
   return trustedNetworkId
 }
@@ -2243,9 +2662,16 @@ async function requestLanJoin(device, template = 'basic') {
   if (!pairingKey) loadOrCreatePairingKey()
   const target = normalizeLanJoinDevice(device)
   if (!target) return { success: false, error: 'invalid_lan_join_target' }
-  if (isKnownTrustedNode(target.id)) return { success: true, alreadyTrusted: true }
+  if (isKnownTrustedNode(target.id)) {
+    return {
+      success: true,
+      alreadyTrusted: true,
+      peer: authorizedPhones.get(target.id) || pairedDesktopPeers.get(target.id) || topologyLsdb.nodes.get(target.id) || target
+    }
+  }
 
   const identity = getDesktopIdentity()
+  const previousNetworkId = String(trustedNetworkId || '').trim()
   const requestId = `join-${Date.now()}-${crypto.randomBytes(6).toString('hex')}`
   const { publicKey, sessionKey } = createLanJoinRequestKey(target.joinPublicKey)
   const policy = contentPolicyForJoinTemplate(template)
@@ -2288,7 +2714,11 @@ async function requestLanJoin(device, template = 'basic') {
   const acceptPlain = decryptMessage(response.payload, sessionKey)
   if (!acceptPlain) return { success: false, error: 'decrypt_join_accept_failed' }
   const accept = JSON.parse(acceptPlain)
-  adoptTrustedNetworkId(accept.networkId)
+  const mergeFromNetworkIds = uniqueNetworkIds([
+    previousNetworkId,
+    ...normalizeNetworkMergeIds(accept.mergeFromNetworkIds || [])
+  ])
+  adoptTrustedNetworkId(accept.networkId, { allowMerge: true, mergeFromNetworkIds })
   const acceptedAt = Number(accept.acceptedAt || Date.now())
   const acceptorNode = accept.node || {
     id: target.id,
@@ -2310,10 +2740,13 @@ async function requestLanJoin(device, template = 'basic') {
   })
 
   if (accept.topologySnapshot) {
-    applyTopologyDeltaPayload(accept.topologySnapshot, { excludeNodeId: accept.acceptedByNodeId || peer.id })
+    applyTopologyDeltaPayload(
+      rewriteTopologyDeltaNetwork(accept.topologySnapshot, accept.networkId, mergeFromNetworkIds),
+      { excludeNodeId: accept.acceptedByNodeId || peer.id }
+    )
   }
   syncLocalTopologyIntoLsdb('lan_join_accepted')
-  broadcastTopologyToAllPeers('lan_join_accepted')
+  broadcastTopologyToAllPeers('lan_join_accepted', { mergeFromNetworkIds })
   return { success: true, peer, networkId: accept.networkId }
 }
 
@@ -2402,6 +2835,11 @@ async function handleLanJoinRequest(body, remoteAddress = '') {
   const acceptedAt = Date.now()
   const contentPolicy = contentPolicyForJoinTemplate(decision.template || 'basic')
   const networkId = ensureTrustedNetworkId()
+  const mergeFromNetworkIds = uniqueNetworkIds([
+    payload.networkId,
+    payload.topologySnapshot && payload.topologySnapshot.networkId,
+    ...normalizeNetworkMergeIds(payload.topologySnapshot?.mergeFromNetworkIds || [])
+  ]).filter(id => id !== networkId)
   const trustedNode = {
     ...requesterNode,
     id: nodeId,
@@ -2426,12 +2864,20 @@ async function handleLanJoinRequest(body, remoteAddress = '') {
     contentPolicy
   })
 
+  if (payload.topologySnapshot) {
+    applyTopologyDeltaPayload(
+      rewriteTopologyDeltaNetwork(payload.topologySnapshot, networkId, mergeFromNetworkIds),
+      { excludeNodeId: nodeId }
+    )
+  }
+
   syncLocalTopologyIntoLsdb('lan_join_accept')
-  const delta = buildTopologyDelta('lan_join_accept')
-  broadcastTopologyToAllPeers('lan_join_accept')
+  const delta = buildTopologyDelta('lan_join_accept', { mergeFromNetworkIds })
+  broadcastTopologyToAllPeers('lan_join_accept', { baseDelta: delta })
 
   const acceptPayload = {
     networkId,
+    mergeFromNetworkIds,
     acceptedByNodeId: getDesktopIdentity().id,
     acceptedAt,
     nodePairingKey: pairingKey,
@@ -2904,8 +3350,9 @@ function setPhoneConnected(phoneId, connected) {
   const phone = authorizedPhones.get(phoneId)
   if (!phone) return
   phone.connected = connected
+  phone.connectionUpdatedAt = Date.now()
   if (connected) {
-    phone.lastSeen = Date.now()
+    phone.lastSeen = phone.connectionUpdatedAt
   }
   notifyPhonesChanged({ topologyChanged: false })
 }
@@ -2927,6 +3374,8 @@ function syncLocalTopologyIntoLsdb(reason = 'local_state') {
   const identity = getDesktopIdentity()
   const now = Date.now()
   const localSeq = nextLsdbSequence()
+  const existingLocalNode = topologyLsdb.nodes.get(identity.id)
+  const localAcceptedAt = Number(existingLocalNode?.acceptedAt || 0) || now
   upsertTopologyLsdbNode({
     id: identity.id,
     name: identity.name,
@@ -2934,13 +3383,15 @@ function syncLocalTopologyIntoLsdb(reason = 'local_state') {
     role: 'local_desktop',
     host: getLocalIP(),
     port: WS_PORT,
+    wsPort: WS_PORT,
+    relayPort: JOIN_PORT,
     pairingKey,
     tsHost: getTailscaleIPv4(),
     networkId: ensureTrustedNetworkId(),
     autoPaired: false,
     trustSourceId: identity.id,
     trustLevel: 'local',
-    acceptedAt: now,
+    acceptedAt: localAcceptedAt,
     capabilities: getNodeCapabilities(),
     status: 'online',
     connected: true,
@@ -2954,14 +3405,20 @@ function syncLocalTopologyIntoLsdb(reason = 'local_state') {
 
   getAuthorizedPhones().forEach(phone => {
     if (!phone.id) return
-    const phoneSeq = normalizeLsdbSeq(phone.lastSeen || phone.firstSeen, now)
+    const phoneStateAt = Math.max(
+      Number(phone.connectionUpdatedAt || 0) || 0,
+      Number(phone.lastSeen || 0) || 0,
+      Number(phone.firstSeen || 0) || 0
+    )
+    const phoneSeq = normalizeLsdbSeq(phoneStateAt, now)
     upsertTopologyLsdbNode({
       id: phone.id,
       name: phone.name || 'Android Phone',
       type: phone.deviceType || 'ANDROID_PHONE',
       role: 'phone',
       host: phone.lastIP,
-      port: Number(phone.relayPort) || 19529,
+      port: Number(phone.relayPort) || JOIN_PORT,
+      relayPort: Number(phone.relayPort) || JOIN_PORT,
       pairingKey: phone.pairingKey,
       tsHost: phone.tsHost || '',
       networkId: phone.networkId || ensureTrustedNetworkId(),
@@ -2979,7 +3436,7 @@ function syncLocalTopologyIntoLsdb(reason = 'local_state') {
       authority: 'source_device',
       sourceId: identity.id,
       seq: phoneSeq,
-      updatedAt: phone.lastSeen || now,
+      updatedAt: phoneStateAt,
       lastSeen: phone.lastSeen || now
     })
     const edgeEnabled = phone.enabled !== false && phone.revoked !== true && !!phone.pairingKey && !!phone.lastIP
@@ -2995,7 +3452,7 @@ function syncLocalTopologyIntoLsdb(reason = 'local_state') {
       routable: edgeEnabled,
       authority: 'source_device',
       seq: phoneSeq,
-      updatedAt: phone.lastSeen || now,
+      updatedAt: phoneStateAt,
       description: '手机作为来源设备，控制推送到当前设备节点的范围'
     })
     upsertTopologyLsdbLink({
@@ -3010,7 +3467,7 @@ function syncLocalTopologyIntoLsdb(reason = 'local_state') {
       routable: edgeEnabled,
       authority: 'link_state',
       seq: phoneSeq,
-      updatedAt: phone.lastSeen || now,
+      updatedAt: phoneStateAt,
       description: '电脑节点向手机下发链路状态和 SPF 路由表'
     })
   })
@@ -3045,7 +3502,12 @@ function syncLocalTopologyIntoLsdb(reason = 'local_state') {
 
   getPairedDesktopPeers().forEach(peer => {
     if (!peer.id) return
-    const peerSeq = normalizeLsdbSeq(peer.lastSeen || peer.firstSeen, now)
+    const peerStateAt = Math.max(
+      Number(peer.connectionUpdatedAt || 0) || 0,
+      Number(peer.lastSeen || 0) || 0,
+      Number(peer.firstSeen || 0) || 0
+    )
+    const peerSeq = normalizeLsdbSeq(peerStateAt, now)
     const peerEnabled = peer.enabled !== false && !!peer.pairingKey && !!peer.host
     upsertTopologyLsdbNode({
       id: peer.id,
@@ -3053,7 +3515,9 @@ function syncLocalTopologyIntoLsdb(reason = 'local_state') {
       type: peer.deviceType || 'WINDOWS_DESKTOP',
       role: 'desktop',
       host: peer.host,
-      port: Number(peer.port) || WS_PORT,
+      port: normalizeTopologyPort(peer.deviceType || 'WINDOWS_DESKTOP', peer.port || WS_PORT),
+      wsPort: normalizeTopologyPort(peer.deviceType || 'WINDOWS_DESKTOP', peer.port || WS_PORT),
+      relayPort: JOIN_PORT,
       pairingKey: peer.pairingKey,
       tsHost: peer.tsHost || '',
       networkId: peer.networkId || ensureTrustedNetworkId(),
@@ -3070,7 +3534,7 @@ function syncLocalTopologyIntoLsdb(reason = 'local_state') {
       authority: 'desktop_owner',
       sourceId: identity.id,
       seq: peerSeq,
-      updatedAt: peer.lastSeen || now,
+      updatedAt: peerStateAt,
       lastSeen: peer.lastSeen || now
     })
     for (const [from, to, direction] of [
@@ -3089,7 +3553,7 @@ function syncLocalTopologyIntoLsdb(reason = 'local_state') {
         routable: peerEnabled,
         authority: 'desktop_owner',
         seq: peerSeq,
-        updatedAt: peer.lastSeen || now,
+        updatedAt: peerStateAt,
         description: '桌面节点之间互相同步拓扑控制面和本机 TOTP 种子'
       })
     }
@@ -3120,6 +3584,11 @@ function buildTopologyDelta(reason = 'full', options = {}) {
   const seq = options.seq || nextLsdbSequence()
   const ttl = Number.isFinite(options.ttl) ? options.ttl : TOPOLOGY_DELTA_TTL
   const now = Date.now()
+  const mergeFromNetworkIds = uniqueNetworkIds([
+    ...normalizeNetworkMergeIds(options.mergeFromNetworkIds || []),
+    ...Array.from(pendingNetworkMergeFromIds)
+  ]).filter(id => id !== ensureTrustedNetworkId())
+  if (options.consumePendingMerge !== false) pendingNetworkMergeFromIds.clear()
   return {
     type: 'topology_delta',
     version: ROUTING_PROTOCOL_VERSION,
@@ -3132,6 +3601,11 @@ function buildTopologyDelta(reason = 'full', options = {}) {
     sourceDeviceType: options.sourceDeviceType || identity.type,
     originDeviceId: options.originDeviceId || identity.id,
     networkId: options.networkId || ensureTrustedNetworkId(),
+    ...(mergeFromNetworkIds.length > 0 ? {
+      networkMerge: true,
+      mergeFromNetworkIds,
+      mergedAt: now
+    } : {}),
     seq,
     ttl,
     updatedAt: now,
@@ -3168,19 +3642,33 @@ function applyTopologyDeltaPayload(rawPayload, options = {}) {
 
   const sourceId = String(normalizedDelta.sourceDeviceId || normalizedDelta.originDeviceId || '').trim()
   const deltaNetworkId = String(normalizedDelta.networkId || '').trim()
-  if (deltaNetworkId && deltaNetworkId !== ensureTrustedNetworkId()) return false
   if (sourceId && sourceId !== identity.id && !isKnownTrustedNode(sourceId)) return false
+  const currentNetworkId = ensureTrustedNetworkId()
+  const mergeFromNetworkIds = normalizeNetworkMergeIds(normalizedDelta.mergeFromNetworkIds || [])
+  let networkMerged = false
+  if (deltaNetworkId && deltaNetworkId !== currentNetworkId) {
+    const canMerge = normalizedDelta.networkMerge === true && mergeFromNetworkIds.includes(currentNetworkId)
+    if (!canMerge) return false
+    mergeTrustedNetworkId(deltaNetworkId, mergeFromNetworkIds)
+    normalizedDelta = rewriteTopologyDeltaNetwork(normalizedDelta, deltaNetworkId, mergeFromNetworkIds)
+    networkMerged = true
+  } else if (deltaNetworkId) {
+    if (normalizedDelta.networkMerge === true && mergeFromNetworkIds.length > 0) {
+      mergeTrustedNetworkId(deltaNetworkId, mergeFromNetworkIds)
+      networkMerged = true
+    }
+    normalizedDelta = rewriteTopologyDeltaNetwork(normalizedDelta, deltaNetworkId, mergeFromNetworkIds)
+  }
   const seq = Number(normalizedDelta.seq || 0)
   let acceptedNewSeq = false
   if (sourceId && sourceId !== identity.id && seq > 0) {
     const lastSeq = topologyLsdb.seenSeq.get(sourceId) || 0
     if (seq <= lastSeq) return false
     topologyLsdb.seenSeq.set(sourceId, seq)
-    rememberTopologyDelta(normalizedDelta)
     acceptedNewSeq = true
   }
 
-  let changed = false
+  let changed = networkMerged
   const nodes = Array.isArray(normalizedDelta.nodes) ? normalizedDelta.nodes : []
   const links = Array.isArray(normalizedDelta.links) ? normalizedDelta.links : []
   topologyBroadcastSuppressionDepth += 1
@@ -3190,7 +3678,8 @@ function applyTopologyDeltaPayload(rawPayload, options = {}) {
       if (!node || node.id === identity.id) continue
       const nodeChanged = upsertTopologyLsdbNode(node)
       changed = nodeChanged || changed
-      if (nodeChanged && node.routable && node.pairingKey && node.host) {
+      const isStoredTrustedNode = authorizedPhones.has(node.id) || pairedDesktopPeers.has(node.id)
+      if ((nodeChanged || !isStoredTrustedNode) && node.routable && node.pairingKey && node.host) {
         if (String(node.type || '').includes('PHONE')) {
           upsertAuthorizedPhone({
             phoneId: node.id,
@@ -3198,7 +3687,7 @@ function applyTopologyDeltaPayload(rawPayload, options = {}) {
             clientIP: node.host,
             deviceType: node.type,
             pairingKey: node.pairingKey,
-            relayPort: node.port || 19529,
+            relayPort: node.relayPort || node.port || JOIN_PORT,
             relayHost: node.host,
             tsHost: node.tsHost,
             networkId: node.networkId || ensureTrustedNetworkId(),
@@ -3209,13 +3698,14 @@ function applyTopologyDeltaPayload(rawPayload, options = {}) {
             capabilities: node.capabilities || {},
             contentPolicy: node.contentPolicy
           })
+          changed = true
         } else if (String(node.type || '').includes('DESKTOP')) {
           upsertPairedDesktopPeer({
             id: node.id,
             name: node.name,
             deviceType: node.type,
             host: node.host,
-            port: node.port || WS_PORT,
+            port: node.wsPort || node.port || WS_PORT,
             pairingKey: node.pairingKey,
             tsHost: node.tsHost,
             networkId: node.networkId || ensureTrustedNetworkId(),
@@ -3226,6 +3716,7 @@ function applyTopologyDeltaPayload(rawPayload, options = {}) {
             capabilities: node.capabilities || {},
             contentPolicy: node.contentPolicy
           })
+          changed = true
         }
       }
     }
@@ -3237,6 +3728,9 @@ function applyTopologyDeltaPayload(rawPayload, options = {}) {
   }
 
   if (changed || acceptedNewSeq) {
+    if (changed && acceptedNewSeq) {
+      rememberTopologyDelta(normalizedDelta)
+    }
     savePairingKey()
   }
 
@@ -3244,7 +3738,12 @@ function applyTopologyDeltaPayload(rawPayload, options = {}) {
     if (mainWindow) {
       mainWindow.webContents.send('topology-changed')
     }
-    if (options.flood !== false && (normalizedDelta.ttl || 0) > 0) {
+    try {
+      connectAllDesktopPeers()
+    } catch (error) {
+      console.warn('Failed to refresh desktop peer connections after topology update:', error.message)
+    }
+    if (options.flood !== false && (normalizedDelta.ttl || 0) > 0 && !shouldThrottleTopologyGossipFlood()) {
       const nextTtl = Math.max(0, Number(normalizedDelta.ttl || 0) - 1)
       broadcastTopologyToAllPeers('gossip', {
         baseDelta: {
@@ -3286,12 +3785,18 @@ function buildPhoneRoutingTable(forPhoneId = '', topology = null) {
     })
     .map(node => {
       const route = routeByDestination.get(node.id)
+      const nodeType = String(node.type || node.deviceType || 'UNKNOWN_DEVICE')
+      const isPhoneNode = nodeType.includes('PHONE')
       return {
       id: node.id,
       name: node.name,
-      type: node.type || node.deviceType || 'UNKNOWN_DEVICE',
+      type: nodeType,
       host: normalizeNetworkHost(node.host || node.lastIP),
-      port: Number(node.port || node.relayPort) || (String(node.type || '').includes('PHONE') ? 19529 : WS_PORT),
+      port: isPhoneNode
+        ? (Number(node.relayPort || node.port) || JOIN_PORT)
+        : normalizeTopologyPort(nodeType, node.wsPort || node.port || WS_PORT),
+      wsPort: isPhoneNode ? undefined : normalizeTopologyPort(nodeType, node.wsPort || node.port || WS_PORT),
+      relayPort: normalizeTopologyRelayPort(nodeType, node),
       pairingKey: node.pairingKey,
       tsHost: node.tsHost || '',
       altHosts: node.altHosts || [],
@@ -3360,6 +3865,15 @@ function sendTopologyToPhone(phoneId, ws, sessionKey, topology = null) {
 }
 
 let topologyBroadcastTimer = null
+let lastTopologyGossipFloodAt = 0
+const TOPOLOGY_GOSSIP_MIN_INTERVAL_MS = 5_000
+
+function shouldThrottleTopologyGossipFlood() {
+  const now = Date.now()
+  if (now - lastTopologyGossipFloodAt < TOPOLOGY_GOSSIP_MIN_INTERVAL_MS) return true
+  lastTopologyGossipFloodAt = now
+  return false
+}
 
 // SPF 节流（FRR `timers throttle spf` 的简化版）：设备上线/下线风暴期间
 // 拓扑连环变化，合并 250ms 内的触发为一次「全量计算 + 广播」。
@@ -3612,7 +4126,9 @@ async function sendTopologyDeltaRelayToPhone(phone, delta) {
 }
 
 function broadcastTopologyToAllPeers(reason = 'broadcast', options = {}) {
-  const baseDelta = options.baseDelta || buildTopologyDelta(reason)
+  const baseDelta = options.baseDelta || buildTopologyDelta(reason, {
+    mergeFromNetworkIds: options.mergeFromNetworkIds || []
+  })
   const excludeNodeId = String(options.excludeNodeId || '').trim()
   const identity = getDesktopIdentity()
   const preserveSource = options.preserveSource === true
@@ -3692,18 +4208,63 @@ function setPhoneEnabled(phoneId, enabled) {
 }
 
 function setPhoneContentPolicy(phoneId, updates = {}) {
-  const phone = authorizedPhones.get(phoneId)
-  if (!phone) return getAuthorizedPhones()
-  if (phone.revoked) return getAuthorizedPhones()
-  phone.contentPolicy = normalizePushContentPolicy({
-    ...(phone.contentPolicy || {}),
-    ...updates
-  })
-  authorizedPhones.set(phoneId, phone)
-  savePairingKey()
-  notifyPhonesChanged()
-  scheduleTopologyBroadcast()
-  return getAuthorizedPhones()
+  const result = setNodeContentPolicy(phoneId, updates)
+  return result.phones
+}
+
+function setNodeContentPolicy(nodeId, updates = {}) {
+  const id = String(nodeId || '').trim()
+  if (!id) {
+    return { phones: getAuthorizedPhones(), fileTargets: getFileTransferTargets() }
+  }
+  const nextUpdates = updates && typeof updates === 'object' ? updates : {}
+  let changed = false
+  const phone = authorizedPhones.get(id)
+  if (phone && !phone.revoked) {
+    phone.contentPolicy = normalizePushContentPolicy({
+      ...(phone.contentPolicy || phone || {}),
+      ...nextUpdates
+    })
+    authorizedPhones.set(id, phone)
+    changed = true
+  }
+  const peer = pairedDesktopPeers.get(id)
+  if (peer && peer.enabled !== false) {
+    peer.contentPolicy = normalizePushContentPolicy({
+      ...(peer.contentPolicy || peer || {}),
+      ...nextUpdates
+    })
+    pairedDesktopPeers.set(id, peer)
+    changed = true
+  }
+  const lsdbNode = topologyLsdb.nodes.get(id)
+  if (lsdbNode) {
+    const policy = normalizePushContentPolicy({
+      ...(lsdbNode.contentPolicy || lsdbNode || {}),
+      ...nextUpdates
+    })
+    topologyLsdb.nodes.set(id, {
+      ...lsdbNode,
+      contentPolicy: policy,
+      allowClipboardFile: policy.allowClipboardFile,
+      allowFileTransfer: policy.allowFileTransfer,
+      maxFileSizeMb: policy.maxFileSizeMb,
+      autoAcceptFiles: policy.autoAcceptFiles,
+      updatedAt: Date.now(),
+      seq: nextLsdbSequence()
+    })
+    changed = true
+  }
+  if (changed) {
+    savePairingKey()
+    notifyPhonesChanged()
+    notifyDesktopPeersChanged()
+    if (mainWindow) {
+      mainWindow.webContents.send('topology-changed')
+    }
+    scheduleTopologyBroadcast()
+  }
+  return { phones: getAuthorizedPhones(), fileTargets: getFileTransferTargets() }
 }
 
 function revokePhone(phoneId) {
@@ -4183,17 +4744,41 @@ function buildTotpSyncPayload(seed, action = 'add') {
 }
 
 /** 鉴权成功时，把本机来源（desktop-local）的全部 TOTP 种子一次性下发给该手机。 */
+function getTotpSyncCutoff(node) {
+  return Number(node?.lastTotpSeedSyncAt || 0) || 0
+}
+
+function markPhoneTotpSeedSynced(phoneId, timestamp = Date.now()) {
+  const phone = authorizedPhones.get(phoneId)
+  if (!phone) return
+  phone.lastTotpSeedSyncAt = Math.max(Number(phone.lastTotpSeedSyncAt || 0) || 0, timestamp)
+  authorizedPhones.set(phoneId, phone)
+  savePairingKey()
+}
+
+function markDesktopPeerTotpSeedSynced(peerId, timestamp = Date.now()) {
+  const peer = pairedDesktopPeers.get(peerId)
+  if (!peer) return
+  peer.lastTotpSeedSyncAt = Math.max(Number(peer.lastTotpSeedSyncAt || 0) || 0, timestamp)
+  pairedDesktopPeers.set(peerId, peer)
+  savePairingKey()
+}
+
 function sendLocalTotpSeedsToPhone(ws, sessionKey, phoneId) {
   if (!ws || !sessionKey) return
   const phone = authorizedPhones.get(phoneId)
   if (!canPushContentToNode(phone, 'totp')) return
+  const cutoff = getTotpSyncCutoff(phone)
   const localSeeds = Array.from(totpSeeds.values())
     .filter(seed => seed.phoneId === LOCAL_TOTP_SOURCE_ID && seed.secret)
+    .filter(seed => (Number(seed.updatedAt || seed.createdAt || 0) || 0) > cutoff)
+  let sent = 0
   for (const seed of localSeeds) {
     try {
       const payload = buildTotpSyncPayload(seed, 'add')
       const encrypted = encryptMessage(payload, sessionKey)
       ws.send(JSON.stringify({ type: 'totp_sync', payload: encrypted }))
+      sent += 1
     } catch (e) {
       console.error('下发 TOTP 种子失败:', e)
     }
@@ -4201,25 +4786,31 @@ function sendLocalTotpSeedsToPhone(ws, sessionKey, phoneId) {
   if (localSeeds.length > 0) {
     console.log(`已向手机 ${phoneId} 下发 ${localSeeds.length} 个本机 TOTP 种子`)
   }
-  sendTotpDeleteTombstonesToPhone(ws, sessionKey, phoneId)
+  const tombstoneCount = sendTotpDeleteTombstonesToPhone(ws, sessionKey, phoneId, cutoff)
+  if (sent > 0 || tombstoneCount > 0) {
+    markPhoneTotpSeedSynced(phoneId)
+    console.log(`Sent ${sent + tombstoneCount} TOTP changes to phone ${phoneId}`)
+  }
 }
 
-function sendTotpDeleteTombstonesToPhone(ws, sessionKey, phoneId) {
-  if (!ws || !sessionKey) return
+function sendTotpDeleteTombstonesToPhone(ws, sessionKey, phoneId, cutoff = 0) {
+  if (!ws || !sessionKey) return 0
   pruneTotpDeleteTombstones()
-  for (const tombstone of totpDeleteTombstones) {
+  const pendingTombstones = totpDeleteTombstones
+    .filter(tombstone => (Number(tombstone.deletedAt || tombstone.updatedAt || 0) || 0) > cutoff)
+  let sent = 0
+  for (const tombstone of pendingTombstones) {
     try {
       const payload = buildTotpSyncPayload(tombstone, 'delete')
       const encrypted = encryptMessage(payload, sessionKey)
       if (!encrypted) continue
       ws.send(JSON.stringify({ type: 'totp_sync', payload: encrypted }))
+      sent += 1
     } catch (e) {
       console.error('下发 TOTP 删除状态失败:', e)
     }
   }
-  if (totpDeleteTombstones.length > 0) {
-    console.log(`已向手机 ${phoneId} 补发 ${totpDeleteTombstones.length} 条 TOTP 删除状态`)
-  }
+  return sent
 }
 
 /** 向所有在线手机广播一条 TOTP 同步消息（用于本机即时新增/删除）。 */
@@ -4229,6 +4820,7 @@ function broadcastTotpSyncToPhones(seed, action = 'add') {
   for (const [phoneId, connections] of activePhoneConnections.entries()) {
     const phone = authorizedPhones.get(phoneId)
     if (!canPushContentToNode(phone, 'totp')) continue
+    let delivered = false
     for (const ws of connections) {
       // 每条连接有各自的会话密钥（基于 nonce 派生），必须按 ws 取
       const sessionKey = phoneSessionKeys.get(ws)
@@ -4237,10 +4829,12 @@ function broadcastTotpSyncToPhones(seed, action = 'add') {
       if (!encrypted) continue
       try {
         ws.send(JSON.stringify({ type: 'totp_sync', payload: encrypted }))
+        delivered = true
       } catch (e) {
         console.error('广播 TOTP 同步失败:', e)
       }
     }
+    if (delivered) markPhoneTotpSeedSynced(phoneId, Number(seed.updatedAt || Date.now()) || Date.now())
   }
 }
 
@@ -4257,6 +4851,7 @@ function broadcastTotpSyncToDesktopPeers(seed, action = 'add') {
     if (!encrypted) continue
     try {
       ws.send(JSON.stringify({ type: 'totp_sync', payload: encrypted }))
+      markDesktopPeerTotpSeedSynced(peerId, Number(seed.updatedAt || Date.now()) || Date.now())
     } catch (e) {
       console.error('广播桌面 TOTP 同步失败:', e)
     }
@@ -4277,6 +4872,8 @@ let clipboardWatchTimer = null
 let lastClipboardText = ''
 let lastClipboardImageHash = ''
 let lastClipboardFileSignature = ''
+let suppressClipboardImagePollUntil = 0
+let incomingClipboardFileSession = { key: '', paths: new Set() }
 
 // 剪贴板 LWW（last-writer-wins）寄存器状态：网络中剪贴板是一个单值寄存器，
 // 每次复制产生新版本 (ts, origin)。节点只应用比已知版本更新的内容——
@@ -4323,6 +4920,29 @@ function encodeClipboardImageForSync(image) {
     : null
 }
 
+function readClipboardImageSyncHash() {
+  try {
+    const image = clipboard.readImage()
+    if (!image || image.isEmpty()) return ''
+    const encoded = encodeClipboardImageForSync(image)
+    return encoded ? hashBuffer(encoded.buffer).slice(0, 24) : ''
+  } catch (_) {
+    return ''
+  }
+}
+
+function refreshClipboardImageSnapshotAfterWrite(fallbackHash = '') {
+  if (fallbackHash) lastClipboardImageHash = fallbackHash
+  suppressClipboardImagePollUntil = Date.now() + 1500
+  ;[80, 350, 1000].forEach(delayMs => {
+    const timer = setTimeout(() => {
+      const currentHash = readClipboardImageSyncHash()
+      if (currentHash) lastClipboardImageHash = currentHash
+    }, delayMs)
+    timer.unref?.()
+  })
+}
+
 function isNewerClipVersion(ts, origin) {
   if (!Number.isFinite(ts) || ts <= 0) return false
   if (ts !== clipboardSyncState.ts) return ts > clipboardSyncState.ts
@@ -4358,9 +4978,7 @@ function startClipboardSyncWatcher() {
   if (clipboardWatchTimer) return
   try {
     lastClipboardText = clipboard.readText() || ''
-    const image = clipboard.readImage()
-    const encodedImage = encodeClipboardImageForSync(image)
-    lastClipboardImageHash = encodedImage ? hashBuffer(encodedImage.buffer).slice(0, 24) : ''
+    lastClipboardImageHash = readClipboardImageSyncHash()
     lastClipboardFileSignature = getClipboardFileSignature(readClipboardFilePaths())
   } catch (_) {
     lastClipboardText = ''
@@ -4396,6 +5014,7 @@ function pollClipboardForSync() {
         // 本机新复制：产生新版本并广播。小文本 inline 走消息通道；
         // 超长文本保持"剪贴板文本"业务语义，但底层转 manifest + 分片拉取。
         const clipTs = Date.now()
+        clearIncomingClipboardFiles()
         rememberClipVersion(clipTs, getDesktopIdentity().id, text)
         if (clipboardTextByteLength(text) <= CLIPBOARD_MAX_LENGTH) {
           broadcastClipboardToNodes(text)
@@ -4433,9 +5052,14 @@ function pollClipboardImageForSync() {
   const imageBuffer = encodedImage.buffer
   const hash = hashBuffer(imageBuffer)
   const shortHash = hash.slice(0, 24)
+  if (Date.now() < suppressClipboardImagePollUntil) {
+    lastClipboardImageHash = shortHash
+    return
+  }
   if (shortHash === lastClipboardImageHash) return
   lastClipboardImageHash = shortHash
   if (shortHash === clipboardImageSyncState.hash) return
+  clearIncomingClipboardFiles()
   if (imageBuffer.length > CLIPBOARD_INLINE_IMAGE_MAX_BYTES) {
     // 大图回退：不整包 inline 进 relay 消息，转 manifest + 分片拉取
     //（与文件传输同通道），接收端拉完写剪贴板。版本先行登记，
@@ -4615,6 +5239,55 @@ function getClipboardFileSignature(filePaths) {
   return parts.join('\n')
 }
 
+function incomingClipboardFileTempDir() {
+  return path.join(app.getPath('userData'), 'clipboard-files-in')
+}
+
+function clearIncomingClipboardFiles() {
+  const dir = incomingClipboardFileTempDir()
+  try {
+    fs.rmSync(dir, { recursive: true, force: true })
+  } catch (_) {}
+  incomingClipboardFileSession = { key: '', paths: new Set() }
+}
+
+function ensureIncomingClipboardFileSession(key) {
+  const normalizedKey = String(key || '').trim() || `clipboard-files-${Date.now()}`
+  if (incomingClipboardFileSession.key !== normalizedKey) {
+    clearIncomingClipboardFiles()
+    incomingClipboardFileSession = { key: normalizedKey, paths: new Set() }
+  }
+  try {
+    fs.mkdirSync(incomingClipboardFileTempDir(), { recursive: true })
+  } catch (_) {}
+  return incomingClipboardFileSession
+}
+
+function writeFilePathsToClipboard(filePaths) {
+  const paths = Array.from(new Set(
+    (Array.isArray(filePaths) ? filePaths : [])
+      .map(item => path.resolve(String(item || '')))
+      .filter(item => {
+        try {
+          return fs.statSync(item).isFile()
+        } catch (_) {
+          return false
+        }
+      })
+  ))
+  if (paths.length === 0) return false
+  if (process.platform !== 'win32') return false
+  try {
+    const utf16 = Buffer.from(`${paths.join('\u0000')}\u0000\u0000`, 'utf16le')
+    clipboard.writeBuffer('FileNameW', utf16)
+    lastClipboardFileSignature = getClipboardFileSignature(paths)
+    return true
+  } catch (error) {
+    console.warn('Failed to write file paths to clipboard:', error.message)
+    return false
+  }
+}
+
 async function pollClipboardFilesForSync() {
   const filePaths = readClipboardFilePaths()
   const signature = getClipboardFileSignature(filePaths)
@@ -4623,6 +5296,7 @@ async function pollClipboardFilesForSync() {
     return
   }
   if (signature === lastClipboardFileSignature) return
+  clearIncomingClipboardFiles()
   lastClipboardFileSignature = signature
 
   const targets = getDefaultClipboardFileTargetIds()
@@ -4633,6 +5307,7 @@ async function pollClipboardFilesForSync() {
 
   const transfer = initFileTransfer()
   const maxBytes = Math.max(1, Number(desktopMessageSettings.maxFileSizeMb || 50)) * 1024 * 1024
+  const eligible = []
   for (const filePath of filePaths) {
     let stat = null
     try {
@@ -4646,6 +5321,8 @@ async function pollClipboardFilesForSync() {
       console.warn(`Clipboard file sync skipped ${filePath}: ${formatBytes(stat.size)} exceeds ${formatBytes(maxBytes)}`)
       continue
     }
+    eligible.push({ filePath, size: stat.size })
+    continue
     transfer.offerFile(filePath, targets, {
       type: CODE_TYPES.CLIPBOARD_FILE,
       source: '剪贴板文件',
@@ -4653,6 +5330,29 @@ async function pollClipboardFilesForSync() {
       payloadExtra: buildLocalSourceAddressPayload()
     }).catch(error => {
       console.error(`Clipboard file sync failed for ${filePath}:`, error.message)
+    })
+  }
+  if (eligible.length === 0) return
+
+  const identity = getDesktopIdentity()
+  const clipTs = Date.now()
+  const signatureHash = hashClipText(signature)
+  const clipboardBatchId = `clip-files-${identity.id}-${clipTs}-${signatureHash}`
+  const clipboardFileTotalBytes = eligible.reduce((sum, item) => sum + item.size, 0)
+  for (const item of eligible) {
+    transfer.offerFile(item.filePath, targets, {
+      type: CODE_TYPES.CLIPBOARD_FILE,
+      source: '剪贴板文件',
+      rawPrefix: '剪贴板文件',
+      payloadExtra: {
+        ...buildLocalSourceAddressPayload(),
+        clipVersion: { ts: clipTs, origin: identity.id, hash: signatureHash, kind: 'file' },
+        clipboardBatchId,
+        clipboardFileCount: eligible.length,
+        clipboardFileTotalBytes
+      }
+    }).catch(error => {
+      console.error(`Clipboard file sync failed for ${item.filePath}:`, error.message)
     })
   }
 }
@@ -4880,6 +5580,7 @@ function applyRemoteClipboard(codeInfo, codeData) {
   rememberClipVersion(ts, origin, text)
   // 先同步本地快照再写剪贴板，防 900ms 轮询把这次远端写入当成本机新复制
   lastClipboardText = text
+  clearIncomingClipboardFiles()
   clipboard.writeText(text)
   showCodeBubble(codeInfo)
   showNotification('📋 剪贴板同步', `${text.slice(0, 80)}\n来源设备: ${codeInfo.sourceDeviceName}`)
@@ -4906,8 +5607,9 @@ function applyRemoteClipboardImage(codeInfo, codeData) {
   const image = nativeImage.createFromBuffer(buffer)
   if (image.isEmpty()) return false
   rememberClipImageVersion(ts, origin, shortHash)
-  lastClipboardImageHash = shortHash
+  clearIncomingClipboardFiles()
   clipboard.writeImage(image)
+  refreshClipboardImageSnapshotAfterWrite(shortHash)
   showCodeBubble(codeInfo)
   showNotification('🖼️ 剪贴板图片同步', `${manifest.name || 'clipboard.png'}\n来源设备: ${codeInfo.sourceDeviceName}`)
   return true
@@ -5095,7 +5797,10 @@ function buildTotpSeedPushPayload(seed, targetPeer) {
 function sendLocalTotpSeedsToDesktopPeer(ws, sessionKey, peer) {
   if (!ws || !sessionKey || !peer || ws.readyState !== WebSocket.OPEN) return
   if (!canPushContentToNode(peer, 'totp')) return
+  const cutoff = getTotpSyncCutoff(peer)
   const localSeeds = getLocalTotpSeeds()
+    .filter(seed => (Number(seed.updatedAt || seed.createdAt || 0) || 0) > cutoff)
+  let sent = 0
   for (const seed of localSeeds) {
     const payload = buildTotpSeedPushPayload(seed, peer)
     const encrypted = encryptMessage(payload, sessionKey)
@@ -5105,19 +5810,28 @@ function sendLocalTotpSeedsToDesktopPeer(ws, sessionKey, peer) {
       msgId: `desktop-seed-${seed.id}-${Date.now()}`,
       payload: encrypted
     }))
+    sent += 1
   }
-  sendTotpDeleteTombstonesToDesktopPeer(ws, sessionKey, peer)
+  const tombstoneCount = sendTotpDeleteTombstonesToDesktopPeer(ws, sessionKey, peer, cutoff)
+  if (sent > 0 || tombstoneCount > 0) {
+    markDesktopPeerTotpSeedSynced(peer.id)
+  }
 }
 
-function sendTotpDeleteTombstonesToDesktopPeer(ws, sessionKey, peer) {
-  if (!ws || !sessionKey || !peer || ws.readyState !== WebSocket.OPEN) return
+function sendTotpDeleteTombstonesToDesktopPeer(ws, sessionKey, peer, cutoff = 0) {
+  if (!ws || !sessionKey || !peer || ws.readyState !== WebSocket.OPEN) return 0
   pruneTotpDeleteTombstones()
-  for (const tombstone of totpDeleteTombstones) {
+  const pendingTombstones = totpDeleteTombstones
+    .filter(tombstone => (Number(tombstone.deletedAt || tombstone.updatedAt || 0) || 0) > cutoff)
+  let sent = 0
+  for (const tombstone of pendingTombstones) {
     const payload = buildTotpSyncPayload(tombstone, 'delete')
     const encrypted = encryptMessage(payload, sessionKey)
     if (!encrypted) continue
     ws.send(JSON.stringify({ type: 'totp_sync', payload: encrypted }))
+    sent += 1
   }
+  return sent
 }
 
 function handleDesktopPeerTotpSync(peer, encryptedPayload, sessionKey) {
@@ -5212,14 +5926,14 @@ function connectDesktopPeer(peer, options = {}) {
         ws.__codebridgeSessionKey = sessionKey
         desktopPeerHostAttempts.delete(peer.id)
         peer.connected = true
-        peer.lastSeen = Date.now()
+        peer.connectionUpdatedAt = Date.now()
+        peer.lastSeen = peer.connectionUpdatedAt
         pairedDesktopPeers.set(peer.id, peer)
         savePairingKey()
-        notifyDesktopPeersChanged()
+        notifyDesktopPeersChanged({ topologyChanged: false })
         sendLocalTotpSeedsToDesktopPeer(ws, sessionKey, peer)
         // 对端（重新）连上时补推本机当前剪贴板状态（LWW 防旧盖新）
         pushClipboardStateToDesktopPeer(ws, sessionKey, peer.id)
-        sendEncryptedControlMessage(ws, sessionKey, 'topology_delta', buildTopologyDelta('desktop_peer_auth'))
         requestTopologySnapshot(ws, sessionKey)
         return
       }
@@ -5306,8 +6020,9 @@ function connectDesktopPeer(peer, options = {}) {
     const latest = pairedDesktopPeers.get(peer.id)
     if (latest) {
       latest.connected = false
+      latest.connectionUpdatedAt = Date.now()
       pairedDesktopPeers.set(peer.id, latest)
-      notifyDesktopPeersChanged()
+      notifyDesktopPeersChanged({ topologyChanged: false })
     }
   })
 
@@ -6049,7 +6764,6 @@ function startWebSocketServer() {
             }))
             if (requestTopologyOnAuth) {
               sendTopologyToPhone(phone.id, ws, connectionSessionKey)
-              sendEncryptedControlMessage(ws, connectionSessionKey, 'topology_delta', buildTopologyDelta('auth_ok'))
               requestTopologySnapshot(ws, connectionSessionKey)
             }
             // 鉴权成功的一刻顺带把本机 TOTP 种子下发给手机（一次性同步，零额外耗电）
@@ -6329,59 +7043,65 @@ function resolveFileSource(originDeviceId, manifest = {}) {
   )
   const phone = authorizedPhones.get(id)
   if (phone && phone.pairingKey) {
+    const merged = mergeTrustedNodeRecord(id, phone)
     const hosts = collectNetworkHosts(
-      phone.lastIP,
-      phone.host,
-      phone.relayHost,
-      phone.tsHost,
-      phone.altHosts,
+      merged.lastIP,
+      merged.host,
+      merged.relayHost,
+      merged.tsHost,
+      merged.altHosts,
       manifestHosts
     )
     return {
       id,
-      name: phone.name || 'Android Phone',
+      name: merged.name || 'Android Phone',
       host: hosts[0] || '',
       hosts,
-      port: Number(phone.relayPort || phone.port) || JOIN_PORT,
-      pairingKey: phone.pairingKey
+      port: Number(merged.relayPort || merged.port) || JOIN_PORT,
+      pairingKey: merged.pairingKey,
+      type: merged.deviceType || merged.type || 'ANDROID_PHONE'
     }
   }
   const peer = pairedDesktopPeers.get(id)
   if (peer && peer.pairingKey) {
+    const merged = mergeTrustedNodeRecord(id, peer)
     const hosts = collectNetworkHosts(
-      peer.lastIP,
-      peer.host,
-      peer.relayHost,
-      peer.tsHost,
-      peer.altHosts,
+      merged.lastIP,
+      merged.host,
+      merged.relayHost,
+      merged.tsHost,
+      merged.altHosts,
       manifestHosts
     )
     return {
       id,
-      name: peer.name || 'Desktop PC',
+      name: merged.name || 'Desktop PC',
       host: hosts[0] || '',
       hosts,
-      port: Number(peer.relayPort || JOIN_PORT) || JOIN_PORT,
-      pairingKey: peer.pairingKey
+      port: Number(merged.relayPort || merged.port) || JOIN_PORT,
+      pairingKey: merged.pairingKey,
+      type: merged.deviceType || merged.type || 'WINDOWS_DESKTOP'
     }
   }
   const lsdbNode = topologyLsdb.nodes.get(id)
   if (lsdbNode && lsdbNode.pairingKey && lsdbNode.enabled !== false && lsdbNode.revoked !== true) {
+    const merged = mergeTrustedNodeRecord(id, lsdbNode)
     const hosts = collectNetworkHosts(
-      lsdbNode.lastIP,
-      lsdbNode.host,
-      lsdbNode.relayHost,
-      lsdbNode.tsHost,
-      lsdbNode.altHosts,
+      merged.lastIP,
+      merged.host,
+      merged.relayHost,
+      merged.tsHost,
+      merged.altHosts,
       manifestHosts
     )
     return {
       id,
-      name: lsdbNode.name || 'Device Node',
+      name: merged.name || 'Device Node',
       host: hosts[0] || '',
       hosts,
-      port: Number(lsdbNode.relayPort || lsdbNode.port) || JOIN_PORT,
-      pairingKey: lsdbNode.pairingKey
+      port: Number(merged.relayPort || merged.port) || JOIN_PORT,
+      pairingKey: merged.pairingKey,
+      type: merged.deviceType || merged.type || 'DEVICE_NODE'
     }
   }
   return null
@@ -6445,12 +7165,7 @@ let fileTransfer = null
 function initFileTransfer() {
   if (fileTransfer) return fileTransfer
   const tmpDir = path.join(app.getPath('userData'), 'file-transfers')
-  let downloadDir
-  try {
-    downloadDir = app.getPath('downloads')
-  } catch (_) {
-    downloadDir = path.join(app.getPath('userData'), 'downloads')
-  }
+  const downloadDir = getFileTransferDownloadDir()
   fileTransfer = createFileTransfer({
     getIdentity: getDesktopIdentity,
     encryptBytes,
@@ -6562,7 +7277,9 @@ function handleVerifyCode(codeData) {
     lastHopDeviceName,
     msgId,
     fileManifest,
-    dataBase64
+    dataBase64,
+    clipVersion,
+    batchId
   } = codeData
   const desktopIdentity = getDesktopIdentity()
   const normalizedTargets = Array.isArray(targetDevices)
@@ -6612,11 +7329,23 @@ function handleVerifyCode(codeData) {
     },
     rawMessage: rawMessage || messageBody || body || '',
     fileManifest: fileManifest || null,
-    dataBase64: dataBase64 || ''
+    dataBase64: dataBase64 || '',
+    clipVersion: clipVersion || null,
+    batchId: batchId || ''
   }
 
-  if (mainWindow) {
-    mainWindow.webContents.send('new-code', codeInfo)
+  let codeInfoEmitted = false
+  const emitCodeInfo = (info = codeInfo) => {
+    if (codeInfoEmitted || !mainWindow) return false
+    codeInfoEmitted = true
+    if (hasRecentClipboardUi(info)) return false
+    rememberRecentClipboardUi(info)
+    mainWindow.webContents.send('new-code', info)
+    return true
+  }
+
+  if (!isClipboardStateType(codeInfo.type)) {
+    emitCodeInfo()
   }
 
   // 三种用户消息都走气泡堆叠展示；系统通知（Windows 通知中心）同时保留。
@@ -6640,9 +7369,10 @@ function handleVerifyCode(codeData) {
   } else if (codeInfo.type === CODE_TYPES.CLIPBOARD || codeInfo.type === CODE_TYPES.CLIPBOARD_TEXT) {
     const textManifest = codeInfo.fileManifest || (codeData && codeData.fileManifest) || {}
     if (textManifest.inline === false && textManifest.fileId) {
+      handleIncomingClipboardTextManifest(codeInfo, codeData, textManifest, emitCodeInfo)
       // 超长文本：业务上仍是剪贴板文本，底层用文件分片拉取，完成后写剪贴板。
-      handleIncomingClipboardTextManifest(codeInfo, codeData, textManifest)
     } else if (applyRemoteClipboard(codeInfo, codeData)) {
+      emitCodeInfo()
       // LWW 应用；状态前进时把同一版本继续 gossip 给本机授权邻居（见剪贴板同步小节）
       gossipClipboardState(codeData)
     }
@@ -6650,8 +7380,11 @@ function handleVerifyCode(codeData) {
     const imageManifest = codeInfo.fileManifest || (codeData && codeData.fileManifest) || {}
     if (imageManifest.inline === false && imageManifest.fileId) {
       // 大图（>inline 上限）：分片拉取后写剪贴板，见 handleIncomingClipboardImageManifest
-      handleIncomingClipboardImageManifest(codeInfo, codeData, imageManifest)
+      if (isIncomingClipboardImageCandidateNew(codeInfo, codeData, imageManifest)) {
+        handleIncomingClipboardImageManifest(codeInfo, codeData, imageManifest, emitCodeInfo)
+      }
     } else if (applyRemoteClipboardImage(codeInfo, codeData)) {
+      emitCodeInfo()
       gossipClipboardImageState(codeData)
     }
   } else if (codeInfo.type === CODE_TYPES.FILE_TRANSFER || codeInfo.type === CODE_TYPES.CLIPBOARD_FILE) {
@@ -6661,7 +7394,7 @@ function handleVerifyCode(codeData) {
   }
 }
 
-function handleIncomingClipboardTextManifest(codeInfo, codeData, manifest) {
+function handleIncomingClipboardTextManifest(codeInfo, codeData, manifest, onApplied = null) {
   const mime = String(manifest.mime || '').toLowerCase()
   if (mime && !mime.startsWith('text/plain') && !mime.startsWith('text/markdown') && mime !== 'application/octet-stream') return
   const maxBytes = Math.max(1, Number(desktopMessageSettings.maxFileSizeMb || 50)) * 1024 * 1024
@@ -6687,8 +7420,10 @@ function handleIncomingClipboardTextManifest(codeInfo, codeData, manifest) {
         if (!isNewerClipVersion(ts, origin)) return
         rememberClipVersion(ts, origin, text)
         lastClipboardText = text
+        clearIncomingClipboardFiles()
         clipboard.writeText(text)
         const info = { ...codeInfo, rawMessage: text }
+        if (typeof onApplied === 'function') onApplied(info)
         showCodeBubble(info)
         showNotification('📋 剪贴板同步', `${text.slice(0, 80)}\n来源设备: ${codeInfo.sourceDeviceName}`)
         offerClipboardTextAsFile(text, ts, actualHash, { origin }).catch(error => {
@@ -6708,7 +7443,16 @@ function handleIncomingClipboardTextManifest(codeInfo, codeData, manifest) {
 // 大图剪贴板（>inline 上限）：manifest + 分片拉取，完成后写本机剪贴板。
 // 与文件传输不同：不弹确认框（已受 syncClipboardImage 接收开关把关）、
 // 不落下载目录、应用后即删。拉取前先做 LWW 预检，避免下载旧版本。
-function handleIncomingClipboardImageManifest(codeInfo, codeData, manifest) {
+function isIncomingClipboardImageCandidateNew(codeInfo, codeData, manifest = {}) {
+  const version = (codeData && codeData.clipVersion) || {}
+  const ts = Number(version.ts) || Number(codeInfo.timestamp) || 0
+  const origin = String(version.origin || codeInfo.originDeviceId || codeInfo.sourceDeviceId || '')
+  const shortHash = String(version.hash || manifest.sha256 || '').slice(0, 24)
+  if (shortHash && shortHash === clipboardImageSyncState.hash) return false
+  return isNewerClipImageVersion(ts, origin)
+}
+
+function handleIncomingClipboardImageManifest(codeInfo, codeData, manifest, onApplied = null) {
   if (!normalizeClipboardImageMime(manifest.mime)) return
   const maxBytes = Math.max(1, Number(desktopMessageSettings.maxFileSizeMb || 50)) * 1024 * 1024
   const size = Number(manifest.size || 0)
@@ -6731,8 +7475,10 @@ function handleIncomingClipboardImageManifest(codeInfo, codeData, manifest) {
           const appliedHash = shortHash || hashBuffer(buffer).slice(0, 24)
           rememberClipImageVersion(ts, origin, appliedHash)
           // 先同步本地快照再写剪贴板，防轮询把这次远端写入当成本机新复制
-          lastClipboardImageHash = appliedHash
+          clearIncomingClipboardFiles()
           clipboard.writeImage(image)
+          refreshClipboardImageSnapshotAfterWrite(appliedHash)
+          if (typeof onApplied === 'function') onApplied(codeInfo)
           showCodeBubble(codeInfo)
           showNotification('🖼️ 剪贴板图片同步', `${manifest.name || 'clipboard.png'}\n来源设备: ${codeInfo.sourceDeviceName}`)
         }
@@ -6759,9 +7505,54 @@ function pruneFileBatchDecisions() {
   }
 }
 
+function incomingClipboardFileKey(codeInfo, codeData, manifest) {
+  const version = (codeData && codeData.clipVersion) || codeInfo.clipVersion || {}
+  const ts = Number(version.ts) || Number(codeInfo.timestamp) || 0
+  const origin = String(version.origin || codeInfo.originDeviceId || codeInfo.sourceDeviceId || '')
+  const hash = String(version.hash || version.signature || '').trim()
+  if (ts > 0 && origin) return [ts, origin, hash].join('|')
+  return String((codeData && codeData.clipboardBatchId) || codeInfo.clipboardBatchId || codeInfo.batchId || manifest.fileId || Date.now())
+}
+
+function handleIncomingClipboardFileManifest(codeInfo, codeData, manifest) {
+  const maxFileSizeMb = Math.max(1, Number(desktopMessageSettings.maxFileSizeMb || 50))
+  const maxBytes = maxFileSizeMb * 1024 * 1024
+  const size = Number(manifest.size || 0)
+  if (size <= 0 || size > maxBytes) return
+  const session = ensureIncomingClipboardFileSession(incomingClipboardFileKey(codeInfo, codeData, manifest))
+  const sessionKey = session.key
+  initFileTransfer().startIncomingPull(manifest, {
+    maxBytes,
+    targetDir: incomingClipboardFileTempDir(),
+    onComplete: ({ path: finalPath, name }) => {
+      if (incomingClipboardFileSession.key !== sessionKey) {
+        try { fs.unlinkSync(finalPath) } catch (_) {}
+        return
+      }
+      session.paths.add(finalPath)
+      const paths = Array.from(session.paths).filter(item => {
+        try {
+          return fs.statSync(item).isFile()
+        } catch (_) {
+          return false
+        }
+      })
+      if (writeFilePathsToClipboard(paths)) {
+        showNotification('剪贴板文件已同步', `${name || path.basename(finalPath)}\n来源设备: ${codeInfo.sourceDeviceName}`)
+      }
+    }
+  }).catch(err => {
+    console.error('Clipboard file pull failed:', err)
+  })
+}
+
 function handleIncomingFileManifest(codeInfo, codeData) {
   const manifest = codeInfo.fileManifest || (codeData && codeData.fileManifest) || null
   if (!manifest || !manifest.fileId || manifest.inline === true) return
+  if (codeInfo.type === CODE_TYPES.CLIPBOARD_FILE) {
+    handleIncomingClipboardFileManifest(codeInfo, codeData, manifest)
+    return
+  }
   // 接收开关（file_transfer 受 receiveFileTransfer 把关；canReceiveContentType 已在
   // 调用前校验过类型接收开关，这里再取大小上限与自动接收策略）
   const maxFileSizeMb = Math.max(1, Number(desktopMessageSettings.maxFileSizeMb || 50))
@@ -6931,12 +7722,23 @@ function payloadTargetIds(codeData) {
   return []
 }
 
+function isInlineClipboardStatePayload(codeData) {
+  const type = String(codeData.contentType || codeData.type || '').trim()
+  if (type !== CODE_TYPES.CLIPBOARD &&
+      type !== CODE_TYPES.CLIPBOARD_TEXT &&
+      type !== CODE_TYPES.CLIPBOARD_IMAGE) {
+    return false
+  }
+  const manifest = codeData.fileManifest || {}
+  return manifest.inline !== false
+}
+
 // 本机是否该本地消费这条消息。
 // 源设备直投（无 lastRelayDeviceId）一律消费，与旧行为完全一致（兼容旧版
 // 配对条目 id 不一致的情况）；中转副本（续传而来）只有本机在目标列表内才消费，
 // 否则只续传不展示——避免「下一跳路由经过的桌面把过路消息当自己的弹出来」。
 function isLocalTargetOfPayload(codeData) {
-  const relayed = !!String(codeData.lastRelayDeviceId || '').trim()
+  const relayed = !!String(codeData.lastRelayDeviceId || codeData.lastHopDeviceId || '').trim()
   if (!relayed) return true
   const ids = payloadTargetIds(codeData)
   if (ids.length === 0) return true
@@ -6946,31 +7748,34 @@ function isLocalTargetOfPayload(codeData) {
 // 在已知节点表里解析续传目标：桌面对端 → 已授权手机 → 拓扑 LSDB（gossip 学到的）
 function resolveForwardTarget(targetId) {
   const peer = pairedDesktopPeers.get(targetId)
-  if (peer) return { kind: 'desktop', node: peer }
+  if (peer) return { kind: 'desktop', node: mergeTrustedNodeRecord(targetId, peer) }
   const phone = authorizedPhones.get(targetId)
   if (phone) {
-    return String(phone.deviceType || '').includes('DESKTOP')
-      ? { kind: 'desktop', node: phone }
-      : { kind: 'phone', node: phone }
+    const node = mergeTrustedNodeRecord(targetId, phone)
+    return String(node.deviceType || node.type || '').includes('DESKTOP')
+      ? { kind: 'desktop', node }
+      : { kind: 'phone', node }
   }
   const lsdbNode = topologyLsdb.nodes.get(targetId)
   if (lsdbNode) {
-    if (String(lsdbNode.type || '').includes('PHONE')) {
+    const node = mergeTrustedNodeRecord(targetId, lsdbNode)
+    if (String(node.type || node.deviceType || '').includes('PHONE')) {
       return {
         kind: 'phone',
         node: {
-          id: lsdbNode.id,
-          name: lsdbNode.name,
-          pairingKey: lsdbNode.pairingKey,
-          lastIP: lsdbNode.host || lsdbNode.lastIP,
-          tsHost: lsdbNode.tsHost || '',
-          relayPort: Number(lsdbNode.port) || 19529,
-          enabled: lsdbNode.enabled !== false,
-          revoked: lsdbNode.revoked === true
+          ...node,
+          id: node.id,
+          name: node.name,
+          pairingKey: node.pairingKey,
+          lastIP: node.host || node.lastIP,
+          tsHost: node.tsHost || '',
+          relayPort: Number(node.relayPort || node.port) || 19529,
+          enabled: node.enabled !== false,
+          revoked: node.revoked === true
         }
       }
     }
-    return { kind: 'desktop', node: lsdbNode }
+    return { kind: 'desktop', node }
   }
   return null
 }
@@ -7145,6 +7950,7 @@ function forwardRelayedMessage(codeData, lastHopDeviceId = '') {
 // 统一分发一条已解密的入站业务消息（手机入站 / 桌面对端两个方向共用）：
 // 本机在目标列表内才本地消费；带 relayTtl 的消息续传给其余目标。
 function dispatchInboundCodeData(codeData, lastHopDeviceId = '') {
+  if (lastHopDeviceId && !codeData.lastHopDeviceId) codeData.lastHopDeviceId = lastHopDeviceId
   if (
     codeData.type === 'topology_delta' ||
     codeData.type === 'node_advertisement' ||
@@ -7161,7 +7967,11 @@ function dispatchInboundCodeData(codeData, lastHopDeviceId = '') {
   } else if (isLocalTarget) {
     handleVerifyCode(codeData)
   }
-  forwardRelayedMessage(codeData, lastHopDeviceId)
+  // Inline clipboard states already gossip after a successful local apply. Running the
+  // generic relay path as well creates duplicate routes in a mesh and can loop images.
+  if (!(isLocalTarget && isInlineClipboardStatePayload(codeData))) {
+    forwardRelayedMessage(codeData, lastHopDeviceId)
+  }
 }
 
 function normalizeExternalUrl(url) {
@@ -7263,6 +8073,7 @@ function getFileTransferTargets() {
     const id = String(raw.id || raw.phoneId || '').trim()
     if (!id || id === identity.id || raw.enabled === false || raw.revoked === true) return
 
+    const mergedRecord = mergeTrustedNodeRecord(id, raw)
     const previous = nodes.get(id) || {}
     const mergedHosts = collectNetworkHosts(
       previous.lastIP,
@@ -7270,47 +8081,47 @@ function getFileTransferTargets() {
       previous.relayHost,
       previous.tsHost,
       previous.altHosts,
-      raw.lastIP,
-      raw.host,
-      raw.relayHost,
-      raw.tsHost,
-      raw.altHosts
+      mergedRecord.lastIP,
+      mergedRecord.host,
+      mergedRecord.relayHost,
+      mergedRecord.tsHost,
+      mergedRecord.altHosts
     )
-    const type = raw.deviceType || raw.type || previous.deviceType || previous.type ||
+    const type = mergedRecord.deviceType || mergedRecord.type || previous.deviceType || previous.type ||
       (fallbackKind === 'phone' ? 'ANDROID_PHONE' : fallbackKind === 'desktop' ? 'WINDOWS_DESKTOP' : 'DEVICE_NODE')
     const lastSeen = Math.max(
       Number(previous.lastSeen || previous.updatedAt || 0) || 0,
-      Number(raw.lastSeen || raw.updatedAt || 0) || 0
+      Number(mergedRecord.lastSeen || mergedRecord.updatedAt || 0) || 0
     )
-    const connected = previous.connected === true || raw.connected === true || hasActiveWsForNode(id)
+    const connected = previous.connected === true || mergedRecord.connected === true || hasActiveWsForNode(id)
     const previousStatus = String(previous.status || '').toLowerCase()
-    const rawStatus = String(raw.status || '').toLowerCase()
-    const contentPolicy = normalizePushContentPolicy({
-      ...(previous.contentPolicy || previous || {}),
-      ...(raw.contentPolicy || raw || {})
+    const rawStatus = String(mergedRecord.status || '').toLowerCase()
+    const contentPolicy = mergeContentPolicyForDuplicateNode(id, {
+      ...(previous.contentPolicy ? { contentPolicy: previous.contentPolicy } : previous),
+      ...mergedRecord
     })
 
     nodes.set(id, {
       ...previous,
-      ...raw,
+      ...mergedRecord,
       id,
-      name: raw.name || previous.name || (fallbackKind === 'phone' ? 'Android Phone' : 'Device Node'),
+      name: mergedRecord.name || previous.name || (fallbackKind === 'phone' ? 'Android Phone' : 'Device Node'),
       type,
       deviceType: type,
-      kind: inferKind({ ...previous, ...raw, type }, fallbackKind),
-      pairingKey: raw.pairingKey || previous.pairingKey || '',
+      kind: inferKind({ ...previous, ...mergedRecord, type }, fallbackKind),
+      pairingKey: mergedRecord.pairingKey || previous.pairingKey || '',
       contentPolicy,
       lastSeen,
       connected,
       status: connected || previousStatus === 'online' || rawStatus === 'online'
         ? 'online'
-        : (raw.status || previous.status || 'known'),
-      lastIP: raw.lastIP || previous.lastIP || mergedHosts[0] || '',
-      host: raw.host || previous.host || mergedHosts[0] || '',
-      relayHost: raw.relayHost || previous.relayHost || '',
-      tsHost: raw.tsHost || previous.tsHost || '',
+        : (mergedRecord.status || previous.status || 'known'),
+      lastIP: mergedRecord.lastIP || previous.lastIP || mergedHosts[0] || '',
+      host: mergedRecord.host || previous.host || mergedHosts[0] || '',
+      relayHost: mergedRecord.relayHost || previous.relayHost || '',
+      tsHost: mergedRecord.tsHost || previous.tsHost || '',
       altHosts: mergedHosts,
-      relayPort: raw.relayPort || raw.port || previous.relayPort || previous.port || JOIN_PORT
+      relayPort: mergedRecord.relayPort || mergedRecord.port || previous.relayPort || previous.port || JOIN_PORT
     })
   }
 
@@ -7353,6 +8164,7 @@ function getFileTransferTargets() {
         status,
         statusLabel: getDeviceStatusLabel(status),
         reachable,
+        trusted,
         allowed,
         selected: reachable && allowed,
         reason,
@@ -7588,6 +8400,7 @@ registerDesktopIpc(ipcMain, {
   getTopology: () => getTopologySnapshot(),
   getMessageSettings: () => normalizeMessageSettings(desktopMessageSettings),
   setMessageSettings: updates => {
+    const previousSettings = normalizeMessageSettings(desktopMessageSettings)
     desktopMessageSettings = normalizeMessageSettings({
       ...desktopMessageSettings,
       ...(updates || {})
@@ -7598,15 +8411,26 @@ registerDesktopIpc(ipcMain, {
       desktopMessageSettings.syncClipboardImage === true ||
       desktopMessageSettings.syncClipboardFile === true
     ) {
+      startClipboardSyncWatcher()
       try {
-        lastClipboardText = clipboard.readText() || ''
-        const image = clipboard.readImage()
-        lastClipboardImageHash = image && !image.isEmpty() ? hashBuffer(image.toPNG()).slice(0, 24) : ''
-        lastClipboardFileSignature = getClipboardFileSignature(readClipboardFilePaths())
+        if (desktopMessageSettings.syncClipboardText !== true || previousSettings.syncClipboardText !== true) {
+          lastClipboardText = clipboard.readText() || ''
+        }
+        if (desktopMessageSettings.syncClipboardImage === true && previousSettings.syncClipboardImage !== true) {
+          lastClipboardImageHash = ''
+        } else {
+          lastClipboardImageHash = readClipboardImageSyncHash()
+        }
+        if (desktopMessageSettings.syncClipboardFile !== true || previousSettings.syncClipboardFile !== true) {
+          lastClipboardFileSignature = getClipboardFileSignature(readClipboardFilePaths())
+        }
       } catch (_) {
         lastClipboardText = ''
         lastClipboardImageHash = ''
         lastClipboardFileSignature = ''
+      }
+      if (desktopMessageSettings.syncClipboardImage === true && previousSettings.syncClipboardImage !== true) {
+        setTimeout(pollClipboardForSync, 25)
       }
     }
     return normalizeMessageSettings(desktopMessageSettings)
@@ -7614,7 +8438,12 @@ registerDesktopIpc(ipcMain, {
   fileSelectAndSend: targetIds => selectAndSendFile(targetIds),
   fileSelectAndSendFolder: targetIds => selectAndSendFolder(targetIds),
   fileTransferTargets: () => getFileTransferTargets(),
+  fileTransferTargetPolicy: (nodeId, updates) => setNodeContentPolicy(nodeId, updates).fileTargets,
   fileTransferHistory: () => getFileTransferHistory(),
+  fileTransferSettings: () => fileTransferSettingsSnapshot(),
+  fileTransferChooseDownloadDir: () => chooseFileTransferDownloadDir(),
+  fileTransferResetDownloadDir: () => setFileTransferDownloadDir(''),
+  fileTransferOpenDownloadDir: () => openFileTransferDownloadDir(),
   fileTransferOpenPath: filePath => openLocalPath(filePath, false),
   fileTransferRevealPath: filePath => openLocalPath(filePath, true),
   getLanJoinSettings: () => ({

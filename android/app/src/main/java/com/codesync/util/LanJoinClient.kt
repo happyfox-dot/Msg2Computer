@@ -20,6 +20,9 @@ object LanJoinClient {
         if (target.joinPublicKey.isBlank()) {
             return JoinResult(success = false, error = "missing_join_public_key")
         }
+        DeviceStore.findDevice(context, target.id)
+            ?.takeIf { it.enabled && it.pairingKey.isNotBlank() }
+            ?.let { return JoinResult(success = true, device = it) }
         val identity = PhoneIdentityStore.get(context)
         val requestId = "join-${System.currentTimeMillis()}-${CryptoUtil.generateNonce().take(8)}"
         val requestKey = LanJoinCrypto.createRequestKey(target.joinPublicKey)
@@ -55,8 +58,14 @@ object LanJoinClient {
         }
         val plain = CryptoUtil.decrypt(response.optString("payload"), requestKey.sessionKey)
         val accept = JSONObject(plain)
+        // accept 完整性校验必须在 adoptNetworkId 之前：adoptNetworkId 会改写本机
+        // networkId 并把既有 Device/Topology 全量迁到新网，副作用全局且不可逆。
+        // 若校验失败时已迁网，本机会脱离原网络（其它设备按 networkId 过滤后互不可见）
+        // 却又加入未成功，等于「加入失败却脱网」。
+        val pairingKey = accept.optString("nodePairingKey")
+        if (pairingKey.isBlank()) return JoinResult(success = false, error = "missing_pairing_key")
         val networkId = accept.optString("networkId")
-        LanTrustStore.adoptNetworkId(context, networkId)
+        if (networkId.isBlank()) return JoinResult(success = false, error = "missing_network_id")
 
         val node = accept.optJSONObject("node") ?: JSONObject()
             .put("id", target.id)
@@ -65,8 +74,18 @@ object LanJoinClient {
             .put("host", target.host)
             .put("port", target.port)
         val acceptedAt = accept.optLong("acceptedAt", System.currentTimeMillis())
-        val pairingKey = accept.optString("nodePairingKey")
-        if (pairingKey.isBlank()) return JoinResult(success = false, error = "missing_pairing_key")
+
+        val previousNetworkId = LanTrustStore.getNetworkId(context)
+        val mergeFromNetworkIds = (listOf(previousNetworkId) + jsonArrayToList(accept.optJSONArray("mergeFromNetworkIds")))
+            .map { it.trim() }
+            .filter { it.isNotBlank() && it != networkId }
+            .distinct()
+        LanTrustStore.adoptNetworkId(
+            context = context,
+            networkId = networkId,
+            allowMerge = true,
+            mergeFromNetworkIds = mergeFromNetworkIds
+        )
 
         val device = DeviceStore.upsertDevice(
             context = context,
@@ -89,7 +108,13 @@ object LanJoinClient {
         val updatedDevice = DeviceStore.findDevice(context, device.id) ?: device
         TopologyStore.markDeviceState(context, updatedDevice, enabled = true)
         accept.optJSONObject("topologySnapshot")?.let {
-            TopologyStore.applyDelta(context, it)
+            TopologyStore.applyDelta(
+                context = context,
+                rawDelta = it,
+                allowNetworkMerge = true,
+                mergeToNetworkId = networkId,
+                mergeFromNetworkIds = mergeFromNetworkIds
+            )
         }
         return JoinResult(success = true, device = updatedDevice)
     }
@@ -255,4 +280,11 @@ object LanJoinClient {
 
     private fun listOfNotNull(value: String?): List<String> =
         if (value.isNullOrBlank()) emptyList() else listOf(value)
+
+    private fun jsonArrayToList(array: JSONArray?): List<String> {
+        if (array == null) return emptyList()
+        return (0 until array.length()).mapNotNull {
+            array.optString(it).trim().takeIf { value -> value.isNotBlank() }
+        }
+    }
 }

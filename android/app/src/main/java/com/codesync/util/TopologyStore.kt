@@ -1,42 +1,98 @@
 package com.codesync.util
 
 import android.content.Context
+import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.Locale
 
 object TopologyStore {
+    private const val TAG = "TopologyStore"
     private const val PREFS_NAME = "topology_lsdb"
     private const val KEY_NODES = "nodes"
     private const val KEY_LINKS = "links"
     private const val KEY_SEEN_SEQ = "seen_seq"
     private const val KEY_DELTA_BACKLOG = "delta_backlog"
+    private const val KEY_STORAGE_SCHEMA_VERSION = "storage_schema_version"
     private const val ENTRY_TTL_MS = 24 * 60 * 60 * 1000L
     private const val DEFAULT_DELTA_TTL = 4
-    private const val DELTA_BACKLOG_LIMIT = 80
+    private const val STORAGE_SCHEMA_VERSION = 2
+    private const val DELTA_BACKLOG_LIMIT = 12
+    private const val DELTA_BACKLOG_PER_SOURCE_LIMIT = 2
+    private const val MAX_STORED_NODES = 80
+    private const val MAX_STORED_LINKS = 160
+    private const val MAX_DELTA_BACKLOG_BYTES = 512 * 1024
+    private const val MAX_STORED_ARRAY_BYTES = 768 * 1024
+    private val VOLATILE_TOPOLOGY_FIELDS = setOf(
+        "seq",
+        "updatedAt",
+        "lastSeen",
+        "expiresAt",
+        "connected",
+        "status",
+        "active"
+    )
 
-    fun applyDelta(context: Context, rawDelta: JSONObject): Boolean {
-        val delta = normalizeDelta(rawDelta)
+    fun applyDelta(
+        context: Context,
+        rawDelta: JSONObject,
+        allowNetworkMerge: Boolean = false,
+        mergeToNetworkId: String = "",
+        mergeFromNetworkIds: List<String> = emptyList()
+    ): Boolean {
+        var delta = normalizeDelta(rawDelta)
         if (delta.optString("type") != "topology_delta") return false
 
         val identity = PhoneIdentityStore.get(context)
         val sourceId = delta.optString("sourceDeviceId", delta.optString("originDeviceId")).trim()
         val networkId = delta.optString("networkId").trim()
-        if (networkId.isNotBlank() && networkId != LanTrustStore.getNetworkId(context)) return false
         if (sourceId.isNotBlank() && sourceId != identity.id && !isTrustedSource(context, sourceId)) {
             return false
         }
+        val currentNetworkId = LanTrustStore.getNetworkId(context)
+        val deltaMergeFrom = jsonArrayToList(delta.optJSONArray("mergeFromNetworkIds"))
+        val requestedMergeFrom = (mergeFromNetworkIds + deltaMergeFrom)
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .distinct()
+        var networkChanged = false
+        if (networkId.isNotBlank() && networkId != currentNetworkId) {
+            val targetNetworkId = mergeToNetworkId.trim().ifBlank { networkId }
+            val canImportForeign = allowNetworkMerge && targetNetworkId == currentNetworkId
+            val canMigrate = delta.optBoolean("networkMerge", false) && requestedMergeFrom.contains(currentNetworkId)
+            if (!canImportForeign && !canMigrate) return false
+            if (canMigrate && targetNetworkId != currentNetworkId) {
+                LanTrustStore.adoptNetworkId(
+                    context = context,
+                    networkId = targetNetworkId,
+                    allowMerge = true,
+                    mergeFromNetworkIds = requestedMergeFrom
+                )
+                networkChanged = true
+            }
+            delta = rewriteDeltaNetwork(delta, targetNetworkId, requestedMergeFrom)
+        } else if (networkId.isNotBlank() && delta.optBoolean("networkMerge", false) && requestedMergeFrom.isNotEmpty()) {
+            LanTrustStore.adoptNetworkId(
+                context = context,
+                networkId = networkId,
+                allowMerge = true,
+                mergeFromNetworkIds = requestedMergeFrom
+            )
+            delta = rewriteDeltaNetwork(delta, networkId, requestedMergeFrom)
+            networkChanged = true
+        }
         val seq = delta.optLong("seq", 0L)
+        val shouldTrackSeq = sourceId.isNotBlank() && sourceId != identity.id && seq > 0L
         if (sourceId.isNotBlank() && sourceId != identity.id && seq > 0L) {
             val seen = loadSeenSeq(context)
             val lastSeq = seen.optLong(sourceId, 0L)
             if (seq <= lastSeq) return false
             seen.put(sourceId, seq)
             saveSeenSeq(context, seen)
-            rememberDelta(context, delta)
         }
 
-        var changed = false
+        var storageChanged = networkChanged
+        var semanticChanged = networkChanged
         val nodes = loadArray(context, KEY_NODES)
         val links = loadArray(context, KEY_LINKS)
         val nodesById = toObjectMap(nodes, "id")
@@ -47,10 +103,22 @@ object TopologyStore {
             val node = normalizeNode(incomingNodes.optJSONObject(i) ?: continue) ?: continue
             if (node.optString("id") == identity.id) continue
             val existing = nodesById[node.optString("id")]
-            if (isNewer(node, existing)) {
+            val missingTrustedDevice = DeviceStore.findDevice(context, node.optString("id")) == null &&
+                node.optString("pairingKey").isNotBlank() &&
+                node.optBoolean("routable", true) &&
+                node.optBoolean("enabled", true) &&
+                !node.optBoolean("revoked", false)
+            if (isSemanticUpdate(node, existing)) {
                 nodesById[node.optString("id")] = node
                 upsertDeviceFromNode(context, node)
-                changed = true
+                storageChanged = true
+                semanticChanged = true
+            } else if (missingTrustedDevice) {
+                upsertDeviceFromNode(context, node)
+                semanticChanged = true
+            } else if (isVolatileRefresh(node, existing)) {
+                nodesById[node.optString("id")] = refreshVolatileFields(existing, node)
+                storageChanged = true
             }
         }
 
@@ -58,27 +126,52 @@ object TopologyStore {
         for (i in 0 until incomingLinks.length()) {
             val link = normalizeLink(incomingLinks.optJSONObject(i) ?: continue) ?: continue
             val existing = linksById[link.optString("id")]
-            if (isNewer(link, existing)) {
+            if (isSemanticUpdate(link, existing)) {
                 linksById[link.optString("id")] = link
-                changed = true
+                storageChanged = true
+                semanticChanged = true
+            } else if (isVolatileRefresh(link, existing)) {
+                linksById[link.optString("id")] = refreshVolatileFields(existing, link)
+                storageChanged = true
             }
         }
 
-        if (changed) {
+        if (storageChanged) {
             saveArray(context, KEY_NODES, JSONArray(nodesById.values))
             saveArray(context, KEY_LINKS, JSONArray(linksById.values))
         }
-        return changed
+        if (shouldTrackSeq && semanticChanged) {
+            rememberDelta(context, delta)
+        }
+        return semanticChanged
     }
 
-    fun buildDelta(context: Context, reason: String = "stored_topology", ttl: Int = DEFAULT_DELTA_TTL): JSONObject {
+    fun buildDelta(
+        context: Context,
+        reason: String = "stored_topology",
+        ttl: Int = DEFAULT_DELTA_TTL,
+        mergeFromNetworkIds: List<String> = emptyList(),
+        connectedDeviceIds: Set<String> = emptySet()
+    ): JSONObject {
         val identity = PhoneIdentityStore.get(context)
         val now = System.currentTimeMillis()
+        val pendingMergeFrom = LanTrustStore.consumePendingMergeFrom(context)
+        val mergeFrom = (mergeFromNetworkIds + pendingMergeFrom)
+            .map { it.trim() }
+            .filter { it.isNotBlank() && it != LanTrustStore.getNetworkId(context) }
+            .distinct()
         val nodesById = toObjectMap(loadArray(context, KEY_NODES), "id")
         val linksById = toObjectMap(loadArray(context, KEY_LINKS), "id")
-
+        // 重广播前剔除已过期的外部条目，否则离网节点会被本机持续重新泛洪，
+        // 复活对端（如桌面）已按 TTL 回收的僵尸节点，破坏全网收敛。本机 identity
+        // 与本地 DeviceStore 设备随后会以新的 now 重新写入，不受此过滤影响。
+        pruneExpiredEntries(nodesById, now)
+        pruneExpiredEntries(linksById, now)
         val localTsHost = LanDiscovery.localTailscaleHost()
         val localHost = LanDiscovery.localLanHost().ifBlank { localTsHost }
+        val localAcceptedAt = nodesById[identity.id]?.optLong("acceptedAt", 0L)
+            ?.takeIf { it > 0L }
+            ?: now
         nodesById[identity.id] = JSONObject()
             .put("type", "ANDROID_PHONE")
             .put("id", identity.id)
@@ -86,13 +179,14 @@ object TopologyStore {
             .put("role", "phone")
             .put("host", localHost)
             .put("port", LanDiscovery.NODE_RELAY_PORT)
+            .put("relayPort", LanDiscovery.NODE_RELAY_PORT)
             .put("pairingKey", identity.pairingKey)
             .put("tsHost", localTsHost)
             .put("networkId", LanTrustStore.getNetworkId(context))
             .put("autoPaired", false)
             .put("trustSourceId", identity.id)
             .put("trustLevel", "local")
-            .put("acceptedAt", now)
+            .put("acceptedAt", localAcceptedAt)
             .put("capabilities", JSONObject()
                 .put("topology", true)
                 .put("relay", true)
@@ -117,13 +211,21 @@ object TopologyStore {
 
         DeviceStore.getDevices(context).forEach { device ->
             val isPhone = isPhoneType(device.type)
+            val connected = connectedDeviceIds.contains(device.id)
+            val stateUpdatedAt = listOf(
+                device.updatedAt,
+                device.lastSyncAt,
+                device.connectionUpdatedAt
+            ).maxOrNull()?.takeIf { it > 0L } ?: now
             nodesById[device.id] = JSONObject()
                 .put("id", device.id)
                 .put("name", device.name)
                 .put("type", device.type)
                 .put("role", if (isPhone) "phone" else "desktop")
                 .put("host", device.host)
-                .put("port", device.port)
+                .put("port", normalizedDevicePort(device.type, device.port))
+                .put("wsPort", if (isPhone) JSONObject.NULL else normalizedDevicePort(device.type, device.port))
+                .put("relayPort", if (isPhone) normalizedDevicePort(device.type, device.port) else LanDiscovery.NODE_RELAY_PORT)
                 .put("pairingKey", device.pairingKey)
                 .put("altHosts", JSONArray(device.altHosts))
                 .put("networkId", device.networkId.ifBlank { LanTrustStore.getNetworkId(context) })
@@ -144,12 +246,16 @@ object TopologyStore {
                 .put("allowFileTransfer", device.allowFileTransfer)
                 .put("maxFileSizeMb", device.maxFileSizeMb)
                 .put("autoAcceptFiles", device.autoAcceptFiles)
-                .put("connected", false)
-                .put("status", if (device.enabled) "known" else "disabled")
+                .put("connected", connected)
+                .put("status", when {
+                    connected -> "online"
+                    device.enabled -> "known"
+                    else -> "disabled"
+                })
                 .put("routable", isDeviceRoutable(device))
                 .put("authority", "device_store")
-                .put("seq", device.updatedAt)
-                .put("updatedAt", device.updatedAt)
+                .put("seq", stateUpdatedAt)
+                .put("updatedAt", stateUpdatedAt)
                 .put("lastSeen", device.lastSyncAt.takeIf { it > 0L } ?: device.updatedAt)
                 .put("expiresAt", now + ENTRY_TTL_MS)
 
@@ -173,15 +279,15 @@ object TopologyStore {
                 .put("allowFileTransfer", device.allowFileTransfer)
                 .put("maxFileSizeMb", device.maxFileSizeMb)
                 .put("autoAcceptFiles", device.autoAcceptFiles)
-                .put("active", false)
+                .put("active", connected)
                 .put("routable", isDeviceRoutable(device))
                 .put("authority", "device_store")
-                .put("seq", device.updatedAt)
-                .put("updatedAt", device.updatedAt)
+                .put("seq", stateUpdatedAt)
+                .put("updatedAt", stateUpdatedAt)
                 .put("expiresAt", now + ENTRY_TTL_MS)
         }
 
-        return JSONObject()
+        val delta = JSONObject()
             .put("type", "topology_delta")
             .put("version", 2)
             .put("routingProtocol", "link-state-spf")
@@ -198,6 +304,56 @@ object TopologyStore {
             .put("updatedAt", now)
             .put("nodes", JSONArray(nodesById.values))
             .put("links", JSONArray(linksById.values))
+        if (mergeFrom.isNotEmpty()) {
+            delta
+                .put("networkMerge", true)
+                .put("mergeFromNetworkIds", JSONArray(mergeFrom))
+                .put("mergedAt", now)
+        }
+        return delta
+    }
+
+    fun rewriteNetworkId(context: Context, targetNetworkId: String, mergeFromNetworkIds: List<String>) {
+        val target = targetNetworkId.trim()
+        if (target.isBlank()) return
+        val mergeFrom = mergeFromNetworkIds.map { it.trim() }.filter { it.isNotBlank() && it != target }.toSet()
+        fun shouldRewrite(value: String): Boolean {
+            val current = value.trim()
+            return current.isBlank() || current == target || current in mergeFrom
+        }
+        fun rewriteArray(key: String) {
+            val original = loadArray(context, key)
+            val rewritten = JSONArray()
+            var changed = false
+            for (i in 0 until original.length()) {
+                val item = original.optJSONObject(i) ?: continue
+                val next = JSONObject(item.toString())
+                if (shouldRewrite(next.optString("networkId"))) {
+                    next.put("networkId", target)
+                    next.put("updatedAt", System.currentTimeMillis())
+                    changed = true
+                }
+                if (next.optString("type") == "topology_delta") {
+                    val networkId = next.optString("networkId").trim()
+                    if (shouldRewrite(networkId)) {
+                        next.put("networkId", target)
+                        val nodes = next.optJSONArray("nodes") ?: JSONArray()
+                        for (n in 0 until nodes.length()) {
+                            val node = nodes.optJSONObject(n) ?: continue
+                            if (shouldRewrite(node.optString("networkId"))) node.put("networkId", target)
+                        }
+                        changed = true
+                    }
+                }
+                rewritten.put(next)
+            }
+            if (changed) saveArray(context, key, rewritten)
+        }
+        rewriteArray(KEY_NODES)
+        // Old deltas belong to the pre-merge network and can be rebuilt by the
+        // next fresh topology broadcast. Rewriting full historical snapshots is
+        // expensive and caused OOM on MIUI devices with a 256MB heap.
+        prefs(context).edit().remove(KEY_DELTA_BACKLOG).apply()
     }
 
     fun rememberLocalDelta(context: Context, delta: JSONObject) {
@@ -214,21 +370,42 @@ object TopologyStore {
         val seq = delta.optLong("seq", 0L)
         if (seq <= 0L) return
         val backlog = loadArray(context, KEY_DELTA_BACKLOG)
-        val filtered = JSONArray()
+        val items = mutableListOf<JSONObject>()
         for (i in 0 until backlog.length()) {
             val item = backlog.optJSONObject(i) ?: continue
             val itemSourceId = item.optString("sourceDeviceId", item.optString("originDeviceId")).trim()
             if (itemSourceId != sourceId || item.optLong("seq", 0L) != seq) {
-                filtered.put(item)
+                items.add(item)
             }
         }
-        filtered.put(JSONObject(delta.toString()))
+        items.add(compactDeltaForBacklog(delta))
+
+        val perSourceCounts = mutableMapOf<String, Int>()
+        val kept = items
+            .sortedByDescending { it.optLong("seq", it.optLong("updatedAt", 0L)) }
+            .filter { item ->
+                val itemSource = item.optString("sourceDeviceId", item.optString("originDeviceId")).trim()
+                val count = perSourceCounts[itemSource] ?: 0
+                if (count >= DELTA_BACKLOG_PER_SOURCE_LIMIT) {
+                    false
+                } else {
+                    perSourceCounts[itemSource] = count + 1
+                    true
+                }
+            }
+            .take(DELTA_BACKLOG_LIMIT)
+            .asReversed()
         val trimmed = JSONArray()
-        val start = (filtered.length() - DELTA_BACKLOG_LIMIT).coerceAtLeast(0)
-        for (i in start until filtered.length()) {
-            trimmed.put(filtered.optJSONObject(i))
+        kept.forEach { trimmed.put(it) }
+        var byteLimited = trimmed
+        while (byteLimited.length() > 1 && byteLimited.toString().length > MAX_DELTA_BACKLOG_BYTES) {
+            val next = JSONArray()
+            for (i in 1 until byteLimited.length()) {
+                next.put(byteLimited.optJSONObject(i))
+            }
+            byteLimited = next
         }
-        saveArray(context, KEY_DELTA_BACKLOG, trimmed)
+        saveArray(context, KEY_DELTA_BACKLOG, byteLimited)
     }
 
     fun replayDeltasSince(context: Context, seenSeq: JSONObject?): List<JSONObject> {
@@ -402,6 +579,30 @@ object TopologyStore {
         }
     }
 
+    private fun rewriteDeltaNetwork(raw: JSONObject, targetNetworkId: String, mergeFromNetworkIds: List<String>): JSONObject {
+        val target = targetNetworkId.trim()
+        if (target.isBlank()) return raw
+        val mergeFrom = (listOf(raw.optString("networkId")) + mergeFromNetworkIds)
+            .map { it.trim() }
+            .filter { it.isNotBlank() && it != target }
+            .distinct()
+        val delta = JSONObject(raw.toString())
+            .put("networkId", target)
+        if (mergeFrom.isNotEmpty()) {
+            delta
+                .put("networkMerge", true)
+                .put("mergeFromNetworkIds", JSONArray(mergeFrom))
+                .put("mergedAt", System.currentTimeMillis())
+        }
+        val nodes = delta.optJSONArray("nodes") ?: JSONArray()
+        for (i in 0 until nodes.length()) {
+            val node = nodes.optJSONObject(i) ?: continue
+            node.put("networkId", target)
+            if (node.optString("trustLevel").isBlank()) node.put("trustLevel", "trusted_lan")
+        }
+        return delta
+    }
+
     private fun normalizeNode(raw: JSONObject): JSONObject? {
         val id = raw.optString("id", raw.optString("deviceId")).trim()
         if (id.isBlank()) return null
@@ -415,7 +616,12 @@ object TopologyStore {
             .put("name", raw.optString("name", raw.optString("deviceName", id)).ifBlank { id })
             .put("type", type)
             .put("host", host)
-            .put("port", raw.optInt("port", if (isPhone) LanDiscovery.NODE_RELAY_PORT else 19527))
+            .put("port", normalizedDevicePort(
+                type,
+                raw.optInt("wsPort", raw.optInt("port", if (isPhone) LanDiscovery.NODE_RELAY_PORT else 19527))
+            ))
+            .put("wsPort", raw.optInt("wsPort", if (isPhone) 0 else normalizedDevicePort(type, raw.optInt("port", 19527))))
+            .put("relayPort", raw.optInt("relayPort", raw.optInt("joinPort", if (isPhone) raw.optInt("port", LanDiscovery.NODE_RELAY_PORT) else LanDiscovery.NODE_RELAY_PORT)))
             .put("pairingKey", raw.optString("pairingKey", raw.optString("pk")).trim())
             .put("enabled", raw.optBoolean("enabled", true))
             .put("revoked", raw.optBoolean("revoked", false))
@@ -474,7 +680,7 @@ object TopologyStore {
         DeviceStore.upsertDevice(
             context = context,
             host = host,
-            port = node.optInt("port", if (isPhoneType(type)) LanDiscovery.NODE_RELAY_PORT else 19527),
+            port = normalizedDevicePort(type, node.optInt("wsPort", node.optInt("port", if (isPhoneType(type)) LanDiscovery.NODE_RELAY_PORT else 19527))),
             pairingKey = pairingKey,
             name = node.optString("name", "Device ${host.ifBlank { id }}").ifBlank { "Device ${host.ifBlank { id }}" },
             deviceId = id,
@@ -509,10 +715,53 @@ object TopologyStore {
         )
     }
 
-    private fun isNewer(incoming: JSONObject, existing: JSONObject?): Boolean {
+    private fun isSemanticUpdate(incoming: JSONObject, existing: JSONObject?): Boolean {
         if (existing == null) return true
-        return incoming.optLong("seq", incoming.optLong("updatedAt", 0L)) >
-            existing.optLong("seq", existing.optLong("updatedAt", 0L))
+        val incomingSeq = incoming.optLong("seq", incoming.optLong("updatedAt", 0L))
+        val existingSeq = existing.optLong("seq", existing.optLong("updatedAt", 0L))
+        if (existingSeq > 0L && incomingSeq > 0L && incomingSeq < existingSeq) return false
+        return semanticFingerprint(incoming) != semanticFingerprint(existing)
+    }
+
+    private fun isVolatileRefresh(incoming: JSONObject, existing: JSONObject?): Boolean {
+        if (existing == null) return false
+        if (semanticFingerprint(incoming) != semanticFingerprint(existing)) return false
+        val incomingSeq = incoming.optLong("seq", incoming.optLong("updatedAt", 0L))
+        val existingSeq = existing.optLong("seq", existing.optLong("updatedAt", 0L))
+        return incomingSeq > existingSeq
+    }
+
+    private fun refreshVolatileFields(existing: JSONObject?, incoming: JSONObject): JSONObject {
+        val result = JSONObject(existing?.toString() ?: "{}")
+        VOLATILE_TOPOLOGY_FIELDS.forEach { key ->
+            if (incoming.has(key)) result.put(key, incoming.opt(key))
+        }
+        return result
+    }
+
+    private fun semanticFingerprint(obj: JSONObject): String =
+        canonicalJson(obj, VOLATILE_TOPOLOGY_FIELDS)
+
+    private fun canonicalJson(value: Any?, ignoredKeys: Set<String> = emptySet()): String {
+        return when (value) {
+            is JSONObject -> {
+                val keys = mutableListOf<String>()
+                val iterator = value.keys()
+                while (iterator.hasNext()) {
+                    val key = iterator.next()
+                    if (key !in ignoredKeys) keys.add(key)
+                }
+                keys.sorted().joinToString(prefix = "{", postfix = "}") { key ->
+                    "$key:${canonicalJson(value.opt(key), ignoredKeys)}"
+                }
+            }
+            is JSONArray -> {
+                val values = (0 until value.length()).map { canonicalJson(value.opt(it), ignoredKeys) }
+                values.joinToString(prefix = "[", postfix = "]")
+            }
+            JSONObject.NULL, null -> "null"
+            else -> value.toString()
+        }
     }
 
     private fun normalizeDeviceType(type: String): String {
@@ -528,6 +777,16 @@ object TopologyStore {
 
     private fun isPhoneType(type: String): Boolean =
         type.uppercase(Locale.ROOT).contains("PHONE")
+
+    private fun normalizedDevicePort(type: String, port: Int): Int {
+        val isPhone = isPhoneType(type)
+        if (isPhone) return if (port > 0) port else LanDiscovery.NODE_RELAY_PORT
+        return when {
+            port <= 0 -> 19527
+            port == LanDiscovery.NODE_RELAY_PORT -> 19527
+            else -> port
+        }
+    }
 
     private fun isDeviceType(type: String): Boolean {
         val value = type.uppercase(Locale.ROOT)
@@ -573,6 +832,17 @@ object TopologyStore {
         return map
     }
 
+    private fun pruneExpiredEntries(items: MutableMap<String, JSONObject>, now: Long) {
+        val iterator = items.iterator()
+        while (iterator.hasNext()) {
+            val item = iterator.next().value
+            val expiresAt = item.optLong("expiresAt", 0L)
+            if (expiresAt > 0L && expiresAt < now) {
+                iterator.remove()
+            }
+        }
+    }
+
     private fun jsonArrayToList(array: JSONArray?): List<String> {
         if (array == null) return emptyList()
         return (0 until array.length()).mapNotNull {
@@ -599,12 +869,137 @@ object TopologyStore {
         prefs(context).edit().putString(KEY_SEEN_SEQ, seen.toString()).apply()
     }
 
-    private fun loadArray(context: Context, key: String): JSONArray =
-        runCatching { JSONArray(prefs(context).getString(key, "[]").orEmpty()) }
-            .getOrElse { JSONArray() }
+    private fun loadArray(context: Context, key: String): JSONArray {
+        ensureStorageSchema(context)
+        val raw = try {
+            prefs(context).getString(key, "[]").orEmpty()
+        } catch (e: OutOfMemoryError) {
+            clearOversizedArray(context, key, e)
+            return JSONArray()
+        } catch (e: Throwable) {
+            Log.e(TAG, "Failed to read topology array: $key", e)
+            return JSONArray()
+        }
+        if (key == KEY_DELTA_BACKLOG && raw.length > MAX_DELTA_BACKLOG_BYTES) {
+            Log.w(TAG, "Drop oversized topology delta backlog: ${raw.length} bytes")
+            prefs(context).edit().remove(key).apply()
+            return JSONArray()
+        }
+        return runCatching { JSONArray(raw) }
+            .getOrElse {
+                Log.e(TAG, "Failed to parse topology array: $key", it)
+                prefs(context).edit().remove(key).apply()
+                JSONArray()
+            }
+    }
 
     private fun saveArray(context: Context, key: String, array: JSONArray) {
-        prefs(context).edit().putString(key, array.toString()).apply()
+        ensureStorageSchema(context)
+        val compacted = compactArrayForKey(key, array)
+        try {
+            prefs(context).edit().putString(key, compacted.toString()).apply()
+        } catch (e: OutOfMemoryError) {
+            clearOversizedArray(context, key, e)
+        } catch (e: Throwable) {
+            Log.e(TAG, "Failed to save topology array: $key", e)
+        }
+    }
+
+    private fun ensureStorageSchema(context: Context) {
+        val prefs = prefs(context)
+        val version = prefs.getInt(KEY_STORAGE_SCHEMA_VERSION, 0)
+        if (version >= STORAGE_SCHEMA_VERSION) return
+        prefs.edit()
+            .remove(KEY_DELTA_BACKLOG)
+            .putInt(KEY_STORAGE_SCHEMA_VERSION, STORAGE_SCHEMA_VERSION)
+            .apply()
+    }
+
+    private fun compactArrayForKey(key: String, array: JSONArray): JSONArray {
+        val compacted = when (key) {
+            KEY_NODES -> compactObjectArray(array, MAX_STORED_NODES)
+            KEY_LINKS -> compactObjectArray(array, MAX_STORED_LINKS)
+            KEY_DELTA_BACKLOG -> compactBacklogArray(array)
+            else -> array
+        }
+        val limit = if (key == KEY_DELTA_BACKLOG) MAX_DELTA_BACKLOG_BYTES else MAX_STORED_ARRAY_BYTES
+        return trimArrayToByteLimit(compacted, limit)
+    }
+
+    private fun compactObjectArray(array: JSONArray, maxItems: Int): JSONArray {
+        val now = System.currentTimeMillis()
+        val items = mutableListOf<JSONObject>()
+        for (i in 0 until array.length()) {
+            val item = array.optJSONObject(i) ?: continue
+            // expiresAt 写入时已是 now+ENTRY_TTL_MS，故过期判定就是 expiresAt < now。
+            // 旧实现用 now - ENTRY_TTL_MS 作阈值，等价于让条目存活 2×TTL（48h）才回收，
+            // 且离网节点会被持续重新广播击穿对端的 GC。
+            val expiresAt = item.optLong("expiresAt", 0L)
+            if (expiresAt > 0L && expiresAt < now) continue
+            items.add(item)
+        }
+        val compacted = JSONArray()
+        items
+            .sortedByDescending { it.optLong("updatedAt", it.optLong("seq", 0L)) }
+            .take(maxItems)
+            .forEach { compacted.put(it) }
+        return compacted
+    }
+
+    private fun compactBacklogArray(array: JSONArray): JSONArray {
+        val perSourceCounts = mutableMapOf<String, Int>()
+        val items = mutableListOf<JSONObject>()
+        for (i in 0 until array.length()) {
+            val item = array.optJSONObject(i) ?: continue
+            items.add(compactDeltaForBacklog(item))
+        }
+        val compacted = JSONArray()
+        items
+            .sortedByDescending { it.optLong("seq", it.optLong("updatedAt", 0L)) }
+            .filter { item ->
+                val source = item.optString("sourceDeviceId", item.optString("originDeviceId")).trim()
+                val count = perSourceCounts[source] ?: 0
+                if (count >= DELTA_BACKLOG_PER_SOURCE_LIMIT) {
+                    false
+                } else {
+                    perSourceCounts[source] = count + 1
+                    true
+                }
+            }
+            .take(DELTA_BACKLOG_LIMIT)
+            .asReversed()
+            .forEach { compacted.put(it) }
+        return compacted
+    }
+
+    private fun compactDeltaForBacklog(delta: JSONObject): JSONObject {
+        val compact = JSONObject(delta.toString())
+        compact.put("nodes", compactObjectArray(compact.optJSONArray("nodes") ?: JSONArray(), MAX_STORED_NODES))
+        compact.put("links", compactObjectArray(compact.optJSONArray("links") ?: JSONArray(), MAX_STORED_LINKS))
+        return compact
+    }
+
+    private fun trimArrayToByteLimit(array: JSONArray, maxBytes: Int): JSONArray {
+        var current = array
+        while (current.length() > 1 && current.toString().length > maxBytes) {
+            val next = JSONArray()
+            for (i in 1 until current.length()) {
+                next.put(current.optJSONObject(i))
+            }
+            current = next
+        }
+        if (current.length() == 1 && current.toString().length > maxBytes) {
+            return JSONArray()
+        }
+        return current
+    }
+
+    private fun clearOversizedArray(context: Context, key: String, error: Throwable) {
+        Log.e(TAG, "Drop oversized topology array after memory pressure: $key", error)
+        runCatching {
+            prefs(context).edit().remove(key).apply()
+            System.gc()
+        }
     }
 
     private fun prefs(context: Context) = SecurePrefs.get(context, PREFS_NAME)

@@ -75,6 +75,9 @@ class NodeReceiverService : Service() {
         private const val FILE_TRANSFER_TIMEOUT_MS = 20_000
         private const val FILE_TRANSFER_PARALLEL_PULLS = 4
         private const val FILE_TRANSFER_BLOCK_RETRIES = 3
+        private const val CLIPBOARD_TEMP_PREFS = "clipboard_temp_state"
+        private const val CLIPBOARD_FILE_TEMP_DIR = "CodeBridgeClipboardFiles"
+        private const val CLIPBOARD_IMAGE_TEMP_DIR = "clipboard_images"
         const val ACTION_RETRY_FILE_TRANSFER = "com.codesync.RETRY_FILE_TRANSFER"
         const val EXTRA_FILE_ID = "file_id"
         private const val RECENT_IDS_LIMIT = 200
@@ -88,6 +91,9 @@ class NodeReceiverService : Service() {
         // 仅内存留存（窗口期外的旧 nonce 必被时间窗拦截，无需跨重启持久化）。
         private const val RELAY_NONCE_TTL_MS = RELAY_REPLAY_WINDOW_MS
         private const val RELAY_NONCE_LIMIT_PER_SENDER = 300
+        private const val TOPOLOGY_GOSSIP_MIN_INTERVAL_MS = 5_000L
+        @Volatile
+        private var lastTopologyGossipBroadcastAt = 0L
     }
 
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -428,6 +434,14 @@ class NodeReceiverService : Service() {
 
         val acceptedAt = System.currentTimeMillis()
         val networkId = LanTrustStore.getNetworkId(this)
+        val mergeFromNetworkIds = (
+            listOf(payload.optString("networkId")) +
+                jsonArrayToList(payload.optJSONObject("topologySnapshot")?.optJSONArray("mergeFromNetworkIds")) +
+                listOf(payload.optJSONObject("topologySnapshot")?.optString("networkId").orEmpty())
+            )
+            .map { it.trim() }
+            .filter { it.isNotBlank() && it != networkId }
+            .distinct()
         val policy = LanJoinClient.contentPolicy(decision.template)
         val device = DeviceStore.upsertDevice(
             context = this,
@@ -449,18 +463,27 @@ class NodeReceiverService : Service() {
         val updatedDevice = DeviceStore.findDevice(this, device.id) ?: device
         TopologyStore.markDeviceState(this, updatedDevice, enabled = true)
         payload.optJSONObject("topologySnapshot")?.let {
-            runCatching { TopologyStore.applyDelta(this, it) }
+            runCatching {
+                TopologyStore.applyDelta(
+                    context = this,
+                    rawDelta = it,
+                    allowNetworkMerge = true,
+                    mergeToNetworkId = networkId,
+                    mergeFromNetworkIds = mergeFromNetworkIds
+                )
+            }
         }
         broadcastTopologyChange("lan_join_accept")
 
         val identity = PhoneIdentityStore.get(this)
         val acceptPayload = JSONObject()
             .put("networkId", networkId)
+            .put("mergeFromNetworkIds", JSONArray(mergeFromNetworkIds))
             .put("acceptedByNodeId", identity.id)
             .put("acceptedAt", acceptedAt)
             .put("nodePairingKey", identity.pairingKey)
             .put("initialContentPolicy", policy)
-            .put("topologySnapshot", TopologyStore.buildDelta(this, reason = "lan_join_accept"))
+            .put("topologySnapshot", TopologyStore.buildDelta(this, reason = "lan_join_accept", mergeFromNetworkIds = mergeFromNetworkIds))
             .put("node", LanJoinClient.localNodeProfile(this).put("pairingKey", identity.pairingKey))
         return 200 to JSONObject()
             .put("type", "join_accept")
@@ -472,6 +495,7 @@ class NodeReceiverService : Service() {
     }
 
     private fun broadcastTopologyChange(reason: String) {
+        if (shouldThrottleTopologyGossip(reason)) return
         val intent = Intent(this, WebSocketService::class.java).apply {
             action = WebSocketService.ACTION_BROADCAST_TOPOLOGY
             putExtra(WebSocketService.EXTRA_TOPOLOGY_REASON, reason)
@@ -480,6 +504,16 @@ class NodeReceiverService : Service() {
             startForegroundService(intent)
         } else {
             startService(intent)
+        }
+    }
+
+    private fun shouldThrottleTopologyGossip(reason: String): Boolean {
+        if (reason != "topology_delta_received") return false
+        val now = System.currentTimeMillis()
+        synchronized(NodeReceiverService::class.java) {
+            if (now - lastTopologyGossipBroadcastAt < TOPOLOGY_GOSSIP_MIN_INTERVAL_MS) return true
+            lastTopologyGossipBroadcastAt = now
+            return false
         }
     }
 
@@ -556,6 +590,7 @@ class NodeReceiverService : Service() {
             if (changed) {
                 sendBroadcast(Intent(WebSocketService.TOTP_SYNCED_ACTION))
                 WebSocketService.reportExternalStatus(this, "已更新拓扑控制面")
+                broadcastTopologyChange("topology_delta_received")
             }
         } else if (isUserMessagePayload(payloadType)) {
             val sourceName = payload.optString("sourceDeviceName", payload.optString("phoneName", "未知设备"))
@@ -601,7 +636,9 @@ class NodeReceiverService : Service() {
                         WebSocketService.reportExternalStatus(this, receivedStatusMessage(payloadType, sourceName))
                         rewriteClipboardImageGossipTargets(payload)
                     }
-                } else if (payloadType == "file_transfer" || payloadType == "clipboard_file") {
+                } else if (payloadType == "clipboard_file") {
+                    handleIncomingClipboardFilePayload(payload, sourceName)
+                } else if (payloadType == "file_transfer") {
                     serviceScope.launch {
                         notifyFileTransferRequested(payload)
                         val decision = FileTransferCoordinator.requestApproval(this@NodeReceiverService, payload)
@@ -632,8 +669,8 @@ class NodeReceiverService : Service() {
             handleTotpRelayPayload(payload)
         }
 
-        val ttl = payload.optInt("relayTtl", 0)
-        if (ttl > 0 && !isTopologyPayload(payloadType)) {
+        val ttl = payload.optInt("relayTtl", payload.optInt("ttl", 0))
+        if (ttl > 0) {
             val relayIntent = Intent(this, WebSocketService::class.java).apply {
                 action = WebSocketService.ACTION_RELAY_SMS
                 putExtra(WebSocketService.EXTRA_RELAY_PAYLOAD, payload.toString())
@@ -676,6 +713,7 @@ class NodeReceiverService : Service() {
             if (changed) {
                 sendBroadcast(Intent(WebSocketService.TOTP_SYNCED_ACTION))
                 WebSocketService.reportExternalStatus(this, "已更新拓扑控制面")
+                broadcastTopologyChange("topology_delta_received")
             }
         } else if (isUserMessagePayload(payloadType)) {
             val sourceName = payload.optString("sourceDeviceName", payload.optString("phoneName", "未知设备"))
@@ -715,7 +753,9 @@ class NodeReceiverService : Service() {
                         WebSocketService.reportExternalStatus(this, receivedStatusMessage(payloadType, sourceName))
                         rewriteClipboardImageGossipTargets(payload)
                     }
-                } else if (payloadType == "file_transfer" || payloadType == "clipboard_file") {
+                } else if (payloadType == "clipboard_file") {
+                    handleIncomingClipboardFilePayload(payload, sourceName)
+                } else if (payloadType == "file_transfer") {
                     serviceScope.launch {
                         notifyFileTransferRequested(payload)
                         val decision = FileTransferCoordinator.requestApproval(this@NodeReceiverService, payload)
@@ -746,15 +786,11 @@ class NodeReceiverService : Service() {
             handleTotpRelayPayload(payload)
         }
 
-        val ttl = payload.optInt("relayTtl", 0)
-        if (ttl > 0 && !isTopologyPayload(payloadType)) {
-            val forwardPayload = JSONObject(payload.toString())
-            val forwardPath = forwardPayload.optJSONArray("relayPath") ?: JSONArray()
-            if (!jsonArrayContains(forwardPath, identity.id)) forwardPath.put(identity.id)
-            forwardPayload.put("relayPath", forwardPath)
+        val ttl = payload.optInt("relayTtl", payload.optInt("ttl", 0))
+        if (ttl > 0) {
             val relayIntent = Intent(this, WebSocketService::class.java).apply {
                 action = WebSocketService.ACTION_RELAY_SMS
-                putExtra(WebSocketService.EXTRA_RELAY_PAYLOAD, forwardPayload.toString())
+                putExtra(WebSocketService.EXTRA_RELAY_PAYLOAD, payload.toString())
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 startForegroundService(relayIntent)
@@ -1091,6 +1127,121 @@ class NodeReceiverService : Service() {
             .notify((System.currentTimeMillis() % Int.MAX_VALUE).toInt(), notification)
     }
 
+    private fun handleIncomingClipboardFilePayload(payload: JSONObject, sourceName: String) {
+        serviceScope.launch {
+            val manifest = payload.optJSONObject("fileManifest") ?: return@launch
+            val versionKey = clipboardFileVersionKey(payload, manifest)
+            prepareClipboardTempDirectory("clipboard_file_key", clipboardFileTempRoot(), versionKey)
+            clearClipboardImageTempFiles()
+            val received = pullIncomingFileTransfer(
+                payload = payload,
+                saveToHistory = false,
+                subDirectoryName = CLIPBOARD_FILE_TEMP_DIR
+            )
+            if (received != null && !isCurrentClipboardTempKey("clipboard_file_key", versionKey)) {
+                runCatching { received.file.delete() }
+                return@launch
+            }
+            if (received != null && writeClipboardFilesFromTempRoot()) {
+                ClipboardHistoryStore.addFile(
+                    context = this@NodeReceiverService,
+                    kind = "file",
+                    direction = "incoming",
+                    title = received.name,
+                    path = received.file.absolutePath,
+                    mime = received.mime,
+                    size = received.size,
+                    sourceDeviceId = received.sourceId,
+                    sourceDeviceName = received.sourceName
+                )
+                WebSocketService.reportExternalStatus(
+                    this@NodeReceiverService,
+                    "已同步剪贴板文件：${received.name} · $sourceName"
+                )
+            }
+        }
+    }
+
+    private fun clipboardFileVersionKey(payload: JSONObject, manifest: JSONObject): String {
+        val version = payload.optJSONObject("clipVersion")
+        val versionTs = version?.optLong("ts", 0L) ?: 0L
+        val versionOrigin = version?.optString("origin").orEmpty()
+        val versionHash = version?.optString("hash").orEmpty()
+            .ifBlank { version?.optString("signature").orEmpty() }
+        if (versionTs > 0L && versionOrigin.isNotBlank()) {
+            return listOf(versionTs.toString(), versionOrigin, versionHash).joinToString("|")
+        }
+        return payload.optString("clipboardBatchId")
+            .ifBlank { payload.optString("batchId") }
+            .ifBlank { manifest.optString("fileId") }
+            .ifBlank { System.currentTimeMillis().toString() }
+    }
+
+    private fun prepareClipboardTempDirectory(prefKey: String, dir: File, versionKey: String) {
+        val prefs = getSharedPreferences(CLIPBOARD_TEMP_PREFS, Context.MODE_PRIVATE)
+        val previousKey = prefs.getString(prefKey, "").orEmpty()
+        if (previousKey != versionKey) {
+            runCatching { dir.deleteRecursively() }
+            prefs.edit().putString(prefKey, versionKey).apply()
+        }
+        dir.mkdirs()
+    }
+
+    private fun isCurrentClipboardTempKey(prefKey: String, versionKey: String): Boolean =
+        getSharedPreferences(CLIPBOARD_TEMP_PREFS, Context.MODE_PRIVATE)
+            .getString(prefKey, "")
+            .orEmpty() == versionKey
+
+    private fun clipboardFileTempRoot(): File {
+        val downloadsRoot = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: filesDir
+        return File(downloadsRoot, CLIPBOARD_FILE_TEMP_DIR)
+    }
+
+    private fun clearClipboardFileTempFiles() {
+        runCatching { clipboardFileTempRoot().deleteRecursively() }
+        getSharedPreferences(CLIPBOARD_TEMP_PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .remove("clipboard_file_key")
+            .apply()
+    }
+
+    private fun clearClipboardImageTempFiles() {
+        runCatching { File(filesDir, CLIPBOARD_IMAGE_TEMP_DIR).deleteRecursively() }
+        getSharedPreferences(CLIPBOARD_TEMP_PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .remove("clipboard_image_key")
+            .apply()
+    }
+
+    private fun currentClipboardTempFiles(): List<File> =
+        clipboardFileTempRoot()
+            .walkTopDown()
+            .filter { file ->
+                file.isFile &&
+                    !file.name.endsWith(".part", ignoreCase = true) &&
+                    !file.name.endsWith(".json", ignoreCase = true)
+            }
+            .sortedBy { it.absolutePath }
+            .toList()
+
+    private fun writeClipboardFilesFromTempRoot(): Boolean {
+        val files = currentClipboardTempFiles()
+        if (files.isEmpty()) return false
+        return runCatching {
+            val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+            val firstUri = FileProvider.getUriForFile(this, "${packageName}.fileprovider", files.first())
+            val clip = ClipData.newUri(contentResolver, "codebridge_clipboard_files", firstUri)
+            files.drop(1).forEach { file ->
+                val uri = FileProvider.getUriForFile(this, "${packageName}.fileprovider", file)
+                clip.addItem(ClipData.Item(uri))
+            }
+            clipboard.setPrimaryClip(clip)
+            true
+        }.onFailure {
+            Log.w(TAG, "写入文件剪贴板失败: ${it.message}")
+        }.getOrDefault(false)
+    }
+
     private fun pullIncomingFileTransfer(
         payload: JSONObject,
         saveToHistory: Boolean = true,
@@ -1124,8 +1275,13 @@ class NodeReceiverService : Service() {
         val mime = manifest.optString("mime", "application/octet-stream").ifBlank { "application/octet-stream" }
         val expectedHash = manifest.optString("sha256").lowercase(Locale.ROOT)
         val downloadsRoot = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: filesDir
+        val receiveSubdir = if (saveToHistory && subDirectoryName == "CodeBridge") {
+            SettingsStore.getFileReceiveSubdirOrDefault(this, subDirectoryName)
+        } else {
+            subDirectoryName
+        }
         // 目录分享：relativePath 重建相对目录（逐段消毒，杜绝路径穿越）
-        val dir = relativeSubDir(File(downloadsRoot, subDirectoryName), manifest.optString("relativePath"))
+        val dir = relativeSubDir(File(downloadsRoot, receiveSubdir), manifest.optString("relativePath"))
             .apply { mkdirs() }
         val partFile = File(dir, "$fileId.part")
         val sidecarFile = File(dir, "$fileId.part.json")
@@ -1546,6 +1702,8 @@ class NodeReceiverService : Service() {
     private fun writeClipboard(text: String) {
         if (text.isBlank()) return
         runCatching {
+            clearClipboardFileTempFiles()
+            clearClipboardImageTempFiles()
             val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
             clipboard.setPrimaryClip(android.content.ClipData.newPlainText("codebridge_clipboard", text))
         }.onFailure {
@@ -1698,7 +1856,13 @@ class NodeReceiverService : Service() {
 
     private fun writeClipboardImage(bytes: ByteArray, ts: Long, shortHash: String, mime: String): File? {
         return runCatching {
-            val dir = File(filesDir, "clipboard_images").apply { mkdirs() }
+            clearClipboardFileTempFiles()
+            val dir = File(filesDir, CLIPBOARD_IMAGE_TEMP_DIR)
+            prepareClipboardTempDirectory(
+                "clipboard_image_key",
+                dir,
+                "${ts.takeIf { it > 0L } ?: System.currentTimeMillis()}|$shortHash"
+            )
             val normalizedMime = normalizeClipboardImageMime(mime).ifBlank { "image/png" }
             val file = File(
                 dir,

@@ -18,6 +18,7 @@ data class ClipboardHistoryEntry(
     val sourceDeviceId: String,
     val sourceDeviceName: String,
     val createdAt: Long,
+    val contentKey: String,
     val exists: Boolean
 )
 
@@ -49,6 +50,18 @@ object ClipboardHistoryStore {
                 sourceDeviceId = item.optString("sourceDeviceId"),
                 sourceDeviceName = item.optString("sourceDeviceName").ifBlank { "本机" },
                 createdAt = item.optLong("createdAt", 0L),
+                contentKey = item.optString("contentKey").ifBlank {
+                    buildContentKey(
+                        kind = kind,
+                        direction = item.optString("direction", "incoming").ifBlank { "incoming" },
+                        sourceDeviceId = item.optString("sourceDeviceId"),
+                        text = text,
+                        title = item.optString("title"),
+                        mime = item.optString("mime"),
+                        size = item.optLong("size", if (path.isNotBlank()) File(path).length() else text.length.toLong()),
+                        path = path
+                    )
+                },
                 exists = path.isBlank() || File(path).exists()
             )
         }
@@ -76,6 +89,15 @@ object ClipboardHistoryStore {
                 .put("sourceDeviceId", sourceDeviceId)
                 .put("sourceDeviceName", sourceDeviceName.ifBlank { "本机" })
                 .put("createdAt", createdAt)
+                .put(
+                    "contentKey",
+                    buildContentKey(
+                        kind = "text",
+                        direction = direction,
+                        sourceDeviceId = sourceDeviceId,
+                        text = clean
+                    )
+                )
         )
     }
 
@@ -111,12 +133,25 @@ object ClipboardHistoryStore {
                 .put("sourceDeviceId", sourceDeviceId)
                 .put("sourceDeviceName", sourceDeviceName.ifBlank { "本机" })
                 .put("createdAt", createdAt)
+                .put(
+                    "contentKey",
+                    buildContentKey(
+                        kind = normalizedKind,
+                        direction = direction,
+                        sourceDeviceId = sourceDeviceId,
+                        title = name,
+                        mime = mime,
+                        size = size.takeIf { it > 0L } ?: File(filePath).length(),
+                        path = filePath
+                    )
+                )
         )
     }
 
     private fun add(context: Context, entry: JSONObject) {
+        val contentKey = entry.optString("contentKey")
         val existing = get(context)
-            .filterNot { it.id == entry.optString("id") }
+            .filterNot { it.id == entry.optString("id") || (contentKey.isNotBlank() && it.contentKey == contentKey) }
             .map(::toJson)
         val next = JSONArray().put(entry)
         existing.take(LIMIT - 1).forEach { next.put(it) }
@@ -136,6 +171,7 @@ object ClipboardHistoryStore {
             .put("sourceDeviceId", entry.sourceDeviceId)
             .put("sourceDeviceName", entry.sourceDeviceName)
             .put("createdAt", entry.createdAt)
+            .put("contentKey", entry.contentKey)
 
     private fun defaultTitle(kind: String): String = when (kind) {
         "image" -> "图片剪贴板"
@@ -146,6 +182,25 @@ object ClipboardHistoryStore {
     private fun hash(value: String): String {
         val digest = MessageDigest.getInstance("SHA-256").digest(value.toByteArray(Charsets.UTF_8))
         return digest.joinToString("") { "%02x".format(it) }.take(12)
+    }
+
+    private fun buildContentKey(
+        kind: String,
+        direction: String,
+        sourceDeviceId: String,
+        text: String = "",
+        title: String = "",
+        mime: String = "",
+        size: Long = 0L,
+        path: String = ""
+    ): String {
+        val source = sourceDeviceId.ifBlank { "local" }
+        val material = if (kind == "text") {
+            text.trim()
+        } else {
+            listOf(title, mime, size.toString(), File(path).name).joinToString("|")
+        }
+        return "$kind|$direction|$source|${hash(material)}"
     }
 
     private fun prefs(context: Context) =

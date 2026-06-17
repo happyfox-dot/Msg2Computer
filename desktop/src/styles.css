@@ -1134,6 +1134,29 @@ body {
   opacity: 0.5;
   cursor: default;
 }
+
+.file-save-path-row {
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.file-save-path-control {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  min-width: 0;
+  flex: 1;
+}
+
+#file-download-dir {
+  min-width: 0;
+  max-width: 230px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: right;
+}
 /* 检查失败时按需显示的「手动下载」兜底链接 */
 .update-fallback-link {
   font-size: 11px;
@@ -1264,7 +1287,7 @@ body {
 }
 .file-target-row {
   display: grid;
-  grid-template-columns: 18px 24px minmax(0, 1fr);
+  grid-template-columns: 18px 24px minmax(0, 1fr) auto;
   gap: 8px;
   align-items: center;
   padding: 8px;
@@ -1278,7 +1301,7 @@ body {
 }
 .file-target-row.permission-disabled {
   opacity: 0.72;
-  cursor: not-allowed;
+  cursor: default;
 }
 .file-target-icon {
   font-size: 16px;
@@ -1306,6 +1329,23 @@ body {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+.file-target-policy-btn {
+  border: 0;
+  border-radius: 6px;
+  background: rgba(108,123,255,0.18);
+  color: #cbd2ff;
+  font-size: 11px;
+  padding: 5px 7px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.file-target-policy-btn:hover {
+  background: rgba(108,123,255,0.28);
+}
+.file-target-policy-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
 .file-history-group {
   display: flex;

@@ -20,7 +20,7 @@ let messageSettings = {
   // 剪贴板同步默认关闭，需用户显式开启
   syncClipboard: false,
   syncClipboardText: false,
-  syncClipboardImage: false,
+  syncClipboardImage: true,
   syncClipboardFile: false,
   receiveFileTransfer: false
 }
@@ -396,10 +396,30 @@ function setupFileTransferControls() {
   const transferList = document.getElementById('file-transfer-list')
   const targetList = document.getElementById('file-target-list')
   const historyList = document.getElementById('file-history-list')
+  const downloadDirLabel = document.getElementById('file-download-dir')
+  const chooseDownloadDirButton = document.getElementById('btn-file-download-dir')
+  const resetDownloadDirButton = document.getElementById('btn-file-download-dir-default')
+  const openDownloadDirButton = document.getElementById('btn-open-file-download-dir')
   if (!button || !window.electronAPI.selectAndSendFile) return
 
   const setStatus = (text) => {
     if (status) status.textContent = text || ''
+  }
+
+  const renderDownloadDir = (settings = {}) => {
+    if (!downloadDirLabel) return
+    const dir = settings.downloadDir || ''
+    downloadDirLabel.textContent = settings.usingDefault ? `默认：${dir}` : dir
+    downloadDirLabel.title = dir
+  }
+
+  const loadDownloadDir = async () => {
+    try {
+      renderDownloadDir(await window.electronAPI.getFileTransferSettings?.())
+    } catch (error) {
+      console.error('Failed to load file transfer settings:', error)
+      renderDownloadDir({})
+    }
   }
 
   const formatBytes = (bytes) => {
@@ -437,6 +457,9 @@ function setupFileTransferControls() {
         target.lastSeen ? `上次同步 ${formatTime(target.lastSeen)}` : '',
         target.reason || ''
       ].filter(Boolean).join(' · ')
+      const policyButton = target.trusted
+        ? `<button type="button" class="file-target-policy-btn" data-action="toggle-file-target-policy" data-file-target-id="${escapeHtml(target.id)}" data-enabled="${target.allowed ? 'true' : 'false'}">${target.allowed ? '关闭文件权限' : '开启文件权限'}</button>`
+        : ''
       return `
         <label class="file-target-row ${rowStateClass}">
           <input type="checkbox" data-file-target-id="${escapeHtml(target.id)}" ${checked ? 'checked' : ''} ${disabled ? 'disabled' : ''}>
@@ -445,6 +468,7 @@ function setupFileTransferControls() {
             <span class="file-target-name">${escapeHtml(target.name || target.id)}</span>
             <span class="file-target-meta">${escapeHtml(meta)}</span>
           </span>
+          ${policyButton}
         </label>
       `
     }).join('')
@@ -548,6 +572,57 @@ function setupFileTransferControls() {
   bindSendButton(button, (targetIds) => window.electronAPI.selectAndSendFile(targetIds), '文件')
   bindSendButton(folderButton, (targetIds) => window.electronAPI.selectAndSendFolder?.(targetIds), '文件夹')
   refreshTargetsButton?.addEventListener('click', loadFileTargets)
+  chooseDownloadDirButton?.addEventListener('click', async () => {
+    try {
+      renderDownloadDir(await window.electronAPI.chooseFileTransferDownloadDir?.())
+      setStatus('接收保存目录已更新')
+    } catch (error) {
+      console.error('Failed to choose file transfer download directory:', error)
+      setStatus('保存目录更新失败')
+    } finally {
+      setTimeout(() => setStatus(''), 3000)
+    }
+  })
+  resetDownloadDirButton?.addEventListener('click', async () => {
+    try {
+      renderDownloadDir(await window.electronAPI.resetFileTransferDownloadDir?.())
+      setStatus('已恢复默认保存目录')
+    } catch (error) {
+      console.error('Failed to reset file transfer download directory:', error)
+      setStatus('保存目录更新失败')
+    } finally {
+      setTimeout(() => setStatus(''), 3000)
+    }
+  })
+  openDownloadDirButton?.addEventListener('click', async () => {
+    const result = await window.electronAPI.openFileTransferDownloadDir?.()
+    if (result && result.success === false) {
+      showNotification('目录不可用', result.error || '无法打开目录')
+    }
+  })
+  targetList?.addEventListener('click', async (event) => {
+    const actionButton = event.target.closest('button[data-action="toggle-file-target-policy"]')
+    if (!actionButton) return
+    event.preventDefault()
+    event.stopPropagation()
+    const targetId = actionButton.dataset.fileTargetId || ''
+    const enable = actionButton.dataset.enabled !== 'true'
+    actionButton.disabled = true
+    try {
+      fileTransferTargets = await window.electronAPI.setFileTransferTargetPolicy?.(targetId, {
+        allowClipboardFile: enable,
+        allowFileTransfer: enable
+      }) || []
+      renderFileTargets()
+      setStatus(enable ? '已开启该节点文件权限' : '已关闭该节点文件权限')
+    } catch (error) {
+      console.error('Failed to update file target policy:', error)
+      setStatus('文件权限更新失败')
+    } finally {
+      actionButton.disabled = false
+      setTimeout(() => setStatus(''), 3000)
+    }
+  })
   refreshHistoryButton?.addEventListener('click', loadFileHistory)
   historyList?.addEventListener('click', async (event) => {
     const actionButton = event.target.closest('button[data-action]')
@@ -626,6 +701,7 @@ function setupFileTransferControls() {
   window.electronAPI.onDesktopPeersChanged?.(scheduleFileTargetsRefresh)
   window.electronAPI.onLanDevicesChanged?.(scheduleFileTargetsRefresh)
   window.electronAPI.onTopologyChanged?.(scheduleFileTargetsRefresh)
+  loadDownloadDir()
   loadFileTargets()
   loadFileHistory()
 }
@@ -780,25 +856,39 @@ function setupTopology() {
 }
 
 function setupLanDiscovery() {
-  const scanButton = document.getElementById('btn-scan-lan')
+  const scanButtons = Array.from(document.querySelectorAll('[data-action="scan-lan-devices"]'))
   const container = document.getElementById('lan-devices-list')
-  if (!scanButton || !container) return
+  if (!scanButtons.length || !container) return
 
-  scanButton.addEventListener('click', async () => {
-    scanButton.disabled = true
-    scanButton.textContent = '扫描中...'
+  async function scanAndRenderLanDevices(triggerButton) {
+    const previousLabels = new Map(scanButtons.map(button => [button, button.textContent]))
+    scanButtons.forEach(button => {
+      button.disabled = true
+      button.textContent = '扫描中...'
+    })
     container.innerHTML = '<div class="empty-state">正在扫描局域网设备...</div>'
     try {
       lanDevices = await window.electronAPI.scanLanDevices()
       if (!Array.isArray(lanDevices)) lanDevices = []
+      if (triggerButton?.id === 'btn-merge-network') {
+        document.querySelector('.tab-btn[data-tab="pairing"]')?.click()
+      }
       renderLanDevices()
     } catch (error) {
       console.error('Failed to scan LAN devices:', error)
       container.innerHTML = '<div class="empty-state">局域网扫描失败</div>'
     } finally {
-      scanButton.disabled = false
-      scanButton.textContent = '发现设备'
+      scanButtons.forEach(button => {
+        button.disabled = false
+        button.textContent = previousLabels.get(button) || '发现并合并节点'
+      })
     }
+  }
+
+  scanButtons.forEach(scanButton => {
+    scanButton.addEventListener('click', () => {
+      scanAndRenderLanDevices(scanButton)
+    })
   })
 
   container.addEventListener('click', async (event) => {
@@ -812,7 +902,8 @@ function setupLanDiscovery() {
         ? await window.electronAPI.requestLanJoin(device, 'basic')
         : await window.electronAPI.pairDesktopDevice(device)
       if (result?.success) {
-        showNotification(device.canRequestJoin ? '已加入可信网络' : '桌面配对已发起', result.peer?.name || device.name)
+        const title = result.alreadyTrusted ? '已是可信节点' : (device.canRequestJoin ? '已加入可信网络' : '桌面配对已发起')
+        showNotification(title, result.peer?.name || device.name)
         await refreshTopology()
         lanDevices = await window.electronAPI.getLanDevices()
         renderLanDevices()
@@ -904,14 +995,15 @@ function addCode(codeInfo) {
     code: codeInfo.code || '',
     phoneId: codeInfo.phoneId || '',
     phoneName: codeInfo.phoneName || '未知手机',
-    timestamp: codeInfo.timestamp || now
+    timestamp: codeInfo.timestamp || now,
+    receivedAt: codeInfo.receivedAt || now
   }
   const duplicateKey = getMessageDuplicateKey(normalized)
   const duplicate = codes.find(c =>
     getMessageDuplicateKey(c) === duplicateKey &&
     c.type === normalized.type &&
     getCodePhoneKey(c) === getCodePhoneKey(normalized) &&
-    (now - c.timestamp) < 30000
+    (now - (c.receivedAt || c.timestamp)) < (isClipboardMessageType(normalized.type) ? 10 * 60 * 1000 : 30000)
   )
   if (duplicate) return
 
@@ -1035,7 +1127,7 @@ function renderLanDevices() {
     const trustLabel = device.trustStatus === 'trusted' ? '已信任' : (device.canRequestJoin ? '未确认' : '已发现')
     const fingerprint = device.joinFingerprint ? ` · 指纹 ${device.joinFingerprint}` : ''
     const action = canPair
-      ? `<button class="lan-pair-btn" data-action="pair-lan-device" data-device-id="${escapeHtml(device.id)}">${device.canRequestJoin ? '请求加入' : '加入'}</button>`
+      ? `<button class="lan-pair-btn" data-action="pair-lan-device" data-device-id="${escapeHtml(device.id)}">${device.canRequestJoin ? '请求加入并合并网络' : '加入并合并网络'}</button>`
       : `<span class="lan-device-hint">${escapeHtml(trustLabel)}</span>`
 
     return `
@@ -1430,11 +1522,19 @@ function buildTopologyViewModel() {
 }
 
 function getMessageDuplicateKey(codeInfo) {
+  const contentType = codeInfo.contentType || codeInfo.type || 'sms'
+  if (isClipboardMessageType(contentType)) {
+    const version = codeInfo.clipVersion || {}
+    const manifest = codeInfo.fileManifest || {}
+    const origin = version.origin || codeInfo.originDeviceId || codeInfo.sourceDeviceId || codeInfo.phoneId || ''
+    const ts = version.ts || codeInfo.timestamp || ''
+    const hash = version.hash || manifest.sha256 || manifest.fileId || getRawMessage(codeInfo) || ''
+    return ['clipboard', contentType, version.kind || '', origin, ts, hash].join('|')
+  }
   const originMessageId = codeInfo.originMessageId || codeInfo.relayMessageId || codeInfo.msgId
   if (originMessageId) {
     return `${codeInfo.originDeviceId || codeInfo.sourceDeviceId || codeInfo.phoneId || ''}|${originMessageId}`
   }
-  const contentType = codeInfo.contentType || codeInfo.type || 'sms'
   if (contentType === 'sms') return codeInfo.code || getRawMessage(codeInfo)
   return [
     codeInfo.source || '',
@@ -1442,6 +1542,13 @@ function getMessageDuplicateKey(codeInfo) {
     codeInfo.appName || '',
     getRawMessage(codeInfo)
   ].join('|')
+}
+
+function isClipboardMessageType(type) {
+  return type === 'clipboard' ||
+    type === 'clipboard_text' ||
+    type === 'clipboard_image' ||
+    type === 'clipboard_file'
 }
 
 function renderDirectedTopologyGraph(view) {

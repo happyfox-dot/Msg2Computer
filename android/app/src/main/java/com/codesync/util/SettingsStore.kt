@@ -21,6 +21,7 @@ object SettingsStore {
     private const val KEY_SYNC_CLIPBOARD_IMAGE = "sync_clipboard_image_enabled"
     private const val KEY_SYNC_CLIPBOARD_FILE = "sync_clipboard_file_enabled"
     private const val KEY_RECEIVE_FILE_TRANSFER = "receive_file_transfer_enabled"
+    private const val KEY_FILE_RECEIVE_SUBDIR = "file_receive_subdir"
 
     fun isForwardingEnabled(context: Context): Boolean =
         prefs(context).getBoolean(KEY_FORWARD_SMS, true)
@@ -90,6 +91,34 @@ object SettingsStore {
 
     fun setReceiveFileTransferEnabled(context: Context, enabled: Boolean) {
         prefs(context).edit().putBoolean(KEY_RECEIVE_FILE_TRANSFER, enabled).apply()
+    }
+
+    fun getFileReceiveSubdir(context: Context): String =
+        sanitizeFileReceiveSubdir(prefs(context).getString(KEY_FILE_RECEIVE_SUBDIR, "").orEmpty())
+
+    fun setFileReceiveSubdir(context: Context, subdir: String) {
+        prefs(context).edit()
+            .putString(KEY_FILE_RECEIVE_SUBDIR, sanitizeFileReceiveSubdir(subdir))
+            .apply()
+    }
+
+    fun getFileReceiveSubdirOrDefault(context: Context, defaultSubdir: String = "CodeBridge"): String =
+        getFileReceiveSubdir(context).ifBlank { defaultSubdir }
+
+    fun sanitizeFileReceiveSubdir(raw: String): String {
+        return raw
+            .trim()
+            .replace('\\', '/')
+            .split('/')
+            .map {
+                it.trim()
+                    .replace(Regex("[\\x00-\\x1F<>:\"|?*]"), "_")
+                    .trim('.')
+                    .take(60)
+            }
+            .filter { it.isNotBlank() && it != "." && it != ".." }
+            .take(4)
+            .joinToString("/")
     }
 
     fun shouldReceiveContent(context: Context, type: String): Boolean {

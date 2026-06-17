@@ -54,6 +54,10 @@
     <string name="send_all_sms">推送全部短信</string>
     <string name="send_notifications">推送 App 通知</string>
     <string name="open_notification_access">打开通知使用权授权</string>
+    <string name="notification_access_status_enabled_active">通知使用权已授权，正在监听 App 通知。</string>
+    <string name="notification_access_status_enabled_inactive">通知使用权已授权，但“推送 App 通知”开关未开启。</string>
+    <string name="notification_access_status_disabled">通知使用权未授权，无法读取其它 App 通知。</string>
+    <string name="notification_access_enable_prompt">请允许“验证码同步”的通知使用权</string>
     <string name="receive_sms_codes">接收验证码短信</string>
     <string name="receive_all_sms">接收普通短信</string>
     <string name="receive_notifications">接收 App 通知</string>
@@ -68,6 +72,14 @@
     <string name="send_file">选择文件发送</string>
     <string name="send_folder">发送文件夹</string>
     <string name="file_receive_history">接收文件历史</string>
+    <string name="file_receive_dir">接收保存目录</string>
+    <string name="file_receive_dir_desc">不设置时保存到默认 CodeBridge 目录；这里填写的是应用下载目录下的子目录。</string>
+    <string name="file_receive_dir_change">修改目录</string>
+    <string name="file_receive_dir_reset">恢复默认</string>
+    <string name="file_receive_dir_title">设置接收保存目录</string>
+    <string name="file_receive_dir_hint">例如 CodeBridge 或 CodeBridge/Work</string>
+    <string name="file_receive_dir_saved">接收保存目录已更新</string>
+    <string name="file_receive_dir_default">默认：CodeBridge</string>
     <string name="file_target_select">选择接收节点</string>
     <string name="file_target_select_desc">本次文件只会发送给勾选的可信设备节点。灰色节点表示当前不可达，或本机对该节点的文件传输权限未开启。</string>
     <string name="file_target_none_selected">请至少选择一个接收节点</string>

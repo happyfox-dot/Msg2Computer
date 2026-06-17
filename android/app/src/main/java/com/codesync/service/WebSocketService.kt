@@ -15,6 +15,7 @@ import android.util.Base64
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.codesync.MainActivity
+import com.codesync.R
 import com.codesync.util.BusReliabilityStore
 import com.codesync.util.ClipboardSyncState
 import com.codesync.util.ContentBus
@@ -118,8 +119,11 @@ class WebSocketService : Service() {
         // 配对测试连接（无负载）鉴权成功后保持这么久再断开，给目标节点登记时间。
         private const val REGISTER_HOLD_MS = 1_500L
         private const val SMS_RELAY_TTL = 4
+        private const val NOTIFICATION_UPDATE_MIN_INTERVAL_MS = 1_000L
+        private const val TOPOLOGY_GOSSIP_MIN_INTERVAL_MS = 5_000L
         // 各来源桌面已接受的最大 LSDB 序列号（key=桌面设备 ID），用于丢弃乱序旧路由表
         private const val LSDB_SEQ_PREFS = "topology_lsdb_seq"
+        private val lastTopologyGossipBroadcastAt = AtomicLong(0L)
 
         @Volatile
         var isConnected = false
@@ -195,6 +199,8 @@ class WebSocketService : Service() {
     private var forwardWifiLock: WifiManager.WifiLock? = null
     private var lockReleaseJob: Job? = null
     private val lockGeneration = AtomicLong(0)
+    private var lastNotificationText = ""
+    private var lastNotificationUpdateAt = 0L
 
     override fun onCreate() {
         super.onCreate()
@@ -242,9 +248,6 @@ class WebSocketService : Service() {
         }
 
         armDeliveryDeadline()
-        if (!isPhoneDevice(device)) {
-            enqueueStoredTotpDeleteTombstones(listOf(device))
-        }
         connectDevice(device, registerOnly = true)
     }
 
@@ -770,6 +773,11 @@ class WebSocketService : Service() {
     }
 
     private fun broadcastTopologyDelta(reason: String, excludeDeviceId: String = "", ttl: Int = SMS_RELAY_TTL) {
+        if (shouldThrottleTopologyGossip(reason)) {
+            Log.d(TAG, "Throttle topology gossip broadcast: $reason")
+            stopIfNothingPending("拓扑已更新，等待合并广播")
+            return
+        }
         val targetDevices = DeviceStore.getEnabledDevices(this)
             .filter { it.id != excludeDeviceId }
         if (targetDevices.isEmpty()) {
@@ -778,7 +786,12 @@ class WebSocketService : Service() {
         }
 
         val identity = PhoneIdentityStore.get(this)
-        val delta = TopologyStore.buildDelta(this, reason = reason, ttl = ttl)
+        val delta = TopologyStore.buildDelta(
+            context = this,
+            reason = reason,
+            ttl = ttl,
+            connectedDeviceIds = connectedDeviceIds
+        )
         TopologyStore.rememberLocalDelta(this, delta)
         val relayMessageId = "topology-${identity.id}-${delta.optLong("seq", System.currentTimeMillis())}-${msgIdSeq.incrementAndGet()}"
         val payload = JSONObject(delta.toString())
@@ -797,6 +810,18 @@ class WebSocketService : Service() {
             statusMessage = "正在同步拓扑到 ${targetDevices.size} 个设备节点",
             force = true
         )
+    }
+
+    private fun shouldThrottleTopologyGossip(reason: String): Boolean {
+        val gossipReason = reason == "topology_delta_received" ||
+            reason == "topology_sync_imported" ||
+            reason == "snapshot_response"
+        if (!gossipReason) return false
+        val now = System.currentTimeMillis()
+        val last = lastTopologyGossipBroadcastAt.get()
+        if (now - last < TOPOLOGY_GOSSIP_MIN_INTERVAL_MS) return true
+        lastTopologyGossipBroadcastAt.set(now)
+        return false
     }
 
     /** 构造一条带 msgId 的负载，登记到待投递队列，然后向所有启用设备节点发起连接投递。 */
@@ -885,10 +910,6 @@ class WebSocketService : Service() {
             return
         }
         val payloadType = payload.optString("type")
-        if (isTopologyPayloadType(payloadType)) {
-            stopIfNothingPending("topology relay skipped")
-            return
-        }
         if (!isRelaySupportedType(payloadType)) {
             stopIfNothingPending("该负载类型不支持节点中继")
             return
@@ -1632,6 +1653,7 @@ class WebSocketService : Service() {
                                 msg.optString("sessionKey")
                             }
                             connection.authenticated = true
+                            updateConnectionState("已连接 ${device.name}")
                             reconnectAttempts.remove(device.id)
                             hostRotation.remove(device.id)
                             // 会话密钥就绪后第一时间加密上报本机 relay 信息（替代明文 auth 字段）
@@ -1827,7 +1849,11 @@ class WebSocketService : Service() {
     ) {
         val sessionKey = connection.sessionKey ?: return
         try {
-            val delta = TopologyStore.buildDelta(this, reason = reason)
+            val delta = TopologyStore.buildDelta(
+                context = this,
+                reason = reason,
+                connectedDeviceIds = connectedDeviceIds
+            )
             if (remember) TopologyStore.rememberLocalDelta(this, delta)
             webSocket.send(
                 JSONObject()
@@ -1881,6 +1907,7 @@ class WebSocketService : Service() {
             val changed = TopologyStore.applyDelta(this, delta)
             if (changed) {
                 updateConnectionState("已更新拓扑：${connection.device.name}")
+                broadcastTopologyDelta("topology_delta_received", excludeDeviceId = connection.device.id)
                 notifyTotpSynced()
             }
         } catch (e: Exception) {
@@ -2001,7 +2028,19 @@ class WebSocketService : Service() {
                 val host = directHost.ifBlank { altHosts.firstOrNull().orEmpty() }
                 val normalizedType = type.ifBlank { "UNKNOWN_DEVICE" }
                 val isPhone = normalizedType.uppercase(Locale.ROOT).contains("PHONE")
-                val port = node.optInt("port", if (isPhone) LanDiscovery.NODE_RELAY_PORT else 19527)
+                val rawPort = node.optInt(
+                    "wsPort",
+                    node.optInt("port", if (isPhone) LanDiscovery.NODE_RELAY_PORT else 19527)
+                )
+                val port = if (isPhone) {
+                    if (rawPort > 0) rawPort else LanDiscovery.NODE_RELAY_PORT
+                } else {
+                    when {
+                        rawPort <= 0 -> 19527
+                        rawPort == LanDiscovery.NODE_RELAY_PORT -> 19527
+                        else -> rawPort
+                    }
+                }
                 val pairingKey = node.optString("pairingKey", node.optString("pk", "")).trim()
                 val route = node.optJSONObject("route") ?: routeByDestination[id]
                 val routePath = jsonArrayToList(route?.optJSONArray("path"))
@@ -2010,7 +2049,8 @@ class WebSocketService : Service() {
                     routePath.size > 1
                 if (id.isBlank() || id == identity.id || pairingKey.isBlank()) continue
                 if (host.isBlank() && !hasRoute) continue
-                DeviceStore.upsertDevice(
+                val existingDevice = DeviceStore.findDevice(this, id)
+                val updatedDevice = DeviceStore.upsertDevice(
                     context = this,
                     host = host,
                     port = port,
@@ -2042,10 +2082,11 @@ class WebSocketService : Service() {
                     policyMaxFileSizeMb = node.optInt("maxFileSizeMb", 50),
                     policyAutoAcceptFiles = node.optBoolean("autoAcceptFiles", false)
                 )
-                imported += 1
+                if (existingDevice != updatedDevice) imported += 1
             }
             if (imported > 0) {
                 updateConnectionState("已更新 $imported 个可达设备节点")
+                broadcastTopologyDelta("topology_sync_imported", excludeDeviceId = connection.device.id)
                 Log.d(TAG, "topology_sync imported $imported peers from ${connection.device.name}")
             }
         } catch (e: Exception) {
@@ -2314,6 +2355,9 @@ class WebSocketService : Service() {
         connections.keys.toList().forEach { cleanupConnection(it) }
         synchronized(pendingPayloads) { pendingPayloads.clear() }
 
+        connectedDeviceIds.forEach { id ->
+            DeviceStore.markDeviceConnectionChanged(this, id)
+        }
         isConnected = false
         connectedCount = 0
         connectedDeviceIds = emptySet()
@@ -2329,10 +2373,16 @@ class WebSocketService : Service() {
     }
 
     private fun updateConnectionState(statusMessage: String? = null) {
+        val previousConnectedIds = connectedDeviceIds
         connectedDeviceIds = connections.values
             .filter { it.authenticated }
             .map { it.device.id }
             .toSet()
+        val connectionChangedIds = previousConnectedIds.union(connectedDeviceIds)
+            .filter { previousConnectedIds.contains(it) != connectedDeviceIds.contains(it) }
+        connectionChangedIds.forEach { id ->
+            DeviceStore.markDeviceConnectionChanged(this, id)
+        }
         connectedCount = connectedDeviceIds.size
         isConnected = connectedCount > 0
         lastStatusMessage = statusMessage ?: if (connectedCount > 0) "投递中" else "空闲"
@@ -2341,18 +2391,28 @@ class WebSocketService : Service() {
     }
 
     private fun updateNotification(text: String) {
+        val now = System.currentTimeMillis()
+        if (text == lastNotificationText && now - lastNotificationUpdateAt < NOTIFICATION_UPDATE_MIN_INTERVAL_MS) {
+            return
+        }
+        if (text != lastNotificationText && now - lastNotificationUpdateAt < NOTIFICATION_UPDATE_MIN_INTERVAL_MS) {
+            lastNotificationText = text
+            return
+        }
+        lastNotificationText = text
+        lastNotificationUpdateAt = now
         val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         manager.notify(NOTIFICATION_ID, buildNotification(text))
     }
 
-    private fun buildNotification(status: String = "验证码同步"): Notification {
+    private fun buildNotification(status: String = getString(R.string.app_name)): Notification {
         val intent = Intent(this, MainActivity::class.java)
         val pendingIntent = PendingIntent.getActivity(
             this, 0, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("验证码同步")
+            .setContentTitle(getString(R.string.app_name))
             .setContentText(status)
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setOngoing(true)

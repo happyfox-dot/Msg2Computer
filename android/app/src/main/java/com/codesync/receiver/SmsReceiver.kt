@@ -11,6 +11,7 @@ import com.codesync.service.WebSocketService
 import com.codesync.util.CodeExtractor
 import com.codesync.util.DeviceStore
 import com.codesync.util.SettingsStore
+import com.codesync.util.SmsForwardDedupStore
 
 class SmsReceiver : BroadcastReceiver() {
 
@@ -58,6 +59,12 @@ class SmsReceiver : BroadcastReceiver() {
         if (enabledDevices.isEmpty()) {
             Log.d(TAG, "无启用的推送目标，跳过推送")
             WebSocketService.reportExternalStatus(context, "收到短信，但未启用任何推送目标：$sender")
+            return
+        }
+
+        if (!SmsForwardDedupStore.shouldForward(context, sender, body, contentType)) {
+            Log.d(TAG, "Skip duplicate SMS forward")
+            WebSocketService.reportExternalStatus(context, "已跳过重复短信：$sender")
             return
         }
 

@@ -218,6 +218,7 @@ class MainActivity : AppCompatActivity() {
         // 按需模型：启动时不再建立常驻连接，仅展示当前空闲状态
         refreshConnectionSnapshot()
         startTotpUpdates()
+        refreshNotificationAccessStatus()
         ensureNotificationRelayBound()
 
         // 下载完成广播跟随 Activity 生命周期注册（下载期间退到后台仍可收到，
@@ -278,6 +279,7 @@ class MainActivity : AppCompatActivity() {
         syncForwardSwitch()
         syncMessagePolicySwitches()
         refreshConnectionSnapshot()
+        refreshNotificationAccessStatus()
         ensureNotificationRelayBound()
 
         // 从「安装未知应用」设置页返回：已授权则继续下载，未授权则明确告知已取消
@@ -300,7 +302,6 @@ class MainActivity : AppCompatActivity() {
     // 哈希比较保证幂等，开销可忽略）。
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
-        if (hasFocus) maybeAutoSyncClipboard()
     }
 
     private fun maybeAutoSyncClipboard() {
@@ -674,7 +675,16 @@ class MainActivity : AppCompatActivity() {
         binding.switchSendNotifications.setOnCheckedChangeListener { _, isChecked ->
             if (updatingMessagePolicySwitches) return@setOnCheckedChangeListener
             SettingsStore.setSendNotificationsEnabled(this, isChecked)
-            if (isChecked) ensureNotificationRelayBound()
+            if (isChecked) {
+                val component = notificationRelayComponent()
+                if (!isNotificationListenerEnabled(component)) {
+                    Toast.makeText(this, R.string.notification_access_enable_prompt, Toast.LENGTH_LONG).show()
+                    startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+                } else {
+                    ensureNotificationRelayBound()
+                }
+            }
+            refreshNotificationAccessStatus()
             showMessagePolicySaved()
         }
         binding.switchReceiveSmsCodes.setOnCheckedChangeListener { _, isChecked ->
@@ -708,6 +718,10 @@ class MainActivity : AppCompatActivity() {
             showMessagePolicySaved()
         }
         binding.btnNotificationAccess.setOnClickListener {
+            SettingsStore.setSendNotificationsEnabled(this, true)
+            syncMessagePolicySwitches()
+            refreshNotificationAccessStatus()
+            Toast.makeText(this, R.string.notification_access_enable_prompt, Toast.LENGTH_LONG).show()
             startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
         }
         // 受 Android 10+ 后台读剪贴板限制，手机→其它节点只能在前台主动触发：
@@ -724,9 +738,51 @@ class MainActivity : AppCompatActivity() {
         binding.btnFileHistory.setOnClickListener {
             showFileReceiveHistory()
         }
+        binding.btnSetFileReceiveDir.setOnClickListener {
+            showFileReceiveDirEditor()
+        }
+        binding.btnResetFileReceiveDir.setOnClickListener {
+            SettingsStore.setFileReceiveSubdir(this, "")
+            refreshFileReceiveDirLabel()
+            Toast.makeText(this, R.string.file_receive_dir_saved, Toast.LENGTH_SHORT).show()
+        }
+        refreshFileReceiveDirLabel()
     }
 
     /** 读取当前剪贴板内容并投递到启用的设备节点（仅前台可读，符合系统限制）。 */
+    private fun refreshFileReceiveDirLabel() {
+        val defaultDir = "CodeBridge"
+        val subdir = SettingsStore.getFileReceiveSubdir(this)
+        val displaySubdir = subdir.ifBlank { defaultDir }
+        val root = getExternalFilesDir(android.os.Environment.DIRECTORY_DOWNLOADS) ?: filesDir
+        binding.txtFileReceiveDir.text = File(root, displaySubdir).absolutePath
+    }
+
+    private fun showFileReceiveDirEditor() {
+        val (dialog, content) = createBottomSheet(getString(R.string.file_receive_dir_title))
+        val input = TextInputEditText(this).apply {
+            setText(SettingsStore.getFileReceiveSubdir(this@MainActivity))
+            hint = getString(R.string.file_receive_dir_hint)
+            inputType = InputType.TYPE_CLASS_TEXT
+            setSingleLine(true)
+        }
+        val layout = TextInputLayout(this).apply {
+            hint = getString(R.string.file_receive_dir_hint)
+            addView(input)
+        }
+        content.addView(layout)
+        addSheetButton(content, getString(R.string.save)) {
+            SettingsStore.setFileReceiveSubdir(this, input.text?.toString().orEmpty())
+            refreshFileReceiveDirLabel()
+            Toast.makeText(this, R.string.file_receive_dir_saved, Toast.LENGTH_SHORT).show()
+            dialog.dismiss()
+        }
+        addSheetButton(content, getString(R.string.cancel), outlined = true) {
+            dialog.dismiss()
+        }
+        dialog.show()
+    }
+
     private fun sendCurrentClipboard() {
         if (!SettingsStore.isSyncClipboardEnabled(this)) {
             Toast.makeText(this, R.string.clipboard_sync_disabled, Toast.LENGTH_SHORT).show()
@@ -1482,10 +1538,33 @@ class MainActivity : AppCompatActivity() {
         updatingMessagePolicySwitches = false
     }
 
+    private fun notificationRelayComponent(): ComponentName =
+        ComponentName(this, NotificationRelayService::class.java)
+
+    private fun refreshNotificationAccessStatus() {
+        val listenerEnabled = isNotificationListenerEnabled(notificationRelayComponent())
+        val sendEnabled = SettingsStore.isSendNotificationsEnabled(this)
+        val textRes = when {
+            listenerEnabled && sendEnabled -> R.string.notification_access_status_enabled_active
+            listenerEnabled -> R.string.notification_access_status_enabled_inactive
+            else -> R.string.notification_access_status_disabled
+        }
+        binding.txtNotificationAccessStatus.text = getString(textRes)
+        val colorRes = when {
+            listenerEnabled && sendEnabled -> R.color.status_online
+            listenerEnabled -> R.color.warning
+            else -> R.color.text_secondary
+        }
+        binding.txtNotificationAccessStatus.setTextColor(ContextCompat.getColor(this, colorRes))
+    }
+
     private fun ensureNotificationRelayBound() {
         if (!SettingsStore.isSendNotificationsEnabled(this)) return
-        val component = ComponentName(this, NotificationRelayService::class.java)
-        if (!isNotificationListenerEnabled(component)) return
+        val component = notificationRelayComponent()
+        if (!isNotificationListenerEnabled(component)) {
+            WebSocketService.reportExternalStatus(this, "App 通知监听未授权")
+            return
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             notificationRebindJob?.cancel()
             notificationRebindJob = lifecycleScope.launch {
@@ -2313,10 +2392,18 @@ class MainActivity : AppCompatActivity() {
         showActionSheet(
             title = getString(R.string.lan_discovery_title),
             actions = devices.map { device ->
-                val canPairNode = device.pairingKey.isNotBlank() || device.joinPublicKey.isNotBlank()
+                val existing = DeviceStore.findDevice(this, device.id)
+                val isTrusted = existing != null && existing.pairingKey.isNotBlank() && existing.enabled
+                val canPairNode = !isTrusted && (device.pairingKey.isNotBlank() || device.joinPublicKey.isNotBlank())
+                val stateText = when {
+                    isTrusted -> "已信任"
+                    device.joinPublicKey.isNotBlank() -> "可请求加入可信网络"
+                    device.pairingKey.isNotBlank() -> "可加入推送目标"
+                    else -> "未确认节点"
+                }
                 SheetAction(
                     title = "${deviceIcon(device.type)} ${device.name}",
-                    subtitle = "${device.host}:${device.joinPort} · ${device.type} · ${if (device.joinPublicKey.isNotBlank()) "可请求加入可信网络" else if (device.pairingKey.isNotBlank()) "可加入推送目标" else "未确认节点"}"
+                    subtitle = "${device.host}:${device.joinPort} · ${device.type} · $stateText"
                 ) {
                     if (canPairNode) {
                         pairDiscoveredLanDevice(device)
@@ -2326,9 +2413,9 @@ class MainActivity : AppCompatActivity() {
                             lines = listOf(
                                 "类型：${device.type}",
                                 "地址：${device.host}:${device.joinPort}",
-                                "状态：未确认",
+                                "状态：$stateText",
                                 "指纹：${device.joinFingerprint.ifBlank { "未提供" }}",
-                                "说明：该节点未提供入网公钥，暂不能请求加入"
+                                if (isTrusted) "说明：该节点已在本机可信设备列表中" else "说明：该节点未提供入网公钥，暂不能请求加入"
                             )
                         )
                     }
@@ -2435,6 +2522,14 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun pairDiscoveredLanDevice(device: LanDiscoveredDevice) {
+        val existing = DeviceStore.findDevice(this, device.id)
+        if (existing != null && existing.pairingKey.isNotBlank() && existing.enabled) {
+            Toast.makeText(this, "${existing.name} 已是可信节点", Toast.LENGTH_SHORT).show()
+            refreshDeviceList()
+            rebuildTopologyList()
+            refreshConnectionSnapshot()
+            return
+        }
         if (device.pairingKey.isBlank() && device.joinPublicKey.isNotBlank()) {
             lifecycleScope.launch {
                 try {

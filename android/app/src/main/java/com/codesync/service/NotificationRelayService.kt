@@ -4,6 +4,7 @@ import android.app.Notification
 import android.content.ComponentName
 import android.content.Intent
 import android.os.Build
+import android.os.Bundle
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import android.util.Log
@@ -19,6 +20,8 @@ class NotificationRelayService : NotificationListenerService() {
     }
 
     private val recentNotifications = LinkedHashMap<String, Long>()
+    private var lastSkipStatus = ""
+    private var lastSkipStatusAt = 0L
 
     override fun onListenerConnected() {
         super.onListenerConnected()
@@ -42,6 +45,7 @@ class NotificationRelayService : NotificationListenerService() {
         sbn ?: return
         if (!SettingsStore.isSendNotificationsEnabled(this)) {
             Log.d(TAG, "通知推送总开关关闭，跳过 package=${sbn.packageName}")
+            reportSkipStatus("App 通知推送开关未开启")
             return
         }
         if (sbn.packageName == packageName) return
@@ -54,10 +58,15 @@ class NotificationRelayService : NotificationListenerService() {
         }
 
         val notification = sbn.notification ?: return
-        val title = extractText(notification, Notification.EXTRA_TITLE)
+        val title = firstNonBlank(
+            extractText(notification, Notification.EXTRA_TITLE),
+            extractText(notification, Notification.EXTRA_TITLE_BIG),
+            extractText(notification, Notification.EXTRA_SUB_TEXT)
+        )
         val text = extractNotificationBody(notification)
         if (title.isBlank() && text.isBlank()) {
             Log.d(TAG, "通知标题和正文为空，跳过 package=${sbn.packageName}")
+            reportSkipStatus("收到通知，但标题和正文为空")
             return
         }
 
@@ -97,13 +106,22 @@ class NotificationRelayService : NotificationListenerService() {
         val bigText = extractText(notification, Notification.EXTRA_BIG_TEXT)
         if (bigText.isNotBlank()) return bigText
 
+        val messages = extractMessagingText(notification)
+        if (messages.isNotBlank()) return messages
+
         val textLines = notification.extras.getCharSequenceArray(Notification.EXTRA_TEXT_LINES)
         if (!textLines.isNullOrEmpty()) {
             return textLines
                 .mapNotNull { it?.toString()?.trim()?.takeIf(String::isNotBlank) }
                 .joinToString("\n")
         }
-        return extractText(notification, Notification.EXTRA_TEXT)
+
+        return firstNonBlank(
+            extractText(notification, Notification.EXTRA_TEXT),
+            extractText(notification, Notification.EXTRA_SUMMARY_TEXT),
+            extractText(notification, Notification.EXTRA_SUB_TEXT),
+            notification.tickerText?.toString()?.trim().orEmpty()
+        )
     }
 
     private fun extractText(notification: Notification, key: String): String {
@@ -115,6 +133,40 @@ class NotificationRelayService : NotificationListenerService() {
             val appInfo = packageManager.getApplicationInfo(packageName, 0)
             packageManager.getApplicationLabel(appInfo).toString()
         }.getOrDefault(packageName)
+    }
+
+    private fun extractMessagingText(notification: Notification): String {
+        val parcelables = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            notification.extras.getParcelableArray(
+                Notification.EXTRA_MESSAGES,
+                Bundle::class.java
+            )
+        } else {
+            @Suppress("DEPRECATION")
+            notification.extras.getParcelableArray(Notification.EXTRA_MESSAGES)
+                ?.mapNotNull { it as? Bundle }
+                ?.toTypedArray()
+        } ?: return ""
+
+        return parcelables
+            .mapNotNull { bundle ->
+                val text = bundle.getCharSequence("text")?.toString()?.trim().orEmpty()
+                if (text.isBlank()) return@mapNotNull null
+                val sender = bundle.getCharSequence("sender")?.toString()?.trim().orEmpty()
+                if (sender.isBlank()) text else "$sender: $text"
+            }
+            .joinToString("\n")
+    }
+
+    private fun firstNonBlank(vararg values: String): String =
+        values.firstOrNull { it.isNotBlank() }.orEmpty()
+
+    private fun reportSkipStatus(message: String) {
+        val now = System.currentTimeMillis()
+        if (message == lastSkipStatus && now - lastSkipStatusAt < 30_000L) return
+        lastSkipStatus = message
+        lastSkipStatusAt = now
+        WebSocketService.reportExternalStatus(this, message)
     }
 
     private fun isRecentDuplicate(key: String): Boolean {

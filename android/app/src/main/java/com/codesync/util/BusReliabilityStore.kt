@@ -11,11 +11,18 @@ object BusReliabilityStore {
     private const val KEY_SEEN = "seen"
     private const val KEY_OUTBOX = "outbox"
     private const val SEEN_LIMIT = 1000
-    private const val OUTBOX_LIMIT = 300
+    private const val OUTBOX_LIMIT = 80
+    private const val MAX_OUTBOX_BYTES = 512 * 1024
+    private const val MAX_RECORD_BYTES = 64 * 1024
     private const val SEEN_TTL_MS = 24 * 60 * 60 * 1000L
     private const val RETRY_BASE_MS = 15 * 1000L
     private const val RETRY_MAX_MS = 5 * 60 * 1000L
-    private const val MAX_ATTEMPTS = 8
+    private const val MAX_ATTEMPTS = 4
+    private val NON_PERSISTENT_TOPICS = setOf(
+        ContentBus.Topic.CLIPBOARD_IMAGE,
+        ContentBus.Topic.CLIPBOARD_FILE,
+        ContentBus.Topic.FILE_MANIFEST
+    )
 
     fun rememberInbound(context: Context, envelope: JSONObject): Boolean {
         val key = envelopeKey(envelope)
@@ -37,6 +44,8 @@ object BusReliabilityStore {
         val messageId = envelope.optString("messageId").trim()
         val target = targetNodeId.trim()
         if (messageId.isBlank() || target.isBlank()) return
+        if (!shouldPersistOutbound(envelope)) return
+        val envelopeCopy = safeEnvelopeCopy(envelope) ?: return
         val outbox = loadOutbox(context)
         val key = outboxKey(messageId, target)
         val now = System.currentTimeMillis()
@@ -46,7 +55,7 @@ object BusReliabilityStore {
                 .put("messageId", messageId)
                 .put("targetNodeId", target)
                 .put("topic", envelope.optString("topic"))
-                .put("envelope", JSONObject(envelope.toString()))
+                .put("envelope", envelopeCopy)
                 .put("status", "pending")
                 .put("attempts", outbox.optJSONObject(key)?.optInt("attempts", 0) ?: 0)
                 .put("createdAt", outbox.optJSONObject(key)?.optLong("createdAt", now) ?: now)
@@ -69,15 +78,16 @@ object BusReliabilityStore {
         val item = outbox.optJSONObject(key) ?: return
         val attempts = item.optInt("attempts", 0) + 1
         val now = System.currentTimeMillis()
+        if (attempts >= MAX_ATTEMPTS || !shouldPersistRecord(item)) {
+            outbox.remove(key)
+            saveOutbox(context, outbox)
+            return
+        }
         item.put("attempts", attempts)
             .put("lastError", reason)
             .put("updatedAt", now)
-        if (attempts >= MAX_ATTEMPTS) {
-            item.put("status", "failed").put("nextAttemptAt", 0L)
-        } else {
-            val delay = min(RETRY_MAX_MS.toDouble(), RETRY_BASE_MS * 2.0.pow((attempts - 1).coerceAtLeast(0))).toLong()
-            item.put("status", "pending").put("nextAttemptAt", now + delay)
-        }
+        val delay = min(RETRY_MAX_MS.toDouble(), RETRY_BASE_MS * 2.0.pow((attempts - 1).coerceAtLeast(0))).toLong()
+        item.put("status", "pending").put("nextAttemptAt", now + delay)
         outbox.put(key, item)
         saveOutbox(context, outbox)
     }
@@ -86,14 +96,24 @@ object BusReliabilityStore {
         val now = System.currentTimeMillis()
         val outbox = loadOutbox(context)
         val records = mutableListOf<JSONObject>()
+        val remove = mutableListOf<String>()
         val keys = outbox.keys()
         while (keys.hasNext()) {
-            val item = outbox.optJSONObject(keys.next()) ?: continue
+            val key = keys.next()
+            val item = outbox.optJSONObject(key) ?: continue
+            if (!shouldPersistRecord(item)) {
+                remove.add(key)
+                continue
+            }
             if (item.optString("status", "pending") == "pending" &&
                 item.optLong("nextAttemptAt", 0L) <= now
             ) {
-                records.add(JSONObject(item.toString()))
+                runCatching { records.add(JSONObject(item.toString())) }
             }
+        }
+        if (remove.isNotEmpty()) {
+            remove.forEach { outbox.remove(it) }
+            saveOutbox(context, outbox)
         }
         return records
             .sortedBy { it.optLong("nextAttemptAt", it.optLong("createdAt", 0L)) }
@@ -123,11 +143,37 @@ object BusReliabilityStore {
     }
 
     private fun loadOutbox(context: Context): JSONObject =
-        runCatching { JSONObject(prefs(context).getString(KEY_OUTBOX, "{}").orEmpty()) }
-            .getOrElse { JSONObject() }
+        runCatching {
+            val raw = prefs(context).getString(KEY_OUTBOX, "{}").orEmpty()
+            if (raw.toByteArray(Charsets.UTF_8).size > MAX_OUTBOX_BYTES * 2) {
+                prefs(context).edit().remove(KEY_OUTBOX).apply()
+                JSONObject()
+            } else {
+                JSONObject(raw)
+            }
+        }.getOrElse {
+            runCatching { prefs(context).edit().remove(KEY_OUTBOX).apply() }
+            JSONObject()
+        }
 
     private fun saveOutbox(context: Context, outbox: JSONObject) {
-        prefs(context).edit().putString(KEY_OUTBOX, outbox.toString()).apply()
+        pruneOutbox(outbox)
+        val serialized = runCatching { outbox.toString() }.getOrElse {
+            runCatching { prefs(context).edit().remove(KEY_OUTBOX).apply() }
+            return
+        }
+        if (serialized.toByteArray(Charsets.UTF_8).size > MAX_OUTBOX_BYTES) {
+            shrinkOutboxToBudget(outbox)
+        }
+        val compact = runCatching { outbox.toString() }.getOrElse {
+            runCatching { prefs(context).edit().remove(KEY_OUTBOX).apply() }
+            return
+        }
+        runCatching {
+            prefs(context).edit().putString(KEY_OUTBOX, compact).apply()
+        }.onFailure {
+            runCatching { prefs(context).edit().remove(KEY_OUTBOX).apply() }
+        }
     }
 
     private fun pruneSeen(seen: JSONObject, now: Long) {
@@ -156,6 +202,65 @@ object BusReliabilityStore {
             .sortedByDescending { it.second }
             .drop(limit)
             .forEach { obj.remove(it.first) }
+    }
+
+    private fun shouldPersistOutbound(envelope: JSONObject): Boolean {
+        if (envelope.optString("topic") in NON_PERSISTENT_TOPICS) return false
+        if (envelope.optJSONObject("payload")?.has("fileManifest") == true) return false
+        val size = runCatching { envelope.toString().toByteArray(Charsets.UTF_8).size }
+            .getOrDefault(MAX_RECORD_BYTES + 1)
+        return size in 1..MAX_RECORD_BYTES
+    }
+
+    private fun safeEnvelopeCopy(envelope: JSONObject): JSONObject? {
+        if (!shouldPersistOutbound(envelope)) return null
+        return runCatching { JSONObject(envelope.toString()) }.getOrNull()
+    }
+
+    private fun shouldPersistRecord(item: JSONObject): Boolean {
+        val envelope = item.optJSONObject("envelope") ?: return false
+        if (!shouldPersistOutbound(envelope)) return false
+        val size = runCatching { item.toString().toByteArray(Charsets.UTF_8).size }
+            .getOrDefault(MAX_RECORD_BYTES + 1)
+        return size in 1..MAX_RECORD_BYTES
+    }
+
+    private fun pruneOutbox(outbox: JSONObject) {
+        val remove = mutableListOf<String>()
+        val keys = outbox.keys()
+        while (keys.hasNext()) {
+            val key = keys.next()
+            val item = outbox.optJSONObject(key)
+            if (item == null || !shouldPersistRecord(item)) remove.add(key)
+        }
+        remove.forEach { outbox.remove(it) }
+        trimObject(outbox, OUTBOX_LIMIT)
+    }
+
+    private fun shrinkOutboxToBudget(outbox: JSONObject) {
+        pruneOutbox(outbox)
+        while (runCatching { outbox.toString().toByteArray(Charsets.UTF_8).size }
+                .getOrDefault(MAX_OUTBOX_BYTES + 1) > MAX_OUTBOX_BYTES
+        ) {
+            val oldest = oldestKey(outbox) ?: break
+            outbox.remove(oldest)
+        }
+    }
+
+    private fun oldestKey(obj: JSONObject): String? {
+        var oldestKey: String? = null
+        var oldestTs = Long.MAX_VALUE
+        val keys = obj.keys()
+        while (keys.hasNext()) {
+            val key = keys.next()
+            val value = obj.optJSONObject(key)
+            val ts = if (value != null) value.optLong("updatedAt", value.optLong("createdAt", 0L)) else 0L
+            if (ts < oldestTs) {
+                oldestTs = ts
+                oldestKey = key
+            }
+        }
+        return oldestKey
     }
 
     private fun prefs(context: Context) = SecurePrefs.get(context, PREFS)

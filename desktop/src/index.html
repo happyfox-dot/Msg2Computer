@@ -100,6 +100,7 @@
     <div class="tab-panel" data-panel="topology">
       <div class="panel-header">
         <h2 class="panel-title">设备拓扑</h2>
+        <button id="btn-merge-network" class="btn-action" data-action="scan-lan-devices" type="button">发现并合并节点</button>
         <button id="btn-refresh-topology" class="btn-action" type="button">刷新</button>
       </div>
       <div class="panel-body scrollable">
@@ -142,7 +143,7 @@
         <div class="lan-discovery-section">
           <div class="lan-discovery-header">
             <span>局域网设备</span>
-            <button id="btn-scan-lan" class="btn-action" type="button">发现设备</button>
+            <button id="btn-scan-lan" class="btn-action" data-action="scan-lan-devices" type="button">发现并合并节点</button>
           </div>
           <div id="lan-devices-list" class="lan-devices-list">
             <div class="empty-state">点击“发现设备”扫描同一局域网内的客户端</div>
@@ -231,6 +232,15 @@
               <button id="btn-send-file" class="btn-action" type="button">选择文件发送</button>
               <button id="btn-send-folder" class="btn-action" type="button">发送文件夹</button>
               <span id="file-transfer-status" class="settings-hint"></span>
+            </div>
+          </div>
+          <div class="settings-item file-save-path-row">
+            <span class="settings-label">接收保存目录</span>
+            <div class="file-save-path-control">
+              <span id="file-download-dir" class="settings-hint"></span>
+              <button id="btn-file-download-dir" class="btn-inline" type="button">选择</button>
+              <button id="btn-file-download-dir-default" class="btn-inline" type="button">默认</button>
+              <button id="btn-open-file-download-dir" class="btn-inline" type="button">打开</button>
             </div>
           </div>
           <div class="file-target-panel">

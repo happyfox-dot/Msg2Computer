@@ -34,6 +34,8 @@ object FileTransferStateStore {
     private const val PREFS = "file_transfer_state"
     private const val KEY_TASKS = "tasks"
     private const val LIMIT = 120
+    private const val PROGRESS_BROADCAST_MIN_INTERVAL_MS = 500L
+    private const val PROGRESS_BROADCAST_MIN_DELTA_BYTES = 512L * 1024L
 
     fun getAll(context: Context): List<FileTransferTask> {
         val array = loadArray(context)
@@ -107,6 +109,17 @@ object FileTransferStateStore {
     }
 
     fun updateProgress(context: Context, fileId: String, received: Long, total: Long) {
+        val current = get(context, fileId) ?: return
+        val now = System.currentTimeMillis()
+        val isComplete = total > 0L && received >= total
+        val advancedBytes = received - current.received
+        val elapsedMs = now - current.updatedAt
+        if (!isComplete &&
+            advancedBytes in 0 until PROGRESS_BROADCAST_MIN_DELTA_BYTES &&
+            elapsedMs < PROGRESS_BROADCAST_MIN_INTERVAL_MS
+        ) {
+            return
+        }
         mutate(context, fileId) {
             if (optString("status") != STATUS_PAUSED) {
                 put("status", STATUS_RUNNING)
