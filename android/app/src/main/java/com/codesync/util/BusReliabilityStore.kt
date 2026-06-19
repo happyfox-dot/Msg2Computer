@@ -120,16 +120,8 @@ object BusReliabilityStore {
             .take(limit)
     }
 
-    private fun envelopeKey(envelope: JSONObject): String {
-        val messageId = envelope.optString("messageId").trim()
-        if (messageId.isBlank()) return ""
-        return listOf(
-            envelope.optString("networkId").trim(),
-            envelope.optString("topic").trim(),
-            envelope.optString("originNodeId", envelope.optString("sourceNodeId")).trim(),
-            messageId
-        ).joinToString("|")
-    }
+    private fun envelopeKey(envelope: JSONObject): String =
+        ContentBus.businessDedupeKey(envelope)
 
     private fun outboxKey(messageId: String, targetNodeId: String): String =
         "${messageId.trim()}|${targetNodeId.trim()}"

@@ -1345,12 +1345,13 @@ class WebSocketService : Service() {
         if (hosts.isEmpty()) return false
         return try {
             val identity = PhoneIdentityStore.get(this)
+            var busEnvelopeForFallback: JSONObject? = null
             if (deviceSupportsSoftBus(device)) {
-                val busEnvelope = runCatching {
+                busEnvelopeForFallback = runCatching {
                     ContentBus.envelopeFromLegacyPayload(this, JSONObject(payload))
                 }.getOrNull()
-                if (busEnvelope != null) {
-                    if (deliverBusEnvelopeHttp(device, busEnvelope, rememberOutbound = true)) return true
+                if (busEnvelopeForFallback != null) {
+                    if (deliverBusEnvelopeHttp(device, busEnvelopeForFallback, rememberOutbound = true)) return true
                 }
             }
             // 发送时间戳放在加密负载内（GCM 保证完整性）：接收端拒绝超出
@@ -1384,7 +1385,10 @@ class WebSocketService : Service() {
                         .post(body)
                         .build()
                     relayHttpClient.newCall(request).execute().use { response ->
-                        if (response.isSuccessful) return true
+                        if (response.isSuccessful) {
+                            markBusFallbackDelivered(device, busEnvelopeForFallback)
+                            return true
+                        }
                         Log.w(TAG, "Relay HTTP rejected by ${device.name}@$host: ${response.code}")
                     }
                 } catch (e: Exception) {
@@ -1396,6 +1400,12 @@ class WebSocketService : Service() {
             Log.e(TAG, "Relay HTTP failed for ${device.name}", e)
             false
         }
+    }
+
+    private fun markBusFallbackDelivered(device: DesktopDevice, busEnvelope: JSONObject?) {
+        val messageId = busEnvelope?.optString("messageId").orEmpty()
+        if (messageId.isBlank()) return
+        BusReliabilityStore.markDelivered(this, messageId, device.id)
     }
 
     private fun deviceSupportsSoftBus(device: DesktopDevice): Boolean {

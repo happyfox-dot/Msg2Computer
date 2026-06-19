@@ -577,6 +577,9 @@ class NodeReceiverService : Service() {
         if (!markRelayMessageSeen(relayMessageId)) {
             return 202
         }
+        if (!rememberLegacyBusinessMessage(payload)) {
+            return 202
+        }
         val targetDeviceIds = payload.optJSONArray("targetDeviceIds")
         val isLocalTarget = targetDeviceIds == null ||
             targetDeviceIds.length() == 0 ||
@@ -682,6 +685,13 @@ class NodeReceiverService : Service() {
             }
         }
         return 200
+    }
+
+    private fun rememberLegacyBusinessMessage(payload: JSONObject): Boolean {
+        val envelope = runCatching {
+            ContentBus.envelopeFromLegacyPayload(this, payload)
+        }.getOrNull() ?: return true
+        return BusReliabilityStore.rememberInbound(this, envelope)
     }
 
     private fun handleDecodedBusPayload(payload: JSONObject, lastHopDeviceId: String): Int {

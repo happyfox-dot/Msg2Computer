@@ -95,6 +95,8 @@ class MainActivity : AppCompatActivity() {
     private var discoveredLanNodes: List<LanDiscoveredDevice> = emptyList()
     private val shownFileTransferRequests = mutableSetOf<String>()
     private var pendingFileTransferTargetIds: List<String> = emptyList()
+    private var lastAutoClipboardHash = ""
+    private var lastAutoClipboardAt = 0L
 
     // 应用内更新：DownloadManager 的下载 id 与待安装的版本号；下载完成由系统广播触发安装
     private var pendingUpdateDownloadId: Long = -1L
@@ -302,6 +304,7 @@ class MainActivity : AppCompatActivity() {
     // 哈希比较保证幂等，开销可忽略）。
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) maybeAutoSyncClipboard()
     }
 
     private fun maybeAutoSyncClipboard() {
@@ -311,7 +314,12 @@ class MainActivity : AppCompatActivity() {
         val text = clipboard.primaryClip?.takeIf { it.itemCount > 0 }
             ?.getItemAt(0)?.coerceToText(this)?.toString()?.trim().orEmpty()
         if (text.isBlank()) return
-        if (ClipboardSyncState.hash(text) == ClipboardSyncState.appliedHash(this)) return
+        val hash = ClipboardSyncState.hash(text)
+        if (hash == ClipboardSyncState.appliedHash(this)) return
+        val now = System.currentTimeMillis()
+        if (hash == lastAutoClipboardHash && now - lastAutoClipboardAt < 5_000L) return
+        lastAutoClipboardHash = hash
+        lastAutoClipboardAt = now
         startServiceForAction(WebSocketService.ACTION_SEND_CLIPBOARD) {
             putExtra(WebSocketService.EXTRA_MESSAGE_BODY, text)
         }

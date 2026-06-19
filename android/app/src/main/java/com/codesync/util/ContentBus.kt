@@ -60,6 +60,17 @@ object ContentBus {
             json.optString("topic").isNotBlank() &&
             json.optString("messageId").isNotBlank()
 
+    fun businessDedupeKey(envelope: JSONObject): String {
+        val messageId = envelope.optString("messageId").trim()
+        if (messageId.isBlank()) return ""
+        return listOf(
+            envelope.optString("networkId").trim(),
+            envelope.optString("topic").trim(),
+            envelope.optString("originNodeId", envelope.optString("sourceNodeId")).trim(),
+            messageId
+        ).joinToString("|")
+    }
+
     fun envelopeFromLegacyPayload(
         context: Context,
         legacyPayload: JSONObject,

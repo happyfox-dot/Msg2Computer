@@ -83,4 +83,5 @@ dependencies {
     implementation("com.google.protobuf:protobuf-javalite:3.21.12")
 
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
 }
