@@ -72,7 +72,10 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
           if (-not $env:KEYSTORE_PASSWORD) { throw 'Missing CODEBRIDGE_KEYSTORE_PASSWORD secret' }
-          .\gradlew.bat "-Dorg.gradle.java.home=$env:JAVA_HOME" :app:testDebugUnitTest :app:assembleRelease --no-daemon
+          .\gradlew.bat `
+            "-Dorg.gradle.java.home=$env:JAVA_HOME" `
+            "-Dorg.gradle.jvmargs=-Xmx1536m -XX:MaxMetaspaceSize=512m -Dfile.encoding=UTF-8" `
+            :app:testDebugUnitTest :app:assembleRelease --no-daemon
           New-Item -ItemType Directory -Force -Path release | Out-Null
           Copy-Item -Force app/build/outputs/apk/release/app-release.apk "release/Msg2Computer-Android-$env:APP_VERSION.apk"
 
