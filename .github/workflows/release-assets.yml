@@ -57,6 +57,8 @@ jobs:
         shell: pwsh
         working-directory: desktop
         run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
           npm ci
           npm test
           npx electron-builder --win --publish never
@@ -67,8 +69,11 @@ jobs:
         env:
           KEYSTORE_PASSWORD: ${{ secrets.CODEBRIDGE_KEYSTORE_PASSWORD }}
         run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
           if (-not $env:KEYSTORE_PASSWORD) { throw 'Missing CODEBRIDGE_KEYSTORE_PASSWORD secret' }
-          .\gradlew.bat :app:testDebugUnitTest :app:assembleRelease --no-daemon
+          .\gradlew.bat "-Dorg.gradle.java.home=$env:JAVA_HOME" :app:testDebugUnitTest :app:assembleRelease --no-daemon
+          New-Item -ItemType Directory -Force -Path release | Out-Null
           Copy-Item -Force app/build/outputs/apk/release/app-release.apk "release/Msg2Computer-Android-$env:APP_VERSION.apk"
 
       - name: Ensure GitHub release exists
