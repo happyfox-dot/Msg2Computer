@@ -54,7 +54,7 @@ function guessMime(name) {
 function sanitizeFileName(name) {
   // 去掉路径分隔与控制字符，落盘时再不信任远端名
   const base = path.basename(String(name || '').replace(/[\\/]/g, '_'))
-  const cleaned = base.replace(/[\x00-\x1f<>:"|?*]/g, '_').trim()
+  const cleaned = base.replace(/[\x00-\x1f<>:"|?*]/g, '_').trim().replace(/^[._\s-]+/, '')
   return cleaned.slice(0, 180) || 'file'
 }
 

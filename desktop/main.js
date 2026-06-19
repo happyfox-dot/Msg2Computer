@@ -4867,13 +4867,18 @@ const CLIPBOARD_MAX_LENGTH = 20 * 1024
 // 首版图片剪贴板用 inline manifest 走现有加密 relay，必须保守限制大小。
 const CLIPBOARD_INLINE_IMAGE_MAX_BYTES = 768 * 1024
 const CLIPBOARD_IMAGE_JPEG_QUALITY = 90
+const CLIPBOARD_FILE_STABLE_MS = 900
+const CLIPBOARD_FILE_RETRY_DELAY_MS = 1200
+const CLIPBOARD_FILE_RETRY_LIMIT = 3
+const CLIPBOARD_FILE_BATCH_FLUSH_MS = 1200
 let clipboardWatchTimer = null
 // 上一次本机剪贴板内容快照：用于检测变化。
 let lastClipboardText = ''
 let lastClipboardImageHash = ''
 let lastClipboardFileSignature = ''
 let suppressClipboardImagePollUntil = 0
-let incomingClipboardFileSession = { key: '', paths: new Set() }
+let pendingClipboardFileBatch = null
+let incomingClipboardFileSession = { key: '', paths: new Set(), fileIds: new Set(), expectedCount: 0, timer: null }
 
 // 剪贴板 LWW（last-writer-wins）寄存器状态：网络中剪贴板是一个单值寄存器，
 // 每次复制产生新版本 (ts, origin)。节点只应用比已知版本更新的内容——
@@ -4985,6 +4990,7 @@ function startClipboardSyncWatcher() {
     lastClipboardImageHash = ''
     lastClipboardFileSignature = ''
   }
+  pendingClipboardFileBatch = null
   clipboardWatchTimer = setInterval(pollClipboardForSync, CLIPBOARD_POLL_INTERVAL_MS)
 }
 
@@ -4993,6 +4999,7 @@ function stopClipboardSyncWatcher() {
     clearInterval(clipboardWatchTimer)
     clipboardWatchTimer = null
   }
+  pendingClipboardFileBatch = null
 }
 
 function pollClipboardForSync() {
@@ -5228,15 +5235,18 @@ function readClipboardFilePaths() {
 function getClipboardFileSignature(filePaths) {
   if (!Array.isArray(filePaths) || filePaths.length === 0) return ''
   const parts = []
+  const seen = new Set()
   for (const filePath of filePaths) {
     try {
       const normalized = path.resolve(String(filePath || ''))
+      if (seen.has(normalized)) continue
+      seen.add(normalized)
       const stat = fs.statSync(normalized)
       if (!stat.isFile()) continue
       parts.push(`${normalized}|${stat.size}|${Math.round(stat.mtimeMs)}`)
     } catch (_) {}
   }
-  return parts.join('\n')
+  return parts.sort().join('\n')
 }
 
 function incomingClipboardFileTempDir() {
@@ -5245,22 +5255,55 @@ function incomingClipboardFileTempDir() {
 
 function clearIncomingClipboardFiles() {
   const dir = incomingClipboardFileTempDir()
+  if (incomingClipboardFileSession.timer) {
+    clearTimeout(incomingClipboardFileSession.timer)
+  }
   try {
     fs.rmSync(dir, { recursive: true, force: true })
   } catch (_) {}
-  incomingClipboardFileSession = { key: '', paths: new Set() }
+  incomingClipboardFileSession = { key: '', paths: new Set(), fileIds: new Set(), expectedCount: 0, timer: null }
 }
 
-function ensureIncomingClipboardFileSession(key) {
+function ensureIncomingClipboardFileSession(key, expectedCount = 0) {
   const normalizedKey = String(key || '').trim() || `clipboard-files-${Date.now()}`
   if (incomingClipboardFileSession.key !== normalizedKey) {
     clearIncomingClipboardFiles()
-    incomingClipboardFileSession = { key: normalizedKey, paths: new Set() }
+    incomingClipboardFileSession = {
+      key: normalizedKey,
+      paths: new Set(),
+      fileIds: new Set(),
+      expectedCount: Math.max(0, Number(expectedCount) || 0),
+      timer: null
+    }
+  } else if (Number(expectedCount) > incomingClipboardFileSession.expectedCount) {
+    incomingClipboardFileSession.expectedCount = Number(expectedCount)
   }
   try {
     fs.mkdirSync(incomingClipboardFileTempDir(), { recursive: true })
   } catch (_) {}
   return incomingClipboardFileSession
+}
+
+function scheduleIncomingClipboardFileFlush(sessionKey, codeInfo = {}, latestName = '') {
+  if (incomingClipboardFileSession.key !== sessionKey) return
+  const session = incomingClipboardFileSession
+  if (session.timer) clearTimeout(session.timer)
+  const expected = Math.max(0, Number(session.expectedCount) || 0)
+  const complete = expected > 0 && session.fileIds.size >= expected
+  const delay = complete ? 80 : CLIPBOARD_FILE_BATCH_FLUSH_MS
+  session.timer = setTimeout(() => {
+    if (incomingClipboardFileSession.key !== sessionKey) return
+    const paths = Array.from(incomingClipboardFileSession.paths).filter(item => {
+      try {
+        return fs.statSync(item).isFile()
+      } catch (_) {
+        return false
+      }
+    })
+    writeFilePathsToClipboard(paths)
+    incomingClipboardFileSession.timer = null
+  }, delay)
+  session.timer.unref?.()
 }
 
 function writeFilePathsToClipboard(filePaths) {
@@ -5288,73 +5331,193 @@ function writeFilePathsToClipboard(filePaths) {
   }
 }
 
-async function pollClipboardFilesForSync() {
+function clipboardFilePathsKey(filePaths) {
+  return (Array.isArray(filePaths) ? filePaths : [])
+    .map(item => path.resolve(String(item || '')))
+    .sort()
+    .join('\n')
+}
+
+function collectEligibleClipboardFiles(filePaths) {
+  const maxBytes = Math.max(1, Number(desktopMessageSettings.maxFileSizeMb || 50)) * 1024 * 1024
+  const eligible = []
+  const skipped = []
+  const seen = new Set()
+  for (const filePath of Array.isArray(filePaths) ? filePaths : []) {
+    const normalized = path.resolve(String(filePath || ''))
+    if (!normalized || seen.has(normalized)) continue
+    seen.add(normalized)
+    let stat = null
+    try {
+      stat = fs.statSync(normalized)
+    } catch (error) {
+      skipped.push({ filePath: normalized, reason: error.message || 'unreadable', retryable: true })
+      continue
+    }
+    if (!stat.isFile()) {
+      skipped.push({ filePath: normalized, reason: 'not_file', retryable: false })
+      continue
+    }
+    if (stat.size <= 0 || stat.size > maxBytes) {
+      skipped.push({ filePath: normalized, reason: `size ${formatBytes(stat.size)} exceeds ${formatBytes(maxBytes)}`, retryable: false })
+      continue
+    }
+    eligible.push({ filePath: normalized, size: stat.size })
+  }
+  return { eligible, skipped }
+}
+
+async function sendClipboardFileBatch(candidate) {
+  const targets = getDefaultClipboardFileTargetIds()
+  if (targets.length === 0) {
+    return { sent: 0, retryable: false, reason: 'no_targets' }
+  }
+
+  const sourcePaths = Array.isArray(candidate.retryFilePaths) && candidate.retryFilePaths.length > 0
+    ? candidate.retryFilePaths
+    : candidate.filePaths
+  const { eligible, skipped } = collectEligibleClipboardFiles(sourcePaths)
+  if (skipped.length > 0) {
+    console.warn('Clipboard file sync skipped entries:', skipped)
+  }
+  const retryableSkippedPaths = skipped
+    .filter(item => item.retryable)
+    .map(item => item.filePath)
+  if (eligible.length === 0) {
+    return {
+      sent: 0,
+      failedPaths: retryableSkippedPaths,
+      retryable: retryableSkippedPaths.length > 0 && candidate.attempts + 1 < CLIPBOARD_FILE_RETRY_LIMIT,
+      reason: 'no_eligible_files'
+    }
+  }
+
+  clearIncomingClipboardFiles()
+  const transfer = initFileTransfer()
+  const identity = getDesktopIdentity()
+  if (!candidate.batchMeta) {
+    const clipTs = Date.now()
+    const signatureHash = hashClipText(candidate.signature)
+    const plannedFileCount = eligible.length + retryableSkippedPaths.length
+    candidate.batchMeta = {
+      clipTs,
+      signatureHash,
+      clipboardBatchId: `clip-files-${identity.id}-${clipTs}-${signatureHash}`,
+      clipboardFileCount: plannedFileCount,
+      clipboardFileTotalBytes: eligible.reduce((sum, item) => sum + item.size, 0)
+    }
+  }
+  const batchMeta = candidate.batchMeta
+  let sent = 0
+  const failedPaths = Array.from(retryableSkippedPaths)
+  for (const [index, item] of eligible.entries()) {
+    try {
+      const offer = await transfer.offerFile(item.filePath, targets, {
+        type: CODE_TYPES.CLIPBOARD_FILE,
+        source: 'Clipboard files',
+        rawPrefix: 'Clipboard file',
+        payloadExtra: {
+          ...buildLocalSourceAddressPayload(),
+          clipVersion: { ts: batchMeta.clipTs, origin: identity.id, hash: batchMeta.signatureHash, kind: 'file' },
+          clipboardBatchId: batchMeta.clipboardBatchId,
+          clipboardFileCount: batchMeta.clipboardFileCount,
+          clipboardFileIndex: index,
+          clipboardFileTotalBytes: batchMeta.clipboardFileTotalBytes
+        }
+      })
+      if (offer && Number(offer.delivered || 0) > 0) sent += 1
+      else failedPaths.push(item.filePath)
+    } catch (error) {
+      console.error(`Clipboard file sync failed for ${item.filePath}:`, error.message)
+      failedPaths.push(item.filePath)
+    }
+  }
+  return {
+    sent,
+    failedPaths,
+    retryable: failedPaths.length > 0 && candidate.attempts + 1 < CLIPBOARD_FILE_RETRY_LIMIT,
+    reason: failedPaths.length === 0 ? '' : 'partial_or_no_manifest_delivered'
+  }
+}
+
+async function dispatchPendingClipboardFileBatch(candidate) {
+  if (!candidate || candidate.sending) return
+  candidate.sending = true
+  try {
+    const result = await sendClipboardFileBatch(candidate)
+    if (pendingClipboardFileBatch !== candidate) return
+    candidate.sending = false
+    const failedPaths = Array.isArray(result.failedPaths) ? result.failedPaths.filter(Boolean) : []
+    if (failedPaths.length === 0 && result.sent > 0) {
+      lastClipboardFileSignature = candidate.signature
+      pendingClipboardFileBatch = null
+      return
+    }
+    candidate.attempts += 1
+    if (!result.retryable || candidate.attempts >= CLIPBOARD_FILE_RETRY_LIMIT) {
+      console.warn(`Clipboard file sync abandoned: ${result.reason || 'unknown'}`)
+      lastClipboardFileSignature = candidate.signature
+      pendingClipboardFileBatch = null
+      return
+    }
+    if (failedPaths.length > 0) {
+      candidate.retryFilePaths = failedPaths
+    }
+    candidate.nextAttemptAt = Date.now() + CLIPBOARD_FILE_RETRY_DELAY_MS
+  } catch (error) {
+    if (pendingClipboardFileBatch !== candidate) return
+    candidate.sending = false
+    candidate.attempts += 1
+    if (candidate.attempts >= CLIPBOARD_FILE_RETRY_LIMIT) {
+      console.warn('Clipboard file sync abandoned:', error.message)
+      lastClipboardFileSignature = candidate.signature
+      pendingClipboardFileBatch = null
+    } else {
+      candidate.nextAttemptAt = Date.now() + CLIPBOARD_FILE_RETRY_DELAY_MS
+    }
+  }
+}
+
+function pollClipboardFilesForSync() {
   const filePaths = readClipboardFilePaths()
   const signature = getClipboardFileSignature(filePaths)
   if (!signature) {
     lastClipboardFileSignature = ''
+    pendingClipboardFileBatch = null
     return
   }
   if (signature === lastClipboardFileSignature) return
-  clearIncomingClipboardFiles()
-  lastClipboardFileSignature = signature
 
-  const targets = getDefaultClipboardFileTargetIds()
-  if (targets.length === 0) {
-    console.warn('Clipboard file sync skipped: no file-transfer targets are enabled')
+  const now = Date.now()
+  const pathsKey = clipboardFilePathsKey(filePaths)
+  if (!pendingClipboardFileBatch || pendingClipboardFileBatch.signature !== signature) {
+    pendingClipboardFileBatch = {
+      signature,
+      pathsKey,
+      filePaths: Array.from(filePaths),
+      stableSince: now,
+      attempts: 0,
+      nextAttemptAt: now,
+      sending: false,
+      retryFilePaths: null
+    }
     return
   }
 
-  const transfer = initFileTransfer()
-  const maxBytes = Math.max(1, Number(desktopMessageSettings.maxFileSizeMb || 50)) * 1024 * 1024
-  const eligible = []
-  for (const filePath of filePaths) {
-    let stat = null
-    try {
-      stat = fs.statSync(filePath)
-    } catch (error) {
-      console.warn(`Clipboard file sync skipped unreadable file: ${filePath}`, error.message)
-      continue
-    }
-    if (!stat.isFile()) continue
-    if (stat.size <= 0 || stat.size > maxBytes) {
-      console.warn(`Clipboard file sync skipped ${filePath}: ${formatBytes(stat.size)} exceeds ${formatBytes(maxBytes)}`)
-      continue
-    }
-    eligible.push({ filePath, size: stat.size })
-    continue
-    transfer.offerFile(filePath, targets, {
-      type: CODE_TYPES.CLIPBOARD_FILE,
-      source: '剪贴板文件',
-      rawPrefix: '剪贴板文件',
-      payloadExtra: buildLocalSourceAddressPayload()
-    }).catch(error => {
-      console.error(`Clipboard file sync failed for ${filePath}:`, error.message)
-    })
+  if (pendingClipboardFileBatch.pathsKey !== pathsKey) {
+    pendingClipboardFileBatch.pathsKey = pathsKey
+    pendingClipboardFileBatch.filePaths = Array.from(filePaths)
+    pendingClipboardFileBatch.stableSince = now
+    pendingClipboardFileBatch.attempts = 0
+    pendingClipboardFileBatch.nextAttemptAt = now
+    pendingClipboardFileBatch.retryFilePaths = null
+    return
   }
-  if (eligible.length === 0) return
 
-  const identity = getDesktopIdentity()
-  const clipTs = Date.now()
-  const signatureHash = hashClipText(signature)
-  const clipboardBatchId = `clip-files-${identity.id}-${clipTs}-${signatureHash}`
-  const clipboardFileTotalBytes = eligible.reduce((sum, item) => sum + item.size, 0)
-  for (const item of eligible) {
-    transfer.offerFile(item.filePath, targets, {
-      type: CODE_TYPES.CLIPBOARD_FILE,
-      source: '剪贴板文件',
-      rawPrefix: '剪贴板文件',
-      payloadExtra: {
-        ...buildLocalSourceAddressPayload(),
-        clipVersion: { ts: clipTs, origin: identity.id, hash: signatureHash, kind: 'file' },
-        clipboardBatchId,
-        clipboardFileCount: eligible.length,
-        clipboardFileTotalBytes
-      }
-    }).catch(error => {
-      console.error(`Clipboard file sync failed for ${item.filePath}:`, error.message)
-    })
-  }
+  pendingClipboardFileBatch.filePaths = Array.from(filePaths)
+  if (now - pendingClipboardFileBatch.stableSince < CLIPBOARD_FILE_STABLE_MS) return
+  if (pendingClipboardFileBatch.sending || now < pendingClipboardFileBatch.nextAttemptAt) return
+  dispatchPendingClipboardFileBatch(pendingClipboardFileBatch)
 }
 
 // 把一条剪贴板状态推送给已配对节点（本机新复制的广播与收到后的 gossip 扩散共用）。
@@ -5582,8 +5745,6 @@ function applyRemoteClipboard(codeInfo, codeData) {
   lastClipboardText = text
   clearIncomingClipboardFiles()
   clipboard.writeText(text)
-  showCodeBubble(codeInfo)
-  showNotification('📋 剪贴板同步', `${text.slice(0, 80)}\n来源设备: ${codeInfo.sourceDeviceName}`)
   return true
 }
 
@@ -5610,8 +5771,6 @@ function applyRemoteClipboardImage(codeInfo, codeData) {
   clearIncomingClipboardFiles()
   clipboard.writeImage(image)
   refreshClipboardImageSnapshotAfterWrite(shortHash)
-  showCodeBubble(codeInfo)
-  showNotification('🖼️ 剪贴板图片同步', `${manifest.name || 'clipboard.png'}\n来源设备: ${codeInfo.sourceDeviceName}`)
   return true
 }
 
@@ -7424,8 +7583,6 @@ function handleIncomingClipboardTextManifest(codeInfo, codeData, manifest, onApp
         clipboard.writeText(text)
         const info = { ...codeInfo, rawMessage: text }
         if (typeof onApplied === 'function') onApplied(info)
-        showCodeBubble(info)
-        showNotification('📋 剪贴板同步', `${text.slice(0, 80)}\n来源设备: ${codeInfo.sourceDeviceName}`)
         offerClipboardTextAsFile(text, ts, actualHash, { origin }).catch(error => {
           console.error('剪贴板长文本 gossip 失败:', error.message)
         })
@@ -7479,8 +7636,6 @@ function handleIncomingClipboardImageManifest(codeInfo, codeData, manifest, onAp
           clipboard.writeImage(image)
           refreshClipboardImageSnapshotAfterWrite(appliedHash)
           if (typeof onApplied === 'function') onApplied(codeInfo)
-          showCodeBubble(codeInfo)
-          showNotification('🖼️ 剪贴板图片同步', `${manifest.name || 'clipboard.png'}\n来源设备: ${codeInfo.sourceDeviceName}`)
         }
       } catch (e) {
         console.error('剪贴板大图应用失败:', e.message)
@@ -7519,7 +7674,13 @@ function handleIncomingClipboardFileManifest(codeInfo, codeData, manifest) {
   const maxBytes = maxFileSizeMb * 1024 * 1024
   const size = Number(manifest.size || 0)
   if (size <= 0 || size > maxBytes) return
-  const session = ensureIncomingClipboardFileSession(incomingClipboardFileKey(codeInfo, codeData, manifest))
+  const expectedCount = Math.max(
+    Number((codeData && codeData.clipboardFileCount) || 0),
+    Number(codeInfo.clipboardFileCount || 0),
+    Number((codeData && codeData.batchCount) || 0),
+    Number(codeInfo.batchCount || 0)
+  )
+  const session = ensureIncomingClipboardFileSession(incomingClipboardFileKey(codeInfo, codeData, manifest), expectedCount)
   const sessionKey = session.key
   initFileTransfer().startIncomingPull(manifest, {
     maxBytes,
@@ -7529,17 +7690,9 @@ function handleIncomingClipboardFileManifest(codeInfo, codeData, manifest) {
         try { fs.unlinkSync(finalPath) } catch (_) {}
         return
       }
+      if (manifest.fileId) session.fileIds.add(String(manifest.fileId))
       session.paths.add(finalPath)
-      const paths = Array.from(session.paths).filter(item => {
-        try {
-          return fs.statSync(item).isFile()
-        } catch (_) {
-          return false
-        }
-      })
-      if (writeFilePathsToClipboard(paths)) {
-        showNotification('剪贴板文件已同步', `${name || path.basename(finalPath)}\n来源设备: ${codeInfo.sourceDeviceName}`)
-      }
+      scheduleIncomingClipboardFileFlush(sessionKey, codeInfo, name || path.basename(finalPath))
     }
   }).catch(err => {
     console.error('Clipboard file pull failed:', err)

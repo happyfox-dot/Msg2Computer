@@ -23,8 +23,8 @@ android {
         applicationId = "com.codesync"
         minSdk = 23
         targetSdk = 34
-        versionCode = 43
-        versionName = "1.0.43"
+        versionCode = 44
+        versionName = "1.0.44"
     }
 
     signingConfigs {
@@ -81,4 +81,6 @@ dependencies {
 
     // Protobuf for Google Authenticator migration support
     implementation("com.google.protobuf:protobuf-javalite:3.21.12")
+
+    testImplementation("junit:junit:4.13.2")
 }

@@ -998,12 +998,12 @@ class NodeReceiverService : Service() {
 
     private fun notifyUserMessageRelay(payload: JSONObject) {
         val type = payload.optString("type")
-        if (type == "clipboard_text") {
-            notifyClipboardTextRelay(payload)
-            return
-        }
-        if (type == "clipboard_image") {
-            notifyClipboardImageRelay(payload)
+        if (
+            type == "clipboard" ||
+            type == "clipboard_text" ||
+            type == "clipboard_image" ||
+            type == "clipboard_file"
+        ) {
             return
         }
         val code = payload.optString("code")
