@@ -1,0 +1,98 @@
+name: Build and upload release assets
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - softbus_p2p
+
+permissions:
+  contents: write
+
+jobs:
+  build-release-assets:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[release-build]')
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Resolve release version
+        shell: pwsh
+        run: |
+          $pkg = Get-Content -Raw -Path desktop/package.json | ConvertFrom-Json
+          "APP_VERSION=$($pkg.version)" >> $env:GITHUB_ENV
+          "RELEASE_TAG=v$($pkg.version)" >> $env:GITHUB_ENV
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: microsoft
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Restore Android signing key
+        shell: pwsh
+        env:
+          KEYSTORE_BASE64: ${{ secrets.CODEBRIDGE_KEYSTORE_BASE64 }}
+        run: |
+          if (-not $env:KEYSTORE_BASE64) { throw 'Missing CODEBRIDGE_KEYSTORE_BASE64 secret' }
+          New-Item -ItemType Directory -Force -Path android/release | Out-Null
+          [IO.File]::WriteAllBytes(
+            (Resolve-Path android/release).Path + '\codebridge-release.jks',
+            [Convert]::FromBase64String($env:KEYSTORE_BASE64)
+          )
+
+      - name: Build desktop installer
+        shell: pwsh
+        working-directory: desktop
+        run: |
+          npm ci
+          npm test
+          npm run build:win
+
+      - name: Build Android APK
+        shell: pwsh
+        working-directory: android
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.CODEBRIDGE_KEYSTORE_PASSWORD }}
+        run: |
+          if (-not $env:KEYSTORE_PASSWORD) { throw 'Missing CODEBRIDGE_KEYSTORE_PASSWORD secret' }
+          .\gradlew.bat :app:testDebugUnitTest :app:assembleRelease --no-daemon
+          Copy-Item -Force app/build/outputs/apk/release/app-release.apk "release/Msg2Computer-Android-$env:APP_VERSION.apk"
+
+      - name: Ensure GitHub release exists
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $notes = @"
+          ## Msg2Computer $env:APP_VERSION
+
+          Automated release assets built by GitHub Actions.
+          "@
+          gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --title "Msg2Computer $env:APP_VERSION" --notes $notes --latest
+          }
+
+      - name: Upload release assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --clobber `
+            "desktop/dist/Msg2Computer-Setup-$env:APP_VERSION.exe#Msg2Computer-Setup-$env:APP_VERSION.exe" `
+            "desktop/dist/Msg2Computer-Setup-$env:APP_VERSION.exe.blockmap#Msg2Computer-Setup-$env:APP_VERSION.exe.blockmap" `
+            "desktop/dist/latest.yml#latest.yml" `
+            "android/release/Msg2Computer-Android-$env:APP_VERSION.apk#Msg2Computer-Android-$env:APP_VERSION.apk"
