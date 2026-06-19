@@ -59,7 +59,7 @@ jobs:
         run: |
           npm ci
           npm test
-          npm run build:win
+          npx electron-builder --win --publish never
 
       - name: Build Android APK
         shell: pwsh
