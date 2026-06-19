@@ -1300,7 +1300,8 @@ class WebSocketService : Service() {
         busEnvelope: JSONObject,
         rememberOutbound: Boolean = true
     ): Boolean {
-        if (device.port <= 0 || device.pairingKey.isBlank()) return false
+        val targetPort = relayHttpPort(device)
+        if (targetPort <= 0 || device.pairingKey.isBlank()) return false
         val hosts = candidateHosts(device)
         if (hosts.isEmpty()) return false
         val messageId = busEnvelope.optString("messageId")
@@ -1311,7 +1312,7 @@ class WebSocketService : Service() {
                 val body = busTransport.toString()
                     .toRequestBody("application/json; charset=utf-8".toMediaType())
                 val request = Request.Builder()
-                    .url("http://${formatHttpHost(host)}:${device.port}/bus/message")
+                    .url("http://${formatHttpHost(host)}:$targetPort/bus/message")
                     .post(body)
                     .build()
                 relayHttpClient.newCall(request).execute().use { response ->
@@ -1340,7 +1341,8 @@ class WebSocketService : Service() {
     }
 
     private fun sendRelayHttp(device: DesktopDevice, payload: String): Boolean {
-        if (device.port <= 0 || device.pairingKey.isBlank()) return false
+        val targetPort = relayHttpPort(device)
+        if (targetPort <= 0 || device.pairingKey.isBlank()) return false
         val hosts = candidateHosts(device)
         if (hosts.isEmpty()) return false
         return try {
@@ -1381,7 +1383,7 @@ class WebSocketService : Service() {
                 try {
                     val body = envelope.toRequestBody("application/json; charset=utf-8".toMediaType())
                     val request = Request.Builder()
-                        .url("http://${formatHttpHost(host)}:${device.port}/relay")
+                        .url("http://${formatHttpHost(host)}:$targetPort/relay")
                         .post(body)
                         .build()
                     relayHttpClient.newCall(request).execute().use { response ->
@@ -1426,6 +1428,14 @@ class WebSocketService : Service() {
 
     private fun isPhoneDevice(device: DesktopDevice): Boolean {
         return device.type.uppercase(Locale.ROOT).contains("PHONE")
+    }
+
+    private fun relayHttpPort(device: DesktopDevice): Int {
+        return if (isPhoneDevice(device)) {
+            device.port.takeIf { it > 0 } ?: LanDiscovery.NODE_RELAY_PORT
+        } else {
+            LanDiscovery.NODE_RELAY_PORT
+        }
     }
 
     private fun targetDevicesForType(type: String): List<DesktopDevice> {

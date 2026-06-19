@@ -2235,6 +2235,8 @@ function buildDiscoveryPayload(type = 'codebridge_discovery_response') {
     host: getLocalIP(),
     port: WS_PORT,
     joinPort: JOIN_PORT,
+    relayPort: JOIN_PORT,
+    tsHost: getTailscaleIPv4(),
     joinPublicKey: exportLanJoinPublicKey(),
     joinFingerprint: getJoinFingerprint(identity),
     capabilities: getNodeCapabilities(),
@@ -2255,6 +2257,7 @@ function normalizeDiscoveredLanDevice(payload, remoteAddress) {
   const host = String(remoteAddress || payload.host || '').trim()
   const port = Number(payload.port || WS_PORT)
   const joinPort = Number(payload.joinPort || payload.relayPort || JOIN_PORT)
+  const tsHost = normalizeNetworkHost(payload.tsHost || '')
   const pairingKeyValue = String(payload.pairingKey || payload.pk || '').trim()
   if (!host || !Number.isFinite(port)) return null
   const isTrusted = authorizedPhones.has(id) || pairedDesktopPeers.has(id) || isKnownTrustedNode(id)
@@ -2265,6 +2268,8 @@ function normalizeDiscoveredLanDevice(payload, remoteAddress) {
     deviceType,
     host,
     port,
+    relayPort: Number.isFinite(joinPort) && joinPort > 0 ? joinPort : JOIN_PORT,
+    tsHost,
     joinPort: Number.isFinite(joinPort) && joinPort > 0 ? joinPort : JOIN_PORT,
     joinPublicKey: String(payload.joinPublicKey || '').trim(),
     joinFingerprint: String(payload.joinFingerprint || '').trim(),
@@ -2279,8 +2284,80 @@ function normalizeDiscoveredLanDevice(payload, remoteAddress) {
   }
 }
 
+function refreshTrustedLanDeviceAddress(device) {
+  if (!device || !device.id) return false
+  const id = String(device.id).trim()
+  const host = normalizeNetworkHost(device.host || '')
+  if (!id || !host) return false
+  const deviceType = normalizeDeviceType(device.deviceType || device.type, 'UNKNOWN_DEVICE')
+  const capabilities = device.capabilities && typeof device.capabilities === 'object'
+    ? device.capabilities
+    : {}
+  const hasCapabilities = Object.keys(capabilities).length > 0
+  const tsHost = normalizeNetworkHost(device.tsHost || '')
+
+  if (authorizedPhones.has(id)) {
+    const previous = authorizedPhones.get(id)
+    const relayPort = Number(device.relayPort || device.joinPort || previous.relayPort || JOIN_PORT) || JOIN_PORT
+    const next = {
+      ...previous,
+      name: String(device.name || previous.name || '').trim() || previous.name,
+      deviceType: deviceType.includes('PHONE') ? deviceType : previous.deviceType,
+      lastIP: host,
+      relayHost: host,
+      relayPort,
+      tsHost: tsHost || previous.tsHost || '',
+      capabilities: hasCapabilities ? capabilities : (previous.capabilities || {})
+    }
+    const changed =
+      String(previous.name || '') !== String(next.name || '') ||
+      String(previous.deviceType || '') !== String(next.deviceType || '') ||
+      String(previous.lastIP || '') !== String(next.lastIP || '') ||
+      String(previous.relayHost || '') !== String(next.relayHost || '') ||
+      Number(previous.relayPort || JOIN_PORT) !== Number(next.relayPort || JOIN_PORT) ||
+      String(previous.tsHost || '') !== String(next.tsHost || '') ||
+      JSON.stringify(previous.capabilities || {}) !== JSON.stringify(next.capabilities || {})
+    if (!changed) return false
+    authorizedPhones.set(id, next)
+    savePairingKey()
+    notifyPhonesChanged()
+    return true
+  }
+
+  if (pairedDesktopPeers.has(id)) {
+    const previous = pairedDesktopPeers.get(id)
+    const port = normalizeTopologyPort(deviceType, device.port || previous.port || WS_PORT)
+    const next = {
+      ...previous,
+      name: String(device.name || previous.name || '').trim() || previous.name,
+      deviceType: deviceType.includes('DESKTOP') ? deviceType : previous.deviceType,
+      host,
+      port,
+      lastIP: host,
+      tsHost: tsHost || previous.tsHost || '',
+      capabilities: hasCapabilities ? capabilities : (previous.capabilities || {})
+    }
+    const changed =
+      String(previous.name || '') !== String(next.name || '') ||
+      String(previous.deviceType || '') !== String(next.deviceType || '') ||
+      String(previous.host || '') !== String(next.host || '') ||
+      String(previous.lastIP || '') !== String(next.lastIP || '') ||
+      Number(previous.port || WS_PORT) !== Number(next.port || WS_PORT) ||
+      String(previous.tsHost || '') !== String(next.tsHost || '') ||
+      JSON.stringify(previous.capabilities || {}) !== JSON.stringify(next.capabilities || {})
+    if (!changed) return false
+    pairedDesktopPeers.set(id, next)
+    savePairingKey()
+    notifyDesktopPeersChanged()
+    return true
+  }
+
+  return false
+}
+
 function rememberDiscoveredLanDevice(device) {
   if (!device || !device.id) return
+  refreshTrustedLanDeviceAddress(device)
   discoveredLanDevices.set(device.id, decorateDiscoveredLanDevice(device))
   if (mainWindow) {
     mainWindow.webContents.send('lan-devices-changed', getDiscoveredLanDevices())

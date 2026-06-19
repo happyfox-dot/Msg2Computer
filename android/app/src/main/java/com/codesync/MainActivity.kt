@@ -160,6 +160,7 @@ class MainActivity : AppCompatActivity() {
         override fun onReceive(context: Context?, intent: Intent?) {
             when (intent?.action) {
                 WebSocketService.CONNECTION_STATE_ACTION -> {
+                    refreshDeviceList()
                     updateConnectionUI(
                         connected = intent.getBooleanExtra("connected", false),
                         connectedCount = intent.getIntExtra("connected_count", 0),
@@ -1607,15 +1608,16 @@ class MainActivity : AppCompatActivity() {
      * 用于配对后验证整条推送链路是否通畅。
      */
     private fun showTestPushDialog() {
-        val enabledCount = DeviceStore.getEnabledDevices(this).size
-        if (enabledCount == 0) {
+        val targets = DeviceStore.getEnabledDevices(this).filter { it.allowSmsCodes }
+        val targetCount = targets.size
+        if (targetCount == 0) {
             Toast.makeText(this, getString(R.string.test_push_no_target), Toast.LENGTH_SHORT).show()
             return
         }
         val code = (100000..999999).random().toString()
         androidx.appcompat.app.AlertDialog.Builder(this)
             .setTitle(getString(R.string.test_push_title))
-            .setMessage(getString(R.string.test_push_message, code, enabledCount))
+            .setMessage(getString(R.string.test_push_message, code, targetCount))
             .setPositiveButton(getString(R.string.test_push_confirm)) { _, _ ->
                 startServiceForAction(WebSocketService.ACTION_SEND_SMS) {
                     putExtra(WebSocketService.EXTRA_CODE, code)
@@ -1623,6 +1625,7 @@ class MainActivity : AppCompatActivity() {
                     putExtra(WebSocketService.EXTRA_MESSAGE_BODY, getString(R.string.test_push_body, code))
                 }
                 Toast.makeText(this, getString(R.string.test_push_sent, code), Toast.LENGTH_LONG).show()
+                refreshConnectionSnapshot()
             }
             .setNegativeButton(android.R.string.cancel, null)
             .show()
@@ -2381,6 +2384,11 @@ class MainActivity : AppCompatActivity() {
                     return@launch
                 }
                 discoveredLanNodes = devices
+                val refreshed = refreshTrustedLanDeviceAddresses(devices)
+                if (refreshed) {
+                    refreshDeviceList()
+                    broadcastTopologyChange("lan_discovery_address_refresh")
+                }
                 rebuildTopologyList()
                 showDiscoveredLanDevices(devices)
             } catch (e: Exception) {
@@ -2394,6 +2402,38 @@ class MainActivity : AppCompatActivity() {
                 binding.btnDiscoverLan.isEnabled = true
             }
         }
+    }
+
+    private fun refreshTrustedLanDeviceAddresses(devices: List<LanDiscoveredDevice>): Boolean {
+        var changed = false
+        devices.forEach { discovered ->
+            val existing = DeviceStore.findDevice(this, discovered.id) ?: return@forEach
+            if (existing.pairingKey.isBlank()) return@forEach
+            val updated = DeviceStore.upsertDevice(
+                context = this,
+                host = discovered.host,
+                port = discovered.port,
+                pairingKey = existing.pairingKey,
+                name = discovered.name.ifBlank { existing.name },
+                deviceId = existing.id,
+                deviceType = discovered.type.ifBlank { existing.type },
+                networkId = existing.networkId,
+                autoPaired = existing.autoPaired,
+                trustSourceId = existing.trustSourceId,
+                trustLevel = existing.trustLevel,
+                acceptedAt = existing.acceptedAt,
+                capabilities = discovered.capabilities.ifBlank { existing.capabilities }
+            )
+            if (updated.host != existing.host ||
+                updated.port != existing.port ||
+                updated.altHosts != existing.altHosts ||
+                updated.capabilities != existing.capabilities
+            ) {
+                TopologyStore.markDeviceState(this, updated, enabled = updated.enabled)
+                changed = true
+            }
+        }
+        return changed
     }
 
     private fun showDiscoveredLanDevices(devices: List<LanDiscoveredDevice>) {
@@ -2532,10 +2572,15 @@ class MainActivity : AppCompatActivity() {
     private fun pairDiscoveredLanDevice(device: LanDiscoveredDevice) {
         val existing = DeviceStore.findDevice(this, device.id)
         if (existing != null && existing.pairingKey.isNotBlank() && existing.enabled) {
-            Toast.makeText(this, "${existing.name} 已是可信节点", Toast.LENGTH_SHORT).show()
+            val refreshed = refreshTrustedLanDeviceAddresses(listOf(device))
             refreshDeviceList()
             rebuildTopologyList()
             refreshConnectionSnapshot()
+            if (refreshed) broadcastTopologyChange("lan_discovery_address_refresh")
+            startServiceForAction(WebSocketService.ACTION_CONNECT) {
+                putExtra(WebSocketService.EXTRA_DEVICE_ID, existing.id)
+            }
+            Toast.makeText(this, "${existing.name} 已是可信节点，已刷新地址并测试连接", Toast.LENGTH_SHORT).show()
             return
         }
         if (device.pairingKey.isBlank() && device.joinPublicKey.isNotBlank()) {
