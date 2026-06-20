@@ -6,6 +6,7 @@ const DEFAULT_SEEN_TTL_MS = 24 * 60 * 60 * 1000
 const DEFAULT_RETRY_BASE_MS = 15 * 1000
 const DEFAULT_RETRY_MAX_MS = 5 * 60 * 1000
 const DEFAULT_MAX_ATTEMPTS = 8
+const DEFAULT_MAX_RECORD_BYTES = 256 * 1024
 
 function nowMs() {
   return Date.now()
@@ -32,6 +33,7 @@ function normalizeRecord(raw = {}) {
   const targetNodeId = String(raw.targetNodeId || '').trim()
   const messageId = String(raw.messageId || envelope?.messageId || '').trim()
   if (!envelope || !targetNodeId || !messageId) return null
+  if (!shouldPersistEnvelope(envelope)) return null
   const attempts = Math.max(0, Number(raw.attempts || 0) || 0)
   return {
     id: outboxKey(messageId, targetNodeId),
@@ -47,6 +49,21 @@ function normalizeRecord(raw = {}) {
     ackedAt: Number(raw.ackedAt || 0) || 0,
     lastError: String(raw.lastError || '')
   }
+}
+
+function shouldPersistEnvelope(envelope = {}) {
+  const topic = String(envelope.topic || '').trim()
+  const payload = envelope.payload && typeof envelope.payload === 'object' ? envelope.payload : {}
+  const manifest = payload.fileManifest && typeof payload.fileManifest === 'object' ? payload.fileManifest : null
+  if (manifest) {
+    if (manifest.inline === true) return false
+    const expiresAt = Number(manifest.expiresAt || 0) || 0
+    if (expiresAt > 0 && expiresAt <= nowMs()) return false
+  } else if (topic === 'clipboard.image' || topic === 'clipboard.file' || topic === 'file.manifest') {
+    return false
+  }
+  const size = Buffer.byteLength(JSON.stringify(envelope || {}), 'utf8')
+  return size > 0 && size <= DEFAULT_MAX_RECORD_BYTES
 }
 
 function createBusReliabilityStore(options = {}) {
@@ -146,6 +163,7 @@ function createBusReliabilityStore(options = {}) {
     const messageId = String(envelope?.messageId || '').trim()
     const targetId = String(targetNodeId || '').trim()
     if (!messageId || !targetId) return null
+    if (!shouldPersistEnvelope(envelope)) return null
     const id = outboxKey(messageId, targetId)
     const existing = outbox.get(id)
     if (existing && existing.status !== 'acked') return existing

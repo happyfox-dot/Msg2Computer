@@ -92,6 +92,31 @@ function hashFile(absPath) {
   })
 }
 
+function sha256Buffer(buffer) {
+  return crypto.createHash('sha256').update(buffer).digest('hex')
+}
+
+function hashFileBlocks(absPath, chunkSize) {
+  return new Promise((resolve, reject) => {
+    const hashes = []
+    let pending = Buffer.alloc(0)
+    const stream = fs.createReadStream(absPath, { highWaterMark: chunkSize })
+    stream.on('data', chunk => {
+      pending = pending.length === 0 ? chunk : Buffer.concat([pending, chunk])
+      while (pending.length >= chunkSize) {
+        const block = pending.subarray(0, chunkSize)
+        hashes.push(sha256Buffer(block))
+        pending = pending.subarray(chunkSize)
+      }
+    })
+    stream.on('end', () => {
+      if (pending.length > 0) hashes.push(sha256Buffer(pending))
+      resolve(hashes)
+    })
+    stream.on('error', reject)
+  })
+}
+
 // 读源文件 [from, to]（含端点）一段，返回 Buffer
 function readFileRange(absPath, from, to) {
   return new Promise((resolve, reject) => {
@@ -240,13 +265,16 @@ function createFileTransfer(deps = {}) {
       onError({ phase: 'offer', error: '不是有效文件或文件为空' })
       return null
     }
-    const { sha256, size } = await hashFile(absPath)
+    const chunkSize = maxChunkBytes
+    const [{ sha256, size }, blockHashes] = await Promise.all([
+      hashFile(absPath),
+      hashFileBlocks(absPath, chunkSize)
+    ])
     const ts = Date.now()
     const shortHash = sha256.slice(0, 24)
     const fileId = `file-${identity.id}-${ts}-${shortHash}`
     const name = path.basename(absPath)
     const mime = guessMime(name)
-    const chunkSize = maxChunkBytes
     const chunkEncodings = options.allowPlainChunks === false ? ['aes-gcm'] : ['none', 'aes-gcm']
     const blockCount = Math.ceil(size / chunkSize)
     const expiresAt = ts + offerTtlMs
@@ -282,6 +310,7 @@ function createFileTransfer(deps = {}) {
       chunkSize,
       blockSize: chunkSize,
       blockCount,
+      blockHashes,
       transferProtocol: 'codebridge-block-v1',
       resumeSupported: true,
       originDeviceId: identity.id,
@@ -525,21 +554,39 @@ function createFileTransfer(deps = {}) {
       const pendingBlocks = blocks.filter(block => !completedBlocks.has(block.index))
       let nextPendingIndex = 0
       const parallelism = Math.max(1, Math.min(4, Number(options.parallelism || maxParallelPulls) || 1))
+      const blockHashes = Array.isArray(manifest.blockHashes) ? manifest.blockHashes : []
       const worker = async () => {
         while (record.active) {
           const block = pendingBlocks[nextPendingIndex++]
           if (!block) return
           const offset = block.from
           const to = block.to
-          const resp = await fetchChunk(offset, to)
-          if (!resp) {
-            throw new Error(`chunk pull failed: all transports unreachable @${offset}`)
+          let plain = null
+          let lastChunkError = ''
+          for (let attempt = 0; attempt < 3; attempt++) {
+            const resp = await fetchChunk(offset, to)
+            if (!resp) {
+              lastChunkError = `chunk pull failed: all transports unreachable @${offset}`
+              continue
+            }
+            const candidate = usePlainChunks ? resp.body : decryptBytes(resp.body, source.pairingKey)
+            if (!candidate) {
+              lastChunkError = `chunk decrypt failed @${offset}`
+              continue
+            }
+            if (candidate.length !== block.length) {
+              lastChunkError = `chunk length mismatch expected=${block.length} got=${candidate.length} @${offset}`
+              continue
+            }
+            const expectedHash = String(blockHashes[block.index] || '').toLowerCase()
+            if (expectedHash && !timingSafeStrEqual(sha256Buffer(candidate), expectedHash)) {
+              lastChunkError = `chunk hash mismatch @${offset}`
+              continue
+            }
+            plain = candidate
+            break
           }
-          const plain = usePlainChunks ? resp.body : decryptBytes(resp.body, source.pairingKey)
-          if (!plain) throw new Error(`chunk decrypt failed @${offset}`)
-          if (plain.length !== block.length) {
-            throw new Error(`chunk length mismatch expected=${block.length} got=${plain.length} @${offset}`)
-          }
+          if (!plain) throw new Error(lastChunkError || `chunk pull failed @${offset}`)
           fs.writeSync(fd, plain, 0, plain.length, offset)
           completedBlocks.add(block.index)
           record.received = completedBytes()
@@ -553,24 +600,6 @@ function createFileTransfer(deps = {}) {
       ))
       if (completedBlocks.size !== blocks.length) {
         throw new Error(`incomplete transfer blocks=${completedBlocks.size}/${blocks.length}`)
-      }
-      while (false) {
-        const to = Math.min(offset + chunkSize - 1, size - 1)
-        const resp = await fetchChunk(offset, to)
-        if (!resp) {
-          throw new Error(`分片拉取失败（所有通道均不可达）@${offset}`)
-        }
-        const plain = usePlainChunks ? resp.body : decryptBytes(resp.body, source.pairingKey)
-        if (!plain) throw new Error(`分片解密失败 @${offset}`)
-        const expectedLen = to - offset + 1
-        if (plain.length !== expectedLen) {
-          throw new Error(`分片长度不符 expected=${expectedLen} got=${plain.length} @${offset}`)
-        }
-        fs.writeSync(fd, plain, 0, plain.length, offset)
-        record.hash.update(plain)
-        record.received = offset + plain.length
-        offset = record.received
-        onProgress({ fileId, name, received: record.received, size })
       }
     } catch (e) {
       try { fs.closeSync(fd) } catch (_) {}

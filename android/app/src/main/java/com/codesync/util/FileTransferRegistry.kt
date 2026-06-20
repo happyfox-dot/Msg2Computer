@@ -54,6 +54,7 @@ object FileTransferRegistry {
         require(file.isFile && file.length() > 0L) { "invalid_file" }
         val now = System.currentTimeMillis()
         val sha256 = sha256File(file)
+        val blockHashes = sha256Blocks(file, CHUNK_BYTES)
         val fileId = "file-${identity.id}-$now-${sha256.take(24)}"
         val targets = targetDeviceIds.map { it.trim() }.filter { it.isNotBlank() }.toSet()
         val chunkEncodings = setOf("none", "aes-gcm")
@@ -78,6 +79,7 @@ object FileTransferRegistry {
             .put("chunkSize", record.chunkSize)
             .put("blockSize", record.chunkSize)
             .put("blockCount", ((record.size + record.chunkSize - 1) / record.chunkSize).toInt())
+            .put("blockHashes", JSONArray(blockHashes))
             .put("transferProtocol", "codebridge-block-v1")
             .put("resumeSupported", true)
             .put("chunkEncodings", JSONArray(chunkEncodings.toList()))
@@ -199,6 +201,27 @@ object FileTransferRegistry {
             }
         }
         return digest.digest().joinToString("") { "%02x".format(it) }
+    }
+
+    private fun sha256Blocks(file: File, chunkSize: Int): List<String> {
+        val result = mutableListOf<String>()
+        file.inputStream().use { input ->
+            val buffer = ByteArray(chunkSize)
+            while (true) {
+                var offset = 0
+                while (offset < buffer.size) {
+                    val read = input.read(buffer, offset, buffer.size - offset)
+                    if (read <= 0) break
+                    offset += read
+                }
+                if (offset <= 0) break
+                val digest = MessageDigest.getInstance("SHA-256")
+                digest.update(buffer, 0, offset)
+                result.add(digest.digest().joinToString("") { "%02x".format(it) })
+                if (offset < buffer.size) break
+            }
+        }
+        return result
     }
 
     private fun sanitizeFileName(name: String): String {

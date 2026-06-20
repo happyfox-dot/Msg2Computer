@@ -2,8 +2,10 @@
 
 const test = require('node:test')
 const assert = require('node:assert/strict')
+const http = require('node:http')
 
 const busEnvelope = require('../src/main/bus-envelope')
+const relayClient = require('../src/main/relay-client')
 const {
   buildPeerRoutes,
   chooseBestRoute,
@@ -102,4 +104,20 @@ test('bus reliability store deduplicates inbound messages and retries pending ou
   assert.equal(store.size().outbox, 0)
   store.flushSave()
   assert.equal(saved.version, 1)
+})
+
+test('relay HTTP client treats rejected bus ack as delivery failure', async () => {
+  const server = http.createServer((req, res) => {
+    req.resume()
+    res.writeHead(202, { 'Content-Type': 'application/json; charset=utf-8' })
+    res.end(JSON.stringify({ type: 'bus_ack', accepted: false, reason: 'policy_denied' }))
+  })
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+  try {
+    const { port } = server.address()
+    const ok = await relayClient.postJsonToNode('127.0.0.1', port, { hello: 'bus' }, { path: '/bus/message' })
+    assert.equal(ok, false)
+  } finally {
+    await new Promise(resolve => server.close(resolve))
+  }
 })

@@ -150,14 +150,21 @@ object ContentBus {
         val encryptedPayload = transport.optString("payload").trim()
         val authToken = transport.optString("authToken").trim()
         if (senderId.isBlank() || nonce.isBlank() || encryptedPayload.isBlank() || authToken.isBlank()) return null
-        val peerKey = peerKeyResolver(senderId)?.takeIf { it.isNotBlank() } ?: identity.pairingKey
         val sentAt = transport.optLong("sentAt", 0L)
         if (sentAt <= 0L || kotlin.math.abs(System.currentTimeMillis() - sentAt) > BUS_REPLAY_WINDOW_MS) return null
-        val expected = CryptoUtil.hmacSha256Base64(peerKey, "$senderId|$nonce|$sentAt|$encryptedPayload")
-        if (!MessageDigest.isEqual(expected.toByteArray(), authToken.toByteArray())) return null
-        if (isReplayedBusNonce(senderId, nonce)) return null
-        val envelope = JSONObject(CryptoUtil.decrypt(encryptedPayload, peerKey))
-        return if (isEnvelope(envelope)) senderId to envelope else null
+        val peerKeys = listOf(identity.pairingKey, peerKeyResolver(senderId).orEmpty())
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .distinct()
+        for (peerKey in peerKeys) {
+            val expected = CryptoUtil.hmacSha256Base64(peerKey, "$senderId|$nonce|$sentAt|$encryptedPayload")
+            if (!MessageDigest.isEqual(expected.toByteArray(), authToken.toByteArray())) continue
+            if (isReplayedBusNonce(senderId, nonce)) return null
+            val envelope = runCatching { JSONObject(CryptoUtil.decrypt(encryptedPayload, peerKey)) }.getOrNull()
+                ?: return null
+            return if (isEnvelope(envelope)) senderId to envelope else null
+        }
+        return null
     }
 
     private fun isReplayedBusNonce(senderId: String, nonce: String): Boolean {

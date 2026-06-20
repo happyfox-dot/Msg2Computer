@@ -470,6 +470,7 @@
 .topology-directed-node.status-disabled,
 .topology-directed-node.status-revoked,
 .topology-directed-node.status-offline,
+.topology-directed-node.status-known,
 .topology-directed-node.status-discovered {
   opacity: 0.62;
 }
@@ -595,6 +596,11 @@
 .topology-node.status-reachable .topology-node-dot {
   background: #60a5fa;
   box-shadow: 0 0 8px rgba(96, 165, 250, 0.28);
+}
+
+.topology-directed-node.status-known .topology-node-dot,
+.topology-node.status-known .topology-node-dot {
+  background: #e0b060;
 }
 
 .topology-directed-node.status-disabled .topology-node-dot,

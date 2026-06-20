@@ -1316,7 +1316,7 @@ class WebSocketService : Service() {
                     .post(body)
                     .build()
                 relayHttpClient.newCall(request).execute().use { response ->
-                    if (response.isSuccessful) {
+                    if (isAcceptedBusAck(response)) {
                         BusReliabilityStore.markDelivered(this, messageId, device.id)
                         return true
                     }
@@ -1327,6 +1327,14 @@ class WebSocketService : Service() {
         }
         BusReliabilityStore.markFailed(this, messageId, device.id, "bus_http_unreachable")
         return false
+    }
+
+    private fun isAcceptedBusAck(response: Response): Boolean {
+        if (!response.isSuccessful) return false
+        val text = runCatching { response.body?.string().orEmpty() }.getOrDefault("")
+        if (text.isBlank()) return true
+        val ack = runCatching { JSONObject(text) }.getOrNull() ?: return true
+        return ack.optString("type") != "bus_ack" || ack.optBoolean("accepted", true)
     }
 
     private fun flushBusOutbox() {

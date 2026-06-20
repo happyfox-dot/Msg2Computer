@@ -1326,6 +1326,8 @@ class NodeReceiverService : Service() {
             Log.w(TAG, "文件拉取失败：源不可直达且没有可用代理节点")
             return null
         }
+        val blockHashes = jsonArrayToList(manifest.optJSONArray("blockHashes"))
+            .map { it.lowercase(Locale.ROOT) }
         val routeFailures = java.util.concurrent.ConcurrentHashMap<String, Int>()
         fun orderedRoutes(): List<Pair<String, String>> =
             routes.sortedWith(
@@ -1384,6 +1386,16 @@ class NodeReceiverService : Service() {
                     val expectedLen = block.length.toInt()
                     if (plain.size != expectedLen) {
                         lastError = "$label:chunk_length_mismatch expected=$expectedLen got=${plain.size}"
+                        markRouteFailure(label)
+                        continue
+                    }
+                    val expectedBlockHash = blockHashes.getOrNull(block.index).orEmpty()
+                    if (expectedBlockHash.isNotBlank() && !MessageDigest.isEqual(
+                            expectedBlockHash.toByteArray(Charsets.UTF_8),
+                            sha256Hex(plain).toByteArray(Charsets.UTF_8)
+                        )
+                    ) {
+                        lastError = "$label:chunk_hash_mismatch index=${block.index}"
                         markRouteFailure(label)
                         continue
                     }

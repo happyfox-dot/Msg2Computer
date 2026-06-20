@@ -1621,8 +1621,8 @@ function renderTopologyLegend() {
     <div class="topology-legend">
       ${items}
       <span class="topology-legend-item"><i class="topology-legend-swatch legend-active"></i>实线 = 在线连接</span>
-      <span class="topology-legend-item"><i class="topology-legend-swatch legend-partial"></i>点线 = 部分在线</span>
-      <span class="topology-legend-item"><i class="topology-legend-swatch legend-idle"></i>虚线 = 可路由 / 离线 / 历史</span>
+      <span class="topology-legend-item"><i class="topology-legend-swatch legend-partial"></i>点线 = 近期可达</span>
+      <span class="topology-legend-item"><i class="topology-legend-swatch legend-idle"></i>虚线 = 已知 / 离线 / 历史</span>
     </div>
   `
 }
@@ -2039,7 +2039,8 @@ function getTopologyStatusSortRank(status) {
   return ({
     online: 5,
     reachable: 4,
-    synced: 3,
+    known: 3,
+    synced: 2,
     discovered: 2,
     offline: 1,
     disabled: 0,
@@ -2053,7 +2054,8 @@ function getTopologyStatusRank(status) {
     disabled: 6,
     online: 5,
     reachable: 4,
-    synced: 3,
+    known: 3,
+    synced: 2,
     discovered: 2,
     offline: 1
   }[status] || 0)
@@ -2062,7 +2064,8 @@ function getTopologyStatusRank(status) {
 function getTopologyStatusLabel(status) {
   return {
     online: '在线',
-    reachable: '可路由',
+    reachable: '近期可达',
+    known: '已知节点',
     offline: '离线',
     disabled: '已禁用',
     revoked: '已撤销',
@@ -2074,7 +2077,8 @@ function getTopologyStatusLabel(status) {
 function getTopologyNodeStatusLabel(node) {
   if (!node) return '未知'
   if (node.status === 'online') return '在线'
-  if (node.status === 'reachable') return node.lastSeen ? `可路由 · 上次同步 ${formatRelativeTime(node.lastSeen)}` : '可路由 · 未在线'
+  if (node.status === 'reachable') return node.lastSeen ? `近期可达 · 上次同步 ${formatRelativeTime(node.lastSeen)}` : '近期可达'
+  if (node.status === 'known') return node.lastSeen ? `已知节点 · 上次同步 ${formatRelativeTime(node.lastSeen)}` : '已知节点 · 当前未验证'
   if (node.status === 'disabled') return '已禁用'
   if (node.status === 'revoked') return '已撤销'
   if (node.status === 'discovered') return '已发现 · 未配对'

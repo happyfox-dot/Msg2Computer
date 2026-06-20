@@ -18,11 +18,6 @@ object BusReliabilityStore {
     private const val RETRY_BASE_MS = 15 * 1000L
     private const val RETRY_MAX_MS = 5 * 60 * 1000L
     private const val MAX_ATTEMPTS = 4
-    private val NON_PERSISTENT_TOPICS = setOf(
-        ContentBus.Topic.CLIPBOARD_IMAGE,
-        ContentBus.Topic.CLIPBOARD_FILE,
-        ContentBus.Topic.FILE_MANIFEST
-    )
 
     fun rememberInbound(context: Context, envelope: JSONObject): Boolean {
         val key = envelopeKey(envelope)
@@ -197,8 +192,20 @@ object BusReliabilityStore {
     }
 
     private fun shouldPersistOutbound(envelope: JSONObject): Boolean {
-        if (envelope.optString("topic") in NON_PERSISTENT_TOPICS) return false
-        if (envelope.optJSONObject("payload")?.has("fileManifest") == true) return false
+        val topic = envelope.optString("topic")
+        val payload = envelope.optJSONObject("payload")
+        val manifest = payload?.optJSONObject("fileManifest")
+        if (manifest != null) {
+            if (manifest.optBoolean("inline", false)) return false
+            val expiresAt = manifest.optLong("expiresAt", 0L)
+            if (expiresAt > 0L && expiresAt <= System.currentTimeMillis()) return false
+        } else if (
+            topic == ContentBus.Topic.CLIPBOARD_IMAGE ||
+            topic == ContentBus.Topic.CLIPBOARD_FILE ||
+            topic == ContentBus.Topic.FILE_MANIFEST
+        ) {
+            return false
+        }
         val size = runCatching { envelope.toString().toByteArray(Charsets.UTF_8).size }
             .getOrDefault(MAX_RECORD_BYTES + 1)
         return size in 1..MAX_RECORD_BYTES

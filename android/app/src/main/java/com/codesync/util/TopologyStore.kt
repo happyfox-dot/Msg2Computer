@@ -256,7 +256,9 @@ object TopologyStore {
                 .put("authority", "device_store")
                 .put("seq", stateUpdatedAt)
                 .put("updatedAt", stateUpdatedAt)
-                .put("lastSeen", device.lastSyncAt.takeIf { it > 0L } ?: device.updatedAt)
+                .put("lastSeen", device.lastSyncAt.takeIf { it > 0L }
+                    ?: device.connectionUpdatedAt.takeIf { it > 0L }
+                    ?: 0L)
                 .put("expiresAt", now + ENTRY_TTL_MS)
 
             val linkType = if (isPhone) "relay_route" else "verify_push"
@@ -524,7 +526,9 @@ object TopologyStore {
             .put("authority", "local_device_store")
             .put("seq", now)
             .put("updatedAt", now)
-            .put("lastSeen", device.lastSyncAt.takeIf { it > 0L } ?: now)
+            .put("lastSeen", device.lastSyncAt.takeIf { it > 0L }
+                ?: device.connectionUpdatedAt.takeIf { it > 0L }
+                ?: 0L)
             .put("expiresAt", now + ENTRY_TTL_MS)
 
         val linkType = if (isPhone) "relay_route" else "verify_push"
@@ -611,6 +615,11 @@ object TopologyStore {
         val host = raw.optString("host", raw.optString("lastIP")).trim()
         val now = System.currentTimeMillis()
         val updatedAt = raw.optLong("updatedAt", raw.optLong("lastSeen", now)).takeIf { it > 0L } ?: now
+        val lastSeen = if (raw.has("lastSeen")) {
+            raw.optLong("lastSeen", 0L).takeIf { it > 0L } ?: 0L
+        } else {
+            0L
+        }
         return JSONObject(raw.toString())
             .put("id", id)
             .put("name", raw.optString("name", raw.optString("deviceName", id)).ifBlank { id })
@@ -634,7 +643,7 @@ object TopologyStore {
             ))
             .put("seq", raw.optLong("seq", updatedAt))
             .put("updatedAt", updatedAt)
-            .put("lastSeen", raw.optLong("lastSeen", updatedAt))
+            .put("lastSeen", lastSeen)
             .put("expiresAt", raw.optLong("expiresAt", updatedAt + ENTRY_TTL_MS))
     }
 

@@ -124,6 +124,7 @@ const TOTP_DELETE_TOMBSTONE_TTL_MS = 180 * 24 * 60 * 60 * 1000
 const TOTP_DELETE_TOMBSTONE_LIMIT = 300
 const ROUTING_PROTOCOL_VERSION = 2
 const ROUTE_STALE_MS = 10 * 60 * 1000
+const TOPOLOGY_RECENT_REACHABLE_MS = 2 * 60 * 1000
 const TOPOLOGY_DELTA_TTL = 4
 const TOPOLOGY_DELTA_BACKLOG_LIMIT = 80
 // 用户消息（短信/通知/剪贴板/TOTP 种子）的多跳续传 TTL，与安卓端 SMS_RELAY_TTL 一致。
@@ -1119,6 +1120,10 @@ function normalizeLsdbNode(raw = {}) {
     (Array.isArray(raw.routePath) && raw.routePath.length > 1)
   const now = Date.now()
   const updatedAt = normalizeLsdbSeq(raw.updatedAt || raw.lastSeen, now)
+  const rawLastSeen = Number(raw.lastSeen || 0)
+  const lastSeen = Number.isFinite(rawLastSeen) && rawLastSeen > 0
+    ? normalizeLsdbSeq(rawLastSeen, 0)
+    : 0
   return {
     id,
     name: String(raw.name || raw.deviceName || id).trim(),
@@ -1148,7 +1153,7 @@ function normalizeLsdbNode(raw = {}) {
     sourceId: String(raw.sourceId || raw.originDeviceId || raw.sourceDeviceId || '').trim(),
     seq: normalizeLsdbSeq(raw.seq || raw.updatedAt, updatedAt),
     updatedAt,
-    lastSeen: normalizeLsdbSeq(raw.lastSeen || raw.updatedAt, updatedAt),
+    lastSeen,
     expiresAt: Number(raw.expiresAt) || (updatedAt + TOPOLOGY_ENTRY_TTL_MS)
   }
 }
@@ -1644,7 +1649,7 @@ function loadOrCreatePairingKey() {
           enabled: phone.enabled !== false,
           revoked: phone.revoked === true,
           firstSeen: phone.firstSeen || Date.now(),
-          lastSeen: phone.lastSeen || Date.now(),
+          lastSeen: Number(phone.lastSeen || 0) || 0,
           lastIP: normalizeNetworkHost(phone.lastIP),
           relayPort: Number(phone.relayPort) || 19529,
           pairingKey: unprotectSecret(phone.pairingKey || phone.pk || ''),
@@ -2982,7 +2987,7 @@ async function handleLanJoinRequest(body, remoteAddress = '') {
 }
 
 function handleBusMessageRequest(body, remoteAddress = '') {
-  const parsed = parseBusTransportEnvelope(body, senderId => lookupPeerPairingKey(senderId) || pairingKey)
+  const parsed = parseBusTransportEnvelope(body, senderId => [pairingKey, lookupPeerPairingKey(senderId)])
   if (!parsed) {
     return { status: 403, body: { type: 'bus_ack', accepted: false, reason: 'invalid_bus_envelope' } }
   }
@@ -3004,6 +3009,43 @@ function handleBusMessageRequest(body, remoteAddress = '') {
   }
 }
 
+function handleLegacyRelayRequest(body, remoteAddress = '') {
+  if (!body || body.type !== 'codebridge_relay') {
+    return { status: 400, body: { ok: false, error: 'invalid_relay_envelope' } }
+  }
+  const senderId = String(body.senderId || '').trim()
+  const nonce = String(body.nonce || '').trim()
+  const encryptedPayload = String(body.payload || '').trim()
+  const authToken = String(body.authToken || '').trim()
+  if (!senderId || !nonce || !encryptedPayload || !authToken) {
+    return { status: 400, body: { ok: false, error: 'missing_relay_fields' } }
+  }
+  if (!isKnownTrustedNode(senderId)) {
+    return { status: 403, body: { ok: false, error: 'untrusted_sender' } }
+  }
+  const keys = Array.from(new Set([pairingKey, lookupPeerPairingKey(senderId)]
+    .map(key => String(key || '').trim())
+    .filter(Boolean)))
+  for (const key of keys) {
+    const expected = hmacBase64(key, `${senderId}|${nonce}|${encryptedPayload}`)
+    if (!timingSafeEqual(expected, authToken)) continue
+    if (isReplayedBusNonce(senderId, `relay:${nonce}`)) {
+      return { status: 202, body: { ok: true, duplicate: true } }
+    }
+    const plain = decryptMessage(encryptedPayload, key)
+    if (!plain) return { status: 403, body: { ok: false, error: 'decrypt_failed' } }
+    const payload = runCatchingJson(plain)
+    if (!payload) return { status: 400, body: { ok: false, error: 'invalid_relay_payload' } }
+    const sentAt = Number(payload.relaySentAt || 0)
+    if (sentAt > 0 && Math.abs(Date.now() - sentAt) > BUS_REPLAY_WINDOW_MS) {
+      return { status: 202, body: { ok: true, stale: true } }
+    }
+    dispatchInboundCodeData(payload, senderId)
+    return { status: 200, body: { ok: true, remoteAddress } }
+  }
+  return { status: 403, body: { ok: false, error: 'relay_auth_failed' } }
+}
+
 function startLanJoinServer() {
   if (lanJoinServer) return
   lanJoinServer = http.createServer(async (req, res) => {
@@ -3021,6 +3063,13 @@ function startLanJoinServer() {
         const raw = await readHttpRequestBody(req)
         const body = raw ? JSON.parse(raw) : {}
         const result = handleBusMessageRequest(body, req.socket?.remoteAddress || '')
+        sendJsonResponse(res, result.status || 200, result.body || {})
+        return
+      }
+      if (req.method === 'POST' && parsedUrl.pathname === '/relay') {
+        const raw = await readHttpRequestBody(req)
+        const body = raw ? JSON.parse(raw) : {}
+        const result = handleLegacyRelayRequest(body, req.socket?.remoteAddress || '')
         sendJsonResponse(res, result.status || 200, result.body || {})
         return
       }
@@ -3514,7 +3563,7 @@ function syncLocalTopologyIntoLsdb(reason = 'local_state') {
       sourceId: identity.id,
       seq: phoneSeq,
       updatedAt: phoneStateAt,
-      lastSeen: phone.lastSeen || now
+      lastSeen: phone.lastSeen || phone.connectionUpdatedAt || 0
     })
     const edgeEnabled = phone.enabled !== false && phone.revoked !== true && !!phone.pairingKey && !!phone.lastIP
     upsertTopologyLsdbLink({
@@ -3567,7 +3616,7 @@ function syncLocalTopologyIntoLsdb(reason = 'local_state') {
         label: '节点直连 relay',
         direction: 'peer',
         enabled: true,
-        active: from.connected === true || to.connected === true,
+        active: from.connected === true && to.connected === true,
         routable: true,
         authority: 'source_device',
         seq: normalizeLsdbSeq(updatedAt, now),
@@ -3612,7 +3661,7 @@ function syncLocalTopologyIntoLsdb(reason = 'local_state') {
       sourceId: identity.id,
       seq: peerSeq,
       updatedAt: peerStateAt,
-      lastSeen: peer.lastSeen || now
+      lastSeen: peer.lastSeen || peer.connectionUpdatedAt || 0
     })
     for (const [from, to, direction] of [
       [identity.id, peer.id, 'outbound'],
@@ -4073,19 +4122,27 @@ function parseBusTransportEnvelope(body, peerKeyOrLookup) {
   const payload = String(body.payload || '').trim()
   const authToken = String(body.authToken || '').trim()
   if (!senderId || !nonce || !payload || !authToken) return null
-  const peerKey = typeof peerKeyOrLookup === 'function'
+  const rawKeys = typeof peerKeyOrLookup === 'function'
     ? peerKeyOrLookup(senderId)
     : peerKeyOrLookup
-  if (!peerKey) return null
+  const peerKeys = Array.from(new Set(
+    (Array.isArray(rawKeys) ? rawKeys : [rawKeys])
+      .map(key => String(key || '').trim())
+      .filter(Boolean)
+  ))
+  if (peerKeys.length === 0) return null
   const sentAt = Number(body.sentAt || 0)
   if (!Number.isFinite(sentAt) || sentAt <= 0 || Math.abs(Date.now() - sentAt) > BUS_REPLAY_WINDOW_MS) return null
-  const expected = hmacBase64(peerKey, `${senderId}|${nonce}|${sentAt}|${payload}`)
-  if (!timingSafeEqual(expected, authToken)) return null
-  if (isReplayedBusNonce(senderId, nonce)) return null
-  const plain = decryptMessage(payload, peerKey)
-  if (!plain) return null
-  const envelope = JSON.parse(plain)
-  return busEnvelope.isEnvelope(envelope) ? { senderId, envelope } : null
+  for (const peerKey of peerKeys) {
+    const expected = hmacBase64(peerKey, `${senderId}|${nonce}|${sentAt}|${payload}`)
+    if (!timingSafeEqual(expected, authToken)) continue
+    if (isReplayedBusNonce(senderId, nonce)) return null
+    const plain = decryptMessage(payload, peerKey)
+    if (!plain) return null
+    const envelope = runCatchingJson(plain)
+    return busEnvelope.isEnvelope(envelope) ? { senderId, envelope } : null
+  }
+  return null
 }
 
 function timingSafeEqual(a, b) {
@@ -4237,6 +4294,21 @@ function broadcastTopologyToAllPeers(reason = 'broadcast', options = {}) {
   for (const [peerId, ws] of activeDesktopPeerConnections.entries()) {
     if (peerId === excludeNodeId) continue
     sendEncryptedControlMessage(ws, ws.__codebridgeSessionKey, 'topology_delta', delta)
+  }
+
+  const topologyEnvelope = busEnvelope.fromLegacyPayload(delta, {
+    identity,
+    networkId: ensureTrustedNetworkId()
+  })
+  for (const peer of getPairedDesktopPeers()) {
+    const peerId = String(peer.id || '').trim()
+    if (!peerId || peerId === excludeNodeId || peer.enabled === false || !peer.pairingKey) continue
+    const active = activeDesktopPeerConnections.get(peerId)
+    if (active && active.readyState === WebSocket.OPEN) continue
+    if (!hasDirectNodeAddress(peer)) continue
+    sendBusEnvelopeDirect(peer, topologyEnvelope).catch(error => {
+      console.error(`拓扑 direct bus 到桌面对端失败 ${peer.name || peerId}:`, error.message)
+    })
   }
 
   for (const phone of getAuthorizedPhones()) {
@@ -6448,7 +6520,7 @@ function getDeviceStatusLabel(status) {
   return {
     online: '在线',
     reachable: '可路由',
-    known: '已知',
+    known: '已知节点',
     offline: '离线',
     disabled: '已禁用',
     revoked: '已撤销',
@@ -6457,12 +6529,48 @@ function getDeviceStatusLabel(status) {
   }[status] || '未知'
 }
 
-function getPhoneTopologyStatus(phone) {
-  if (phone.revoked) return 'revoked'
-  if (phone.enabled === false) return 'disabled'
-  if (phone.connected) return 'online'
-  if (phone.pairingKey && phone.lastIP) return 'reachable'
+function isRecentTopologyTimestamp(value, windowMs = TOPOLOGY_RECENT_REACHABLE_MS) {
+  const timestamp = Number(value || 0)
+  return Number.isFinite(timestamp) && timestamp > 0 && Date.now() - timestamp <= windowMs
+}
+
+function getTopologyFreshnessAt(node = {}) {
+  return Math.max(
+    Number(node.connectionUpdatedAt || 0) || 0,
+    Number(node.lastSeen || 0) || 0,
+    Number(node.routeUpdatedAt || 0) || 0
+  )
+}
+
+function hasTopologyPathCandidate(node = {}) {
+  return hasDirectNodeAddress(node) ||
+    node.routable === true ||
+    !!String(node.routeNextHopId || '').trim() ||
+    Number(node.routeMetric || 0) > 0 ||
+    (Array.isArray(node.routePath) && node.routePath.length > 1)
+}
+
+function getLayeredTopologyStatus(node = {}, options = {}) {
+  if (node.revoked === true) return 'revoked'
+  if (node.enabled === false) return 'disabled'
+  const id = String(node.id || node.phoneId || '').trim()
+  const connected = Object.prototype.hasOwnProperty.call(options, 'connected')
+    ? options.connected === true
+    : (node.connected === true || hasActiveWsForNode(id))
+  if (connected) return 'online'
+  const trusted = options.trusted === true || !!node.pairingKey || !!lookupPeerPairingKey(id)
+  const hasPath = options.hasPath === true || hasTopologyPathCandidate(node)
+  if (trusted && hasPath && isRecentTopologyTimestamp(getTopologyFreshnessAt(node), options.recentMs)) {
+    return 'reachable'
+  }
+  if (trusted && hasPath) return 'known'
   return 'offline'
+}
+
+function getPhoneTopologyStatus(phone) {
+  return getLayeredTopologyStatus(phone, {
+    connected: phone.connected === true || hasActiveWsForNode(phone.id)
+  })
 }
 
 function normalizeTopologyDevice(device, fallback = {}) {
@@ -6482,6 +6590,19 @@ function normalizeTopologyDevice(device, fallback = {}) {
   }
 }
 
+function getTopologyStatusPriority(status) {
+  return {
+    revoked: 7,
+    disabled: 6,
+    online: 5,
+    reachable: 4,
+    known: 3,
+    synced: 2,
+    discovered: 1,
+    offline: 0
+  }[status] ?? 0
+}
+
 function mergeTopologyNode(nodes, node) {
   if (!node || !node.id) return
   const existing = nodes.get(node.id)
@@ -6495,7 +6616,9 @@ function mergeTopologyNode(nodes, node) {
     name: node.name || existing.name,
     type: node.type || existing.type,
     role: existing.role === 'local_desktop' ? existing.role : (node.role || existing.role),
-    status: existing.status === 'online' ? existing.status : (node.status || existing.status)
+    status: getTopologyStatusPriority(existing.status) >= getTopologyStatusPriority(node.status)
+      ? existing.status
+      : (node.status || existing.status)
   })
 }
 
@@ -6587,12 +6710,8 @@ function getTopologySnapshot() {
 
   for (const node of topologyLsdb.nodes.values()) {
     if (!node.id) continue
-    const lsdbConnected = node.id === identity.id || node.connected === true
-    const lsdbStatus = lsdbConnected
-      ? 'online'
-      : (node.enabled === false
-          ? 'disabled'
-          : (node.routable === true && (node.host || node.lastIP) ? 'reachable' : (node.status || 'offline')))
+    const lsdbConnected = node.id === identity.id || hasActiveWsForNode(node.id)
+    const lsdbStatus = getLayeredTopologyStatus(node, { connected: lsdbConnected })
     mergeTopologyNode(nodes, {
       ...node,
       deviceType: node.type,
@@ -6695,9 +6814,9 @@ function getTopologySnapshot() {
   }
 
   desktopPeers.forEach(peer => {
-    const status = peer.connected
-      ? 'online'
-      : (peer.enabled === false ? 'disabled' : ((peer.host || peer.lastIP) && peer.pairingKey ? 'reachable' : 'offline'))
+    const status = getLayeredTopologyStatus(peer, {
+      connected: peer.connected === true || hasActiveWsForNode(peer.id)
+    })
     mergeTopologyNode(nodes, {
       id: peer.id,
       name: peer.name,
@@ -8259,29 +8378,14 @@ function getFileTransferTargetStatus(node = {}, snapshotNode = null, route = nul
   if (node.enabled === false) return 'disabled'
   if (node.revoked === true) return 'revoked'
   const id = String(node.id || node.phoneId || '').trim()
-  const nodeStatus = String(node.status || '').toLowerCase()
-  const snapshotStatus = String(snapshotNode?.status || '').toLowerCase()
-  if (
-    node.connected === true ||
-    hasActiveWsForNode(id) ||
-    nodeStatus === 'online' ||
-    snapshotStatus === 'online' ||
-    route?.active === true
-  ) {
-    return 'online'
-  }
-  if (
-    nodeStatus === 'reachable' ||
-    snapshotStatus === 'reachable' ||
-    route?.partiallyActive === true ||
-    route ||
-    node.routable === true ||
-    hasDirectNodeAddress(node) ||
-    hasKnownDeliveryPath(node)
-  ) {
-    return 'reachable'
-  }
-  return 'offline'
+  const connected = node.connected === true || hasActiveWsForNode(id)
+  if (connected) return 'online'
+  const merged = { ...(snapshotNode || {}), ...node }
+  if (route?.active === true || route?.partiallyActive === true) return 'reachable'
+  return getLayeredTopologyStatus(merged, {
+    connected: false,
+    hasPath: !!route || hasTopologyPathCandidate(merged)
+  })
 }
 
 function getFileTransferTargets() {
@@ -8324,8 +8428,6 @@ function getFileTransferTargets() {
       Number(mergedRecord.lastSeen || mergedRecord.updatedAt || 0) || 0
     )
     const connected = previous.connected === true || mergedRecord.connected === true || hasActiveWsForNode(id)
-    const previousStatus = String(previous.status || '').toLowerCase()
-    const rawStatus = String(mergedRecord.status || '').toLowerCase()
     const contentPolicy = mergeContentPolicyForDuplicateNode(id, {
       ...(previous.contentPolicy ? { contentPolicy: previous.contentPolicy } : previous),
       ...mergedRecord
@@ -8343,9 +8445,7 @@ function getFileTransferTargets() {
       contentPolicy,
       lastSeen,
       connected,
-      status: connected || previousStatus === 'online' || rawStatus === 'online'
-        ? 'online'
-        : (mergedRecord.status || previous.status || 'known'),
+      status: connected ? 'online' : (mergedRecord.status || previous.status || 'known'),
       lastIP: mergedRecord.lastIP || previous.lastIP || mergedHosts[0] || '',
       host: mergedRecord.host || previous.host || mergedHosts[0] || '',
       relayHost: mergedRecord.relayHost || previous.relayHost || '',
@@ -8366,14 +8466,7 @@ function getFileTransferTargets() {
       const snapshotNode = snapshotNodeById.get(id) || null
       const route = findRouteForTarget(routes, id)
       const status = getFileTransferTargetStatus(node, snapshotNode, route)
-      const reachable = node.connected === true ||
-        status === 'online' ||
-        status === 'reachable' ||
-        node.status === 'online' ||
-        hasActiveWsForNode(id) ||
-        hosts.length > 0 ||
-        !!route ||
-        hasKnownDeliveryPath(node)
+      const reachable = status === 'online' || status === 'reachable'
       const trusted = !!lookupPeerPairingKey(id)
       const allowed = trusted && canPushContentToNode(node, CODE_TYPES.FILE_TRANSFER)
       const routeLabel = route && String(route.nextHopId || '') && String(route.nextHopId || '') !== id
@@ -8382,7 +8475,7 @@ function getFileTransferTargets() {
       const reason = !trusted
         ? '未完成可信配对'
         : (!reachable
-            ? '当前不可达'
+            ? (status === 'known' ? '已知节点，当前未验证可达' : '当前不可达')
             : (!allowed ? '文件传输权限未开启' : routeLabel))
       return {
         id,

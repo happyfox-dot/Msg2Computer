@@ -87,6 +87,10 @@ import java.io.File
 import java.io.FileOutputStream
 
 class MainActivity : AppCompatActivity() {
+    private companion object {
+        const val TOPOLOGY_RECENT_REACHABLE_MS = 2 * 60 * 1000L
+    }
+
     private lateinit var binding: ActivityMainBinding
     private var totpUpdateJob: Job? = null
     private var notificationRebindJob: Job? = null
@@ -1820,6 +1824,16 @@ class MainActivity : AppCompatActivity() {
     private fun isReachableTopologyStatus(status: String): Boolean =
         status == "online" || status == "reachable"
 
+    private fun isRecentTopologyTimestamp(timestamp: Long): Boolean =
+        timestamp > 0L && System.currentTimeMillis() - timestamp <= TOPOLOGY_RECENT_REACHABLE_MS
+
+    private fun getTopologyFreshnessAt(device: DesktopDevice): Long =
+        listOf(
+            device.connectionUpdatedAt,
+            device.lastSyncAt,
+            device.routeUpdatedAt
+        ).maxOrNull() ?: 0L
+
     private fun isDeviceRoutableCandidate(device: DesktopDevice): Boolean =
         device.enabled &&
             device.pairingKey.isNotBlank() &&
@@ -1834,13 +1848,15 @@ class MainActivity : AppCompatActivity() {
     private fun getTopologyDeviceStatus(device: DesktopDevice): String = when {
         !device.enabled -> "disabled"
         isDeviceOnline(device) -> "online"
-        isDeviceRoutableCandidate(device) -> "reachable"
+        isDeviceRoutableCandidate(device) && isRecentTopologyTimestamp(getTopologyFreshnessAt(device)) -> "reachable"
+        isDeviceRoutableCandidate(device) -> "known"
         else -> "offline"
     }
 
     private fun getTopologyDeviceStateLabel(device: DesktopDevice): String = when (getTopologyDeviceStatus(device)) {
         "online" -> "在线连接"
-        "reachable" -> "可路由，未在线"
+        "reachable" -> "近期可达"
+        "known" -> "已知节点，当前未验证"
         "disabled" -> getString(R.string.push_disabled)
         else -> "离线"
     }
@@ -1859,13 +1875,14 @@ class MainActivity : AppCompatActivity() {
                 val allowed = device.allowFileTransfer
                 val statusLabel = when (topologyStatus) {
                     "online" -> "在线连接"
-                    "reachable" -> "可路由"
+                    "reachable" -> "近期可达"
+                    "known" -> "已知节点"
                     "disabled" -> "已禁用"
                     else -> "离线"
                 }
                 val reason = buildList {
                     if (!allowed) add("文件传输权限未开启")
-                    if (!reachable) add("当前不可达")
+                    if (!reachable) add(if (topologyStatus == "known") "已知节点，当前未验证可达" else "当前不可达")
                     if (device.routeNextHopId.isNotBlank() && device.routeNextHopId != device.id) {
                         add("经 ${device.routeNextHopName.ifBlank { device.routeNextHopId }}")
                     } else if (device.routeMetric > 0) {

@@ -146,11 +146,12 @@ class TopologyGraphView @JvmOverloads constructor(
         val localY = height / 2f - nodeHeight / 2f
         nodeRects[local.id] = RectF(localX, localY, localX + nodeWidth, localY + nodeHeight)
 
-        // 在线节点排最前，可路由候选其次，离线和仅发现的排在下面
+        // 在线节点排最前，近期可达其次，已知/历史节点再往后，离线和仅发现的排在下面
         val remotes = nodes.filter { it.id != local.id }
             .sortedWith(
                 compareByDescending<Node> { it.status == "online" }
                     .thenByDescending { it.status == "reachable" }
+                    .thenByDescending { it.status == "known" }
                     .thenBy { it.status == "discovered" }
                     .thenBy { it.name.lowercase() }
             )
@@ -235,6 +236,7 @@ class TopologyGraphView @JvmOverloads constructor(
     private fun statusColor(node: Node): Int = when (node.status) {
         "online" -> COLOR_ACTIVE
         "reachable" -> Color.rgb(96, 165, 250)
+        "known" -> Color.rgb(224, 176, 96)
         "synced" -> COLOR_TOTP
         "discovered" -> COLOR_META
         else -> COLOR_IDLE
@@ -242,7 +244,8 @@ class TopologyGraphView @JvmOverloads constructor(
 
     private fun statusText(status: String): String = when (status) {
         "online" -> "在线"
-        "reachable" -> "可路由"
+        "reachable" -> "近期可达"
+        "known" -> "已知"
         "enabled" -> "已启用"
         "disabled" -> "已禁用"
         "synced" -> "已同步"
