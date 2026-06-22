@@ -16,6 +16,7 @@ object ClipboardSyncState {
     private const val KEY_TS = "applied_ts"
     private const val KEY_ORIGIN = "applied_origin"
     private const val KEY_HASH = "applied_hash"
+    private const val KEY_KIND = "applied_kind"
 
     fun hash(text: String): String {
         val digest = MessageDigest.getInstance("SHA-256").digest(text.toByteArray(Charsets.UTF_8))
@@ -30,6 +31,9 @@ object ClipboardSyncState {
     fun appliedHash(context: Context): String =
         prefs(context).getString(KEY_HASH, "").orEmpty()
 
+    fun appliedKind(context: Context): String =
+        prefs(context).getString(KEY_KIND, "").orEmpty()
+
     /** 收到的版本是否比已应用版本新。 */
     fun isNewer(context: Context, ts: Long, origin: String): Boolean {
         if (ts <= 0L) return false
@@ -39,10 +43,15 @@ object ClipboardSyncState {
     }
 
     fun remember(context: Context, ts: Long, origin: String, text: String) {
+        rememberHash(context, ts, origin, hash(text), "text")
+    }
+
+    fun rememberHash(context: Context, ts: Long, origin: String, hash: String, kind: String = "") {
         prefs(context).edit()
             .putLong(KEY_TS, ts)
             .putString(KEY_ORIGIN, origin)
-            .putString(KEY_HASH, hash(text))
+            .putString(KEY_HASH, hash)
+            .putString(KEY_KIND, kind)
             .apply()
     }
 

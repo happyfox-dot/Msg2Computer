@@ -1641,6 +1641,15 @@ class WebSocketService : Service() {
         connections[device.id] = connection
 
         val candidates = candidateHosts(device)
+        // 纯路由可达设备（拓扑同步允许 host 空但有 route）没有直连地址，
+        // 不能走 WebSocket 直连——否则 candidates 为空，% candidates.size 触发
+        // 除零崩溃。这类设备本就应经 relay/nextHop 投递，这里清掉空壳连接早返回。
+        if (candidates.isEmpty()) {
+            connections.remove(device.id)?.reconnectJob?.cancel()
+            Log.d(TAG, "Skip WS connect for ${device.name}: no direct host (route-only)")
+            stopIfNothingPending("空闲")
+            return
+        }
         val connectHost = candidates[(hostRotation[device.id] ?: 0) % candidates.size]
         updateConnectionState("正在连接 ${device.name} ($connectHost:${device.port})")
 

@@ -21,6 +21,8 @@ const { createRouteHealthTracker } = require('./src/main/route-manager')
 const { registerDesktopIpc } = require('./src/main/desktop-ipc')
 const updater = require('./src/main/updater')
 const { createFileTransfer } = require('./src/main/file-transfer')
+const clipboardVersion = require('./src/main/clipboard-version')
+const trustedNode = require('./src/main/trusted-node')
 
 let mainWindow = null
 let bubbleWindow = null
@@ -1671,14 +1673,15 @@ function loadOrCreatePairingKey() {
           id: peer.id,
           name: peer.name || 'Desktop PC',
           deviceType: peer.deviceType || peer.type || 'WINDOWS_DESKTOP',
-          host: peer.host || '',
+          host: trustedNode.primaryTrustedNodeHost(peer) || '',
           port: Number(peer.port) || WS_PORT,
           pairingKey: unprotectSecret(peer.pairingKey || peer.pk || ''),
           tsHost: String(peer.tsHost || '').trim(),
+          altHosts: Array.isArray(peer.altHosts) ? peer.altHosts.map(normalizeNetworkHost).filter(Boolean) : [],
           enabled: peer.enabled !== false,
           firstSeen: peer.firstSeen || Date.now(),
           lastSeen: peer.lastSeen || 0,
-          lastIP: peer.lastIP || peer.host || '',
+          lastIP: normalizeNetworkHost(peer.lastIP || peer.host || peer.tsHost || '') || trustedNode.primaryTrustedNodeHost(peer) || '',
           networkId: String(peer.networkId || '').trim(),
           autoPaired: peer.autoPaired === true,
           trustSourceId: String(peer.trustSourceId || '').trim(),
@@ -1709,6 +1712,10 @@ function loadOrCreatePairingKey() {
       fileTransferDownloadDir = normalizeFileTransferDownloadDir(saved.fileTransferDownloadDir || '')
       clipboardSyncState = normalizeClipboardSyncState(saved.clipboardSyncState || {})
       clipboardImageSyncState = normalizeClipboardSyncState(saved.clipboardImageSyncState || {})
+      clipboardGlobalSyncState = normalizeClipboardSyncState(
+        saved.clipboardGlobalSyncState ||
+        clipboardVersion.bestClipboardVersion(clipboardSyncState, clipboardImageSyncState)
+      )
       trustedNetworkId = String(saved.networkId || saved.trustedNetworkId || '').trim()
       allowLanJoinRequests = saved.allowLanJoinRequests !== false
       localEventToken = unprotectSecret(saved.localEventToken || '') || ''
@@ -1813,6 +1820,7 @@ function flushPairingConfigToDisk() {
           port: peer.port,
           pairingKey: protectSecret(peer.pairingKey),
           tsHost: peer.tsHost || '',
+          altHosts: Array.isArray(peer.altHosts) ? peer.altHosts : [],
           enabled: peer.enabled,
           firstSeen: peer.firstSeen,
           lastSeen: peer.lastSeen,
@@ -1835,6 +1843,7 @@ function flushPairingConfigToDisk() {
         // 剪贴板 LWW 版本（仅哈希不含明文）：跨重启保持，避免补推用旧值盖新值
         clipboardSyncState: { ...clipboardSyncState },
         clipboardImageSyncState: { ...clipboardImageSyncState },
+        clipboardGlobalSyncState: { ...clipboardGlobalSyncState },
         updatedAt: Date.now()
       }, null, 2),
       'utf8'
@@ -2139,7 +2148,8 @@ function upsertAuthorizedPhone({
 
 function normalizeDesktopPeer(pairingData) {
   const id = String(pairingData?.id || pairingData?.deviceId || '').trim()
-  const host = String(pairingData?.host || '').trim()
+  const addressData = trustedNode.withPrimaryTrustedHost(pairingData || {})
+  const host = String(addressData.host || '').trim()
   const deviceType = normalizeDeviceType(pairingData?.deviceType || pairingData?.type, 'WINDOWS_DESKTOP')
   const port = normalizeTopologyPort(deviceType, pairingData?.wsPort || pairingData?.port || WS_PORT)
   const pairingKeyValue = String(pairingData?.pairingKey || pairingData?.pk || '').trim()
@@ -2153,6 +2163,7 @@ function normalizeDesktopPeer(pairingData) {
     port,
     pairingKey: pairingKeyValue,
     tsHost: String(pairingData?.tsHost || '').trim(),
+    altHosts: Array.isArray(addressData.altHosts) ? addressData.altHosts : [],
     networkId: String(pairingData?.networkId || '').trim(),
     autoPaired: pairingData?.autoPaired === true,
     trustSourceId: String(pairingData?.trustSourceId || '').trim(),
@@ -2194,7 +2205,8 @@ function upsertPairedDesktopPeer(pairingData) {
     capabilities: Object.keys(normalized.capabilities || {}).length > 0 ? normalized.capabilities : (existing?.capabilities || {}),
     contentPolicy: normalizePushContentPolicy(normalized.contentPolicy || existing?.contentPolicy || existing || {}),
     connectionUpdatedAt: existing?.connectionUpdatedAt || 0,
-    connected: existing?.connected === true
+    connected: existing?.connected === true,
+    altHosts: normalized.altHosts.length > 0 ? normalized.altHosts : (existing?.altHosts || [])
   }
   const topologyChanged = !existing ||
     String(existing.name || '') !== String(peer.name || '') ||
@@ -2202,6 +2214,7 @@ function upsertPairedDesktopPeer(pairingData) {
     Number(existing.port || 0) !== Number(peer.port || 0) ||
     String(existing.pairingKey || '') !== String(peer.pairingKey || '') ||
     String(existing.tsHost || '') !== String(peer.tsHost || '') ||
+    JSON.stringify(existing.altHosts || []) !== JSON.stringify(peer.altHosts || []) ||
     String(existing.networkId || '') !== String(peer.networkId || '') ||
     existing.enabled !== peer.enabled ||
     String(existing.deviceType || '') !== String(peer.deviceType || '') ||
@@ -3698,9 +3711,7 @@ function getKnownRoutableTopologyNodes() {
       node.id !== identity.id &&
       node.enabled !== false &&
       node.revoked !== true &&
-      node.routable === true &&
-      node.pairingKey &&
-      (node.host || node.lastIP)
+      trustedNode.shouldRouteTrustedTopologyNode(node)
     )
 }
 
@@ -3805,42 +3816,44 @@ function applyTopologyDeltaPayload(rawPayload, options = {}) {
       const nodeChanged = upsertTopologyLsdbNode(node)
       changed = nodeChanged || changed
       const isStoredTrustedNode = authorizedPhones.has(node.id) || pairedDesktopPeers.has(node.id)
-      if ((nodeChanged || !isStoredTrustedNode) && node.routable && node.pairingKey && node.host) {
-        if (String(node.type || '').includes('PHONE')) {
+      if ((nodeChanged || !isStoredTrustedNode) && trustedNode.shouldImportTrustedTopologyNode(node)) {
+        const importNode = trustedNode.withPrimaryTrustedHost(node)
+        if (String(importNode.type || '').includes('PHONE')) {
           upsertAuthorizedPhone({
-            phoneId: node.id,
-            phoneName: node.name,
-            clientIP: node.host,
-            deviceType: node.type,
-            pairingKey: node.pairingKey,
-            relayPort: node.relayPort || node.port || JOIN_PORT,
-            relayHost: node.host,
-            tsHost: node.tsHost,
-            networkId: node.networkId || ensureTrustedNetworkId(),
-            autoPaired: node.autoPaired === true,
-            trustSourceId: node.trustSourceId || sourceId || identity.id,
-            trustLevel: node.trustLevel || 'trusted_lan',
-            acceptedAt: node.acceptedAt || node.updatedAt || Date.now(),
-            capabilities: node.capabilities || {},
-            contentPolicy: node.contentPolicy
+            phoneId: importNode.id,
+            phoneName: importNode.name,
+            clientIP: importNode.host,
+            deviceType: importNode.type,
+            pairingKey: importNode.pairingKey,
+            relayPort: importNode.relayPort || importNode.port || JOIN_PORT,
+            relayHost: importNode.host,
+            tsHost: importNode.tsHost,
+            networkId: importNode.networkId || ensureTrustedNetworkId(),
+            autoPaired: importNode.autoPaired === true,
+            trustSourceId: importNode.trustSourceId || sourceId || identity.id,
+            trustLevel: importNode.trustLevel || 'trusted_lan',
+            acceptedAt: importNode.acceptedAt || importNode.updatedAt || Date.now(),
+            capabilities: importNode.capabilities || {},
+            contentPolicy: importNode.contentPolicy
           })
           changed = true
-        } else if (String(node.type || '').includes('DESKTOP')) {
+        } else if (String(importNode.type || '').includes('DESKTOP')) {
           upsertPairedDesktopPeer({
-            id: node.id,
-            name: node.name,
-            deviceType: node.type,
-            host: node.host,
-            port: node.wsPort || node.port || WS_PORT,
-            pairingKey: node.pairingKey,
-            tsHost: node.tsHost,
-            networkId: node.networkId || ensureTrustedNetworkId(),
-            autoPaired: node.autoPaired === true,
-            trustSourceId: node.trustSourceId || sourceId || identity.id,
-            trustLevel: node.trustLevel || 'trusted_lan',
-            acceptedAt: node.acceptedAt || node.updatedAt || Date.now(),
-            capabilities: node.capabilities || {},
-            contentPolicy: node.contentPolicy
+            id: importNode.id,
+            name: importNode.name,
+            deviceType: importNode.type,
+            host: importNode.host,
+            port: importNode.wsPort || importNode.port || WS_PORT,
+            pairingKey: importNode.pairingKey,
+            tsHost: importNode.tsHost,
+            altHosts: importNode.altHosts,
+            networkId: importNode.networkId || ensureTrustedNetworkId(),
+            autoPaired: importNode.autoPaired === true,
+            trustSourceId: importNode.trustSourceId || sourceId || identity.id,
+            trustLevel: importNode.trustLevel || 'trusted_lan',
+            acceptedAt: importNode.acceptedAt || importNode.updatedAt || Date.now(),
+            capabilities: importNode.capabilities || {},
+            contentPolicy: importNode.contentPolicy
           })
           changed = true
         }
@@ -5027,7 +5040,7 @@ let lastClipboardImageHash = ''
 let lastClipboardFileSignature = ''
 let suppressClipboardImagePollUntil = 0
 let pendingClipboardFileBatch = null
-let incomingClipboardFileSession = { key: '', paths: new Set(), fileIds: new Set(), expectedCount: 0, timer: null }
+let incomingClipboardFileSession = { key: '', paths: new Set(), fileIds: new Set(), expectedCount: 0, timer: null, version: null }
 
 // 剪贴板 LWW（last-writer-wins）寄存器状态：网络中剪贴板是一个单值寄存器，
 // 每次复制产生新版本 (ts, origin)。节点只应用比已知版本更新的内容——
@@ -5036,6 +5049,7 @@ let incomingClipboardFileSession = { key: '', paths: new Set(), fileIds: new Set
 // 重启后的上线补推不会把旧值打上新时间戳盖掉别人的新内容。
 let clipboardSyncState = { ts: 0, origin: '', hash: '' }
 let clipboardImageSyncState = { ts: 0, origin: '', hash: '' }
+let clipboardGlobalSyncState = { ts: 0, origin: '', hash: '', kind: '' }
 
 function hashClipText(text) {
   return crypto.createHash('sha256').update(String(text), 'utf8').digest('hex').slice(0, 24)
@@ -5098,34 +5112,42 @@ function refreshClipboardImageSnapshotAfterWrite(fallbackHash = '') {
 }
 
 function isNewerClipVersion(ts, origin) {
-  if (!Number.isFinite(ts) || ts <= 0) return false
-  if (ts !== clipboardSyncState.ts) return ts > clipboardSyncState.ts
+  return clipboardVersion.isNewerClipboardVersion(clipboardGlobalSyncState, { ts, origin })
   // 同毫秒平手用 origin 字典序裁决，保证所有节点裁决结果一致
-  return String(origin || '') > String(clipboardSyncState.origin || '')
 }
 
 function isNewerClipImageVersion(ts, origin) {
-  if (!Number.isFinite(ts) || ts <= 0) return false
-  if (ts !== clipboardImageSyncState.ts) return ts > clipboardImageSyncState.ts
-  return String(origin || '') > String(clipboardImageSyncState.origin || '')
+  return clipboardVersion.isNewerClipboardVersion(clipboardGlobalSyncState, { ts, origin })
+}
+
+function isSameGlobalClipHash(hash) {
+  return clipboardVersion.hasSameClipboardHash(clipboardGlobalSyncState, hash)
+}
+
+function rememberGlobalClipVersion(ts, origin, hash, kind) {
+  clipboardGlobalSyncState = clipboardVersion.rememberClipboardVersion(clipboardGlobalSyncState, {
+    ts,
+    origin: String(origin || ''),
+    hash: String(hash || ''),
+    kind: String(kind || '')
+  })
 }
 
 function rememberClipVersion(ts, origin, text) {
-  clipboardSyncState = { ts, origin: String(origin || ''), hash: hashClipText(text) }
+  const hash = hashClipText(text)
+  clipboardSyncState = { ts, origin: String(origin || ''), hash, kind: 'text' }
+  rememberGlobalClipVersion(ts, origin, hash, 'text')
   savePairingKey()
 }
 
 function rememberClipImageVersion(ts, origin, hash) {
-  clipboardImageSyncState = { ts, origin: String(origin || ''), hash: String(hash || '') }
+  clipboardImageSyncState = { ts, origin: String(origin || ''), hash: String(hash || ''), kind: 'image' }
+  rememberGlobalClipVersion(ts, origin, hash, 'image')
   savePairingKey()
 }
 
 function normalizeClipboardSyncState(saved = {}) {
-  return {
-    ts: Number(saved.ts) || 0,
-    origin: String(saved.origin || ''),
-    hash: String(saved.hash || '')
-  }
+  return clipboardVersion.normalizeClipboardVersion(saved)
 }
 
 function startClipboardSyncWatcher() {
@@ -5214,7 +5236,7 @@ function pollClipboardImageForSync() {
   }
   if (shortHash === lastClipboardImageHash) return
   lastClipboardImageHash = shortHash
-  if (shortHash === clipboardImageSyncState.hash) return
+  if (isSameGlobalClipHash(shortHash)) return
   clearIncomingClipboardFiles()
   if (imageBuffer.length > CLIPBOARD_INLINE_IMAGE_MAX_BYTES) {
     // 大图回退：不整包 inline 进 relay 消息，转 manifest + 分片拉取
@@ -5410,10 +5432,10 @@ function clearIncomingClipboardFiles() {
   try {
     fs.rmSync(dir, { recursive: true, force: true })
   } catch (_) {}
-  incomingClipboardFileSession = { key: '', paths: new Set(), fileIds: new Set(), expectedCount: 0, timer: null }
+  incomingClipboardFileSession = { key: '', paths: new Set(), fileIds: new Set(), expectedCount: 0, timer: null, version: null }
 }
 
-function ensureIncomingClipboardFileSession(key, expectedCount = 0) {
+function ensureIncomingClipboardFileSession(key, expectedCount = 0, version = null) {
   const normalizedKey = String(key || '').trim() || `clipboard-files-${Date.now()}`
   if (incomingClipboardFileSession.key !== normalizedKey) {
     clearIncomingClipboardFiles()
@@ -5422,10 +5444,15 @@ function ensureIncomingClipboardFileSession(key, expectedCount = 0) {
       paths: new Set(),
       fileIds: new Set(),
       expectedCount: Math.max(0, Number(expectedCount) || 0),
-      timer: null
+      timer: null,
+      version
     }
   } else if (Number(expectedCount) > incomingClipboardFileSession.expectedCount) {
     incomingClipboardFileSession.expectedCount = Number(expectedCount)
+    if (version) incomingClipboardFileSession.version = version
+  }
+  if (version && !incomingClipboardFileSession.version) {
+    incomingClipboardFileSession.version = version
   }
   try {
     fs.mkdirSync(incomingClipboardFileTempDir(), { recursive: true })
@@ -5449,7 +5476,17 @@ function scheduleIncomingClipboardFileFlush(sessionKey, codeInfo = {}, latestNam
         return false
       }
     })
-    writeFilePathsToClipboard(paths)
+    const version = incomingClipboardFileSession.version
+    if (version && !isIncomingClipboardVersionApplicable(version)) {
+      incomingClipboardFileSession.timer = null
+      clearIncomingClipboardFiles()
+      return
+    }
+    const wrote = writeFilePathsToClipboard(paths)
+    if (wrote && version && !isSameGlobalClipVersion(version)) {
+      rememberGlobalClipVersion(version.ts, version.origin, version.hash, version.kind || 'file')
+      savePairingKey()
+    }
     incomingClipboardFileSession.timer = null
   }, delay)
   session.timer.unref?.()
@@ -5887,7 +5924,7 @@ function applyRemoteClipboard(codeInfo, codeData) {
   // 旧版负载无 clipVersion：退化用消息时间戳参与排序，保持互通
   const ts = Number(version.ts) || Number(codeInfo.timestamp) || 0
   const origin = String(version.origin || codeInfo.originDeviceId || codeInfo.sourceDeviceId || '')
-  if (hashClipText(text) === clipboardSyncState.hash) return false
+  if (isSameGlobalClipHash(hashClipText(text))) return false
   if (!isNewerClipVersion(ts, origin)) return false
   rememberClipVersion(ts, origin, text)
   // 先同步本地快照再写剪贴板，防 900ms 轮询把这次远端写入当成本机新复制
@@ -5912,7 +5949,7 @@ function applyRemoteClipboardImage(codeInfo, codeData) {
   const version = (codeData && codeData.clipVersion) || {}
   const ts = Number(version.ts) || Number(codeInfo.timestamp) || 0
   const origin = String(version.origin || codeInfo.originDeviceId || codeInfo.sourceDeviceId || '')
-  if (shortHash === clipboardImageSyncState.hash) return false
+  if (isSameGlobalClipHash(shortHash)) return false
   if (!isNewerClipImageVersion(ts, origin)) return false
   const image = nativeImage.createFromBuffer(buffer)
   if (image.isEmpty()) return false
@@ -7759,7 +7796,7 @@ function handleIncomingClipboardTextManifest(codeInfo, codeData, manifest, onApp
   const ts = Number(version.ts) || Number(codeInfo.timestamp) || 0
   const origin = String(version.origin || codeInfo.originDeviceId || codeInfo.sourceDeviceId || '')
   const shortHash = String(version.hash || manifest.sha256 || '').slice(0, 24)
-  if (shortHash && shortHash === clipboardSyncState.hash) return
+  if (shortHash && isSameGlobalClipHash(shortHash)) return
   if (!isNewerClipVersion(ts, origin)) return
   const inDir = path.join(app.getPath('userData'), 'clipboard-text-in')
   initFileTransfer().startIncomingPull(manifest, {
@@ -7771,7 +7808,7 @@ function handleIncomingClipboardTextManifest(codeInfo, codeData, manifest, onApp
         if (!text) return
         const actualHash = hashClipText(text)
         if (shortHash && actualHash !== shortHash) return
-        if (actualHash === clipboardSyncState.hash) return
+        if (isSameGlobalClipHash(actualHash)) return
         if (!isNewerClipVersion(ts, origin)) return
         rememberClipVersion(ts, origin, text)
         lastClipboardText = text
@@ -7801,7 +7838,7 @@ function isIncomingClipboardImageCandidateNew(codeInfo, codeData, manifest = {})
   const ts = Number(version.ts) || Number(codeInfo.timestamp) || 0
   const origin = String(version.origin || codeInfo.originDeviceId || codeInfo.sourceDeviceId || '')
   const shortHash = String(version.hash || manifest.sha256 || '').slice(0, 24)
-  if (shortHash && shortHash === clipboardImageSyncState.hash) return false
+  if (shortHash && isSameGlobalClipHash(shortHash)) return false
   return isNewerClipImageVersion(ts, origin)
 }
 
@@ -7814,7 +7851,7 @@ function handleIncomingClipboardImageManifest(codeInfo, codeData, manifest, onAp
   const ts = Number(version.ts) || Number(codeInfo.timestamp) || 0
   const origin = String(version.origin || codeInfo.originDeviceId || codeInfo.sourceDeviceId || '')
   const shortHash = String(manifest.sha256 || '').slice(0, 24)
-  if (shortHash && shortHash === clipboardImageSyncState.hash) return
+  if (shortHash && isSameGlobalClipHash(shortHash)) return
   if (!isNewerClipImageVersion(ts, origin)) return
   const inDir = path.join(app.getPath('userData'), 'clipboard-images-in')
   initFileTransfer().startIncomingPull(manifest, {
@@ -7826,6 +7863,8 @@ function handleIncomingClipboardImageManifest(codeInfo, codeData, manifest, onAp
         const image = nativeImage.createFromBuffer(buffer)
         if (!image.isEmpty()) {
           const appliedHash = shortHash || hashBuffer(buffer).slice(0, 24)
+          if (isSameGlobalClipHash(appliedHash)) return
+          if (!isNewerClipImageVersion(ts, origin)) return
           rememberClipImageVersion(ts, origin, appliedHash)
           // 先同步本地快照再写剪贴板，防轮询把这次远端写入当成本机新复制
           clearIncomingClipboardFiles()
@@ -7865,6 +7904,34 @@ function incomingClipboardFileKey(codeInfo, codeData, manifest) {
   return String((codeData && codeData.clipboardBatchId) || codeInfo.clipboardBatchId || codeInfo.batchId || manifest.fileId || Date.now())
 }
 
+function incomingClipboardVersion(codeInfo = {}, codeData = {}, manifest = {}, kind = 'file') {
+  const version = (codeData && codeData.clipVersion) || codeInfo.clipVersion || {}
+  return {
+    ts: Number(version.ts) || Number(codeInfo.timestamp) || 0,
+    origin: String(version.origin || codeInfo.originDeviceId || codeInfo.sourceDeviceId || ''),
+    hash: String(version.hash || version.signature || manifest.sha256 || '').slice(0, 24),
+    kind
+  }
+}
+
+function isIncomingClipboardVersionNewer(version = {}) {
+  if (version.hash && isSameGlobalClipHash(version.hash)) return false
+  return clipboardVersion.isNewerClipboardVersion(clipboardGlobalSyncState, version)
+}
+
+function isSameGlobalClipVersion(version = {}) {
+  const current = clipboardVersion.normalizeClipboardVersion(clipboardGlobalSyncState)
+  const incoming = clipboardVersion.normalizeClipboardVersion(version)
+  return incoming.ts > 0 &&
+    current.ts === incoming.ts &&
+    current.origin === incoming.origin &&
+    (!incoming.hash || current.hash === incoming.hash)
+}
+
+function isIncomingClipboardVersionApplicable(version = {}) {
+  return isSameGlobalClipVersion(version) || isIncomingClipboardVersionNewer(version)
+}
+
 function handleIncomingClipboardFileManifest(codeInfo, codeData, manifest) {
   const maxFileSizeMb = Math.max(1, Number(desktopMessageSettings.maxFileSizeMb || 50))
   const maxBytes = maxFileSizeMb * 1024 * 1024
@@ -7876,7 +7943,14 @@ function handleIncomingClipboardFileManifest(codeInfo, codeData, manifest) {
     Number((codeData && codeData.batchCount) || 0),
     Number(codeInfo.batchCount || 0)
   )
-  const session = ensureIncomingClipboardFileSession(incomingClipboardFileKey(codeInfo, codeData, manifest), expectedCount)
+  const sessionKeyCandidate = incomingClipboardFileKey(codeInfo, codeData, manifest)
+  const version = incomingClipboardVersion(codeInfo, codeData, manifest, 'file')
+  if (incomingClipboardFileSession.key !== sessionKeyCandidate &&
+    !isIncomingClipboardVersionApplicable(version)
+  ) {
+    return
+  }
+  const session = ensureIncomingClipboardFileSession(sessionKeyCandidate, expectedCount, version)
   const sessionKey = session.key
   initFileTransfer().startIncomingPull(manifest, {
     maxBytes,

@@ -1140,7 +1140,13 @@ class NodeReceiverService : Service() {
     private fun handleIncomingClipboardFilePayload(payload: JSONObject, sourceName: String) {
         serviceScope.launch {
             val manifest = payload.optJSONObject("fileManifest") ?: return@launch
+            val version = clipboardVersionFromPayload(payload, manifest, "file")
             val versionKey = clipboardFileVersionKey(payload, manifest)
+            if (!isCurrentClipboardTempKey("clipboard_file_key", versionKey) &&
+                !isIncomingClipboardVersionNewer(version)
+            ) {
+                return@launch
+            }
             prepareClipboardTempDirectory("clipboard_file_key", clipboardFileTempRoot(), versionKey)
             clearClipboardImageTempFiles()
             val received = pullIncomingFileTransfer(
@@ -1153,6 +1159,13 @@ class NodeReceiverService : Service() {
                 return@launch
             }
             if (received != null && writeClipboardFilesFromTempRoot()) {
+                ClipboardSyncState.rememberHash(
+                    this@NodeReceiverService,
+                    version.ts,
+                    version.origin,
+                    version.hash,
+                    version.kind
+                )
                 ClipboardHistoryStore.addFile(
                     context = this@NodeReceiverService,
                     kind = "file",
@@ -1170,6 +1183,34 @@ class NodeReceiverService : Service() {
                 )
             }
         }
+    }
+
+    private data class ClipboardVersion(
+        val ts: Long,
+        val origin: String,
+        val hash: String,
+        val kind: String
+    )
+
+    private fun clipboardVersionFromPayload(
+        payload: JSONObject,
+        manifest: JSONObject,
+        kind: String
+    ): ClipboardVersion {
+        val version = payload.optJSONObject("clipVersion")
+        val ts = (version?.optLong("ts", 0L) ?: 0L).takeIf { it > 0L }
+            ?: payload.optLong("timestamp", 0L)
+        val origin = version?.optString("origin").orEmpty()
+            .ifBlank { payload.optString("originDeviceId", payload.optString("sourceDeviceId")) }
+        val hash = version?.optString("hash").orEmpty()
+            .ifBlank { version?.optString("signature").orEmpty() }
+            .ifBlank { manifest.optString("sha256").take(24) }
+        return ClipboardVersion(ts, origin, hash, kind)
+    }
+
+    private fun isIncomingClipboardVersionNewer(version: ClipboardVersion): Boolean {
+        if (version.hash.isNotBlank() && version.hash == ClipboardSyncState.appliedHash(this)) return false
+        return ClipboardSyncState.isNewer(this, version.ts, version.origin)
     }
 
     private fun clipboardFileVersionKey(payload: JSONObject, manifest: JSONObject): String {
@@ -1805,6 +1846,7 @@ class NodeReceiverService : Service() {
         val bytes = runCatching { received.file.readBytes() }.getOrNull()
         runCatching { received.file.delete() }
         if (bytes == null || bytes.isEmpty()) return false
+        if (!isNewerClipboardImageVersion(ts, origin, shortHash)) return false
         val clipboardFile = writeClipboardImage(bytes, ts, shortHash, mime) ?: return false
         rememberClipboardImageVersion(ts, origin, shortHash)
         rememberClipboardImageHistory(payload, clipboardFile, bytes.size.toLong(), ts, origin)
@@ -1935,6 +1977,8 @@ class NodeReceiverService : Service() {
 
     private fun isNewerClipboardImageVersion(ts: Long, origin: String, hash: String): Boolean {
         val prefs = getSharedPreferences(IMAGE_STATE_PREFS, Context.MODE_PRIVATE)
+        if (hash.isNotBlank() && hash == ClipboardSyncState.appliedHash(this)) return false
+        if (!ClipboardSyncState.isNewer(this, ts, origin)) return false
         if (hash.isNotBlank() && hash == prefs.getString("hash", "")) return false
         val currentTs = prefs.getLong("ts", 0L)
         val currentOrigin = prefs.getString("origin", "").orEmpty()
@@ -1951,6 +1995,7 @@ class NodeReceiverService : Service() {
             .putString("origin", origin)
             .putString("hash", hash)
             .apply()
+        ClipboardSyncState.rememberHash(this, ts, origin, hash, "image")
     }
 
     private fun sha256Hex(bytes: ByteArray): String {

@@ -227,6 +227,14 @@ function createFileTransfer(deps = {}) {
         cleanupIncoming(fileId)
       }
     }
+    // 回收分片 nonce 去重表：内层条目按 TTL 过期，外层 senderId 桶在内层清空后
+    // 也需删除，否则每个曾交互过的 senderId 会留一个永不回收的空桶（内存泄漏）
+    for (const [senderId, seen] of recentChunkNonces) {
+      for (const [n, firstSeen] of seen) {
+        if (now - firstSeen > NONCE_TTL_MS) seen.delete(n)
+      }
+      if (seen.size === 0) recentChunkNonces.delete(senderId)
+    }
   }
 
   function isReplayedChunkNonce(senderId, nonce) {
@@ -586,7 +594,14 @@ function createFileTransfer(deps = {}) {
             plain = candidate
             break
           }
-          if (!plain) throw new Error(lastChunkError || `chunk pull failed @${offset}`)
+          if (!plain) {
+            // 标记整次传输失败，令兄弟 worker 在循环顶部退出，避免它们
+            // 在 catch 关闭 fd 后仍向已关闭的 fd 写入（EBADF / 未捕获 rejection）
+            record.active = false
+            throw new Error(lastChunkError || `chunk pull failed @${offset}`)
+          }
+          // fd 可能已被并发失败的 catch 关闭，写入前复查
+          if (!record.active) return
           fs.writeSync(fd, plain, 0, plain.length, offset)
           completedBlocks.add(block.index)
           record.received = completedBytes()
@@ -602,6 +617,9 @@ function createFileTransfer(deps = {}) {
         throw new Error(`incomplete transfer blocks=${completedBlocks.size}/${blocks.length}`)
       }
     } catch (e) {
+      // 先停掉所有在途 worker，再关闭 fd：否则仍在 await fetchChunk 的兄弟
+      // worker 返回后会写入已关闭的 fd
+      record.active = false
       try { fs.closeSync(fd) } catch (_) {}
       onError({ phase: 'pull', fileId, error: e.message })
       incomingTransfers.delete(fileId)

@@ -155,12 +155,13 @@ object LanJoinClient {
                 // per-device 位默认放行，避免 LAN 配对后通知永远没有目标
                 .put("allowNotifications", true)
                 .put("allowTotp", true)
-                // 局域网可信环境：剪贴板文本默认放行（实际是否同步仍由两端
-                // "剪贴板同步"全局开关把关）。图片/文件/传输涉及更大数据量，
-                // 保持默认关，由用户按需显式开启。
+                // 局域网可信环境：剪贴板文本/图片默认放行（实际是否同步仍由两端
+                // "剪贴板同步"全局开关把关，per-device 位仅作针对个别设备的显式关闭）。
+                // 图片与文本保持同一默认，避免 basic 入网得 image=false、扫码/gossip
+                // 得 true 的分叉（"图片有时同步有时不"）。文件/传输数据量更大，仍默认关。
                 .put("allowClipboard", true)
                 .put("allowClipboardText", true)
-                .put("allowClipboardImage", false)
+                .put("allowClipboardImage", true)
                 .put("allowClipboardFile", false)
                 .put("allowFileTransfer", false)
                 .put("maxFileSizeMb", 50)

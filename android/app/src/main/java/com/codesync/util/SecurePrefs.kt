@@ -19,8 +19,16 @@ import java.util.concurrent.ConcurrentHashMap
 object SecurePrefs {
     private const val TAG = "SecurePrefs"
     private val cache = ConcurrentHashMap<String, SharedPreferences>()
+    @Volatile
+    private var testProvider: ((Context, String) -> SharedPreferences)? = null
+
+    fun setTestProviderForTests(provider: ((Context, String) -> SharedPreferences)?) {
+        testProvider = provider
+        cache.clear()
+    }
 
     fun get(context: Context, name: String): SharedPreferences {
+        testProvider?.let { provider -> return provider(context, name) }
         return cache.getOrPut(name) {
             runCatching { createEncrypted(context.applicationContext, name) }
                 .getOrElse { e ->

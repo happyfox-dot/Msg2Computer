@@ -161,10 +161,15 @@ object FileTransferRegistry {
     private fun pruneExpired() {
         val now = System.currentTimeMillis()
         outgoingTransfers.entries.removeIf { now > it.value.expiresAt }
-        recentNonces.values.forEach { seen ->
-            val iterator = seen.entries.iterator()
-            while (iterator.hasNext()) {
-                if (now - iterator.next().value > NONCE_TTL_MS) iterator.remove()
+        // 内层条目按 TTL 过期；内层清空后外层 senderId 桶也需删除，否则每个曾
+        // 交互过的 senderId 会留一个永不回收的空桶（与桌面 recentChunkNonces 同款泄漏）
+        recentNonces.entries.removeIf { (_, seen) ->
+            synchronized(seen) {
+                val iterator = seen.entries.iterator()
+                while (iterator.hasNext()) {
+                    if (now - iterator.next().value > NONCE_TTL_MS) iterator.remove()
+                }
+                seen.isEmpty()
             }
         }
     }
