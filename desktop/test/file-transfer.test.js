@@ -94,4 +94,87 @@ test('file transfer can offer, pull, resume state, and verify a plain trusted ch
 
   const received = fs.readFileSync(path.join(recvDir, 'payload.txt'))
   assert.deepEqual(received, content)
+
+  const treePath = path.join(sendDir, 'tree.bin')
+  const treeContent = Buffer.from('relative path tree\n', 'utf8')
+  fs.writeFileSync(treePath, treeContent)
+  const treeOffer = await sender.offerFile(treePath, ['B'], {
+    relativePath: 'myfolder/sub/../..\\evil/tree.bin'
+  })
+  assert.equal(treeOffer.manifest.relativePath, 'myfolder/sub/../..\\evil/tree.bin')
+
+  const treeOk = await receiver.startIncomingPull(treeOffer.manifest, { targetDir: recvDir, parallelism: 1 })
+  assert.equal(treeOk, true)
+
+  const expectedTreePath = path.join(recvDir, 'myfolder', 'sub', 'evil', 'tree.bin')
+  assert.deepEqual(fs.readFileSync(expectedTreePath), treeContent)
+  assert.equal(fs.existsSync(path.join(recvDir, 'myfolder', 'sub', 'file')), false)
+})
+
+test('desktop-to-desktop chunk pull signs with requester key instead of source key', async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'codebridge-desktop-transfer-'))
+  const sendDir = path.join(tmpRoot, 'send')
+  const recvDir = path.join(tmpRoot, 'recv')
+  const tmpDir = path.join(tmpRoot, 'tmp')
+  fs.mkdirSync(sendDir, { recursive: true })
+  fs.mkdirSync(recvDir, { recursive: true })
+  fs.mkdirSync(tmpDir, { recursive: true })
+
+  const sourceKey = Buffer.from('desktop-a-key-should-not-sign').toString('base64')
+  const requesterKey = Buffer.from('desktop-b-key-used-by-source').toString('base64')
+  const sourcePath = path.join(sendDir, 'tool.exe')
+  const content = crypto.randomBytes(8192)
+  fs.writeFileSync(sourcePath, content)
+
+  const sender = createFileTransfer({
+    getIdentity: () => ({ id: 'desktop-a', name: 'Desktop A', pairingKey: sourceKey }),
+    encryptBytes: buffer => buffer,
+    decryptBytes: buffer => buffer,
+    hmacBase64,
+    generateNonce: nonceFactory(),
+    lookupPeerKey: id => (id === 'desktop-b' ? requesterKey : null),
+    sendManifest: async () => 1,
+    downloadDir: recvDir,
+    tmpDir,
+    maxChunkBytes: 4096
+  })
+
+  const offered = await sender.offerFile(sourcePath, ['desktop-b'])
+
+  const receiver = createFileTransfer({
+    getIdentity: () => ({ id: 'desktop-b', name: 'Desktop B', pairingKey: requesterKey }),
+    encryptBytes: buffer => buffer,
+    decryptBytes: buffer => buffer,
+    hmacBase64,
+    generateNonce: nonceFactory(),
+    lookupPeerKey: () => requesterKey,
+    resolveSource: () => ({
+      id: 'desktop-a',
+      name: 'Desktop A',
+      host: '127.0.0.1',
+      port: 19529,
+      pairingKey: sourceKey,
+      type: 'WINDOWS_DESKTOP'
+    }),
+    httpGet: async ({ path: reqPath }) => {
+      const url = new URL(reqPath, 'http://127.0.0.1')
+      const fileId = decodeURIComponent(url.pathname.split('/').pop())
+      return sender.serveFileChunk({
+        fileId,
+        from: Number(url.searchParams.get('from')),
+        to: Number(url.searchParams.get('to')),
+        senderId: url.searchParams.get('senderId'),
+        nonce: url.searchParams.get('nonce'),
+        authToken: url.searchParams.get('authToken'),
+        chunkEncoding: url.searchParams.get('chunkEncoding') || 'aes-gcm'
+      })
+    },
+    downloadDir: recvDir,
+    tmpDir,
+    maxChunkBytes: 4096
+  })
+
+  const ok = await receiver.startIncomingPull(offered.manifest, { targetDir: recvDir, parallelism: 2 })
+  assert.equal(ok, true)
+  assert.deepEqual(fs.readFileSync(path.join(recvDir, 'tool.exe')), content)
 })

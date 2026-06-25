@@ -22,6 +22,7 @@ function registerDesktopIpc(ipcMain, handlers) {
   handle('file-transfer-open-download-dir', () => handlers.fileTransferOpenDownloadDir())
   handle('file-transfer-open-path', (event, filePath) => handlers.fileTransferOpenPath(filePath))
   handle('file-transfer-reveal-path', (event, filePath) => handlers.fileTransferRevealPath(filePath))
+  handle('file-transfer-copy-to-clipboard', (event, filePaths) => handlers.fileTransferCopyToClipboard(filePaths))
   handle('get-lan-join-settings', () => handlers.getLanJoinSettings())
   handle('set-lan-join-settings', (event, updates) => handlers.setLanJoinSettings(updates))
   handle('scan-lan-devices', () => handlers.scanLanDevices())

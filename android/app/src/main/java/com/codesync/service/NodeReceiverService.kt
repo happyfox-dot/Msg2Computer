@@ -36,6 +36,7 @@ import com.codesync.util.LanJoinCrypto
 import com.codesync.util.LanTrustStore
 import com.codesync.util.PendingLanJoinRequest
 import com.codesync.util.PhoneIdentityStore
+import com.codesync.util.RouteManager
 import com.codesync.util.SettingsStore
 import com.codesync.util.TotpEntry
 import com.codesync.util.TotpStore
@@ -47,8 +48,8 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -62,6 +63,7 @@ import java.net.URLDecoder
 import java.net.URLEncoder
 import java.security.MessageDigest
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 
 class NodeReceiverService : Service() {
@@ -101,6 +103,7 @@ class NodeReceiverService : Service() {
     private var running = false
     private var serverSocket: ServerSocket? = null
     private var lanResponderJob: Job? = null
+    private val incomingFileTransfers = ConcurrentHashMap.newKeySet<String>()
 
     private data class FileSource(
         val id: String,
@@ -612,7 +615,7 @@ class NodeReceiverService : Service() {
                                     this@NodeReceiverService,
                                     receivedStatusMessage(payloadType, sourceName)
                                 )
-                                rewriteClipboardGossipTargets(payload)
+                                relayClipboardGossipAfterApply(payload, ::rewriteClipboardGossipTargets)
                             }
                         }
                     } else if (applyRemoteClipboard(payload)) {
@@ -632,6 +635,7 @@ class NodeReceiverService : Service() {
                                     this@NodeReceiverService,
                                     receivedStatusMessage(payloadType, sourceName)
                                 )
+                                relayClipboardGossipAfterApply(payload, ::rewriteClipboardImageGossipTargets)
                             }
                         }
                     } else if (applyRemoteClipboardImage(payload)) {
@@ -738,7 +742,7 @@ class NodeReceiverService : Service() {
                                     this@NodeReceiverService,
                                     receivedStatusMessage(payloadType, sourceName)
                                 )
-                                rewriteClipboardGossipTargets(payload)
+                                relayClipboardGossipAfterApply(payload, ::rewriteClipboardGossipTargets)
                             }
                         }
                     } else if (applyRemoteClipboard(payload)) {
@@ -756,6 +760,7 @@ class NodeReceiverService : Service() {
                                     this@NodeReceiverService,
                                     receivedStatusMessage(payloadType, sourceName)
                                 )
+                                relayClipboardGossipAfterApply(payload, ::rewriteClipboardImageGossipTargets)
                             }
                         }
                     } else if (applyRemoteClipboardImage(payload)) {
@@ -1177,6 +1182,7 @@ class NodeReceiverService : Service() {
                     sourceDeviceId = received.sourceId,
                     sourceDeviceName = received.sourceName
                 )
+                relayClipboardGossipAfterApply(payload, ::rewriteClipboardFileGossipTargets)
                 WebSocketService.reportExternalStatus(
                     this@NodeReceiverService,
                     "已同步剪贴板文件：${received.name} · $sourceName"
@@ -1293,7 +1299,7 @@ class NodeReceiverService : Service() {
         }.getOrDefault(false)
     }
 
-    private fun pullIncomingFileTransfer(
+    private suspend fun pullIncomingFileTransfer(
         payload: JSONObject,
         saveToHistory: Boolean = true,
         subDirectoryName: String = "CodeBridge"
@@ -1302,6 +1308,11 @@ class NodeReceiverService : Service() {
         if (manifest.optBoolean("inline", false)) return null
         val fileId = manifest.optString("fileId").trim()
         if (fileId.isBlank()) return null
+        if (!incomingFileTransfers.add(fileId)) {
+            Log.d(TAG, "Skip duplicate in-flight file transfer: $fileId")
+            return null
+        }
+        return try {
         val size = manifest.optLong("size", 0L)
         val source = resolveFileSource(payload, manifest) ?: run {
             Log.w(TAG, "文件拉取失败：找不到源设备")
@@ -1450,7 +1461,7 @@ class NodeReceiverService : Service() {
             throw IllegalStateException("block ${block.index} failed after $FILE_TRANSFER_BLOCK_RETRIES retries: $lastError")
         }
 
-        return try {
+        try {
             RandomAccessFile(partFile, "rw").use { output ->
                 output.setLength(size)
                 saveTransferSidecar(sidecarFile, manifest, size, chunkSize, completedBlocks)
@@ -1466,7 +1477,7 @@ class NodeReceiverService : Service() {
                 val parallelism = manifest.optInt("parallelPulls", FILE_TRANSFER_PARALLEL_PULLS)
                     .coerceIn(1, FILE_TRANSFER_PARALLEL_PULLS)
                 if (pendingBlocks.isNotEmpty()) {
-                    runBlocking {
+                    coroutineScope {
                         (0 until minOf(parallelism, pendingBlocks.size)).map {
                             async(Dispatchers.IO) {
                                 while (true) {
@@ -1560,98 +1571,12 @@ class NodeReceiverService : Service() {
             Log.e(TAG, "文件拉取失败: ${e.message}", e)
             null
         }
+        } finally {
+            incomingFileTransfers.remove(fileId)
+        }
     }
 
     /** relativePath 含文件名（最后一段丢弃），其余各段消毒后映射为子目录。 */
-    private data class TransferBlock(val index: Int, val from: Long, val to: Long) {
-        val length: Long get() = to - from + 1
-    }
-
-    private fun buildTransferBlocks(size: Long, chunkSize: Long): List<TransferBlock> {
-        val blocks = mutableListOf<TransferBlock>()
-        var offset = 0L
-        var index = 0
-        while (offset < size) {
-            val to = minOf(offset + chunkSize - 1, size - 1)
-            blocks.add(TransferBlock(index, offset, to))
-            offset = to + 1
-            index += 1
-        }
-        return blocks
-    }
-
-    private fun loadTransferSidecar(
-        sidecarFile: File,
-        manifest: JSONObject,
-        size: Long,
-        chunkSize: Long
-    ): MutableSet<Int> {
-        return runCatching {
-            if (!sidecarFile.isFile) return@runCatching mutableSetOf()
-            val json = JSONObject(sidecarFile.readText(Charsets.UTF_8))
-            if (json.optString("fileId") != manifest.optString("fileId")) return@runCatching mutableSetOf()
-            if (json.optString("sha256") != manifest.optString("sha256")) return@runCatching mutableSetOf()
-            if (json.optLong("size") != size || json.optLong("chunkSize") != chunkSize) {
-                return@runCatching mutableSetOf()
-            }
-            jsonArrayToList(json.optJSONArray("completedBlocks"))
-                .mapNotNull { it.toIntOrNull() }
-                .toMutableSet()
-        }.getOrElse { mutableSetOf() }
-    }
-
-    private fun saveTransferSidecar(
-        sidecarFile: File,
-        manifest: JSONObject,
-        size: Long,
-        chunkSize: Long,
-        completedBlocks: Set<Int>
-    ) {
-        runCatching {
-            sidecarFile.parentFile?.mkdirs()
-            sidecarFile.writeText(
-                JSONObject()
-                    .put("version", 1)
-                    .put("fileId", manifest.optString("fileId"))
-                    .put("sha256", manifest.optString("sha256"))
-                    .put("size", size)
-                    .put("chunkSize", chunkSize)
-                    .put("completedBlocks", JSONArray(completedBlocks.sorted()))
-                    .put("updatedAt", System.currentTimeMillis())
-                    .toString(),
-                Charsets.UTF_8
-            )
-        }
-    }
-
-    private fun completedBlockBytes(blocks: List<TransferBlock>, completedBlocks: Set<Int>): Long =
-        completedBlocks.sumOf { index -> blocks.getOrNull(index)?.length ?: 0L }
-
-    private fun sha256File(file: File): String {
-        val digest = MessageDigest.getInstance("SHA-256")
-        file.inputStream().use { input ->
-            val buffer = ByteArray(128 * 1024)
-            while (true) {
-                val read = input.read(buffer)
-                if (read <= 0) break
-                digest.update(buffer, 0, read)
-            }
-        }
-        return digest.digest().joinToString("") { "%02x".format(it) }
-    }
-
-    private fun relativeSubDir(baseDir: File, relativePath: String): File {
-        var dir = baseDir
-        relativePath.split('/', '\\')
-            .dropLast(1)
-            .filter { it.isNotBlank() }
-            .map { sanitizeFileName(it) }
-            .filter { it != "." && it != ".." }
-            .take(8)
-            .forEach { dir = File(dir, it) }
-        return dir
-    }
-
     private fun notifyFileTransferProgress(notificationId: Int, name: String, received: Long, total: Long) {
         val percent = if (total > 0) ((received * 100) / total).toInt().coerceIn(0, 100) else 0
         val notification = NotificationCompat.Builder(this, CHANNEL_ID)
@@ -1705,63 +1630,6 @@ class NodeReceiverService : Service() {
         )
     }
 
-    private fun httpGetBytes(urlText: String): ByteArray {
-        val connection = (URL(urlText).openConnection() as HttpURLConnection).apply {
-            connectTimeout = FILE_TRANSFER_TIMEOUT_MS
-            readTimeout = FILE_TRANSFER_TIMEOUT_MS
-            requestMethod = "GET"
-            useCaches = false
-        }
-        return try {
-            val status = connection.responseCode
-            if (status != HttpURLConnection.HTTP_PARTIAL) {
-                throw IllegalStateException("HTTP $status")
-            }
-            connection.inputStream.use { it.readBytes() }
-        } finally {
-            connection.disconnect()
-        }
-    }
-
-    private fun sanitizeFileName(name: String): String {
-        val clean = name.substringAfterLast('/').substringAfterLast('\\')
-            .replace(Regex("[\\\\/\\x00-\\x1F<>:\"|?*]"), "_")
-            .trim()
-            .take(180)
-        return clean.ifBlank { "file" }
-    }
-
-    private fun uniqueFile(dir: File, name: String): File {
-        val safe = sanitizeFileName(name)
-        var candidate = File(dir, safe)
-        if (!candidate.exists()) return candidate
-        val dot = safe.lastIndexOf('.')
-        val stem = if (dot > 0) safe.substring(0, dot) else safe
-        val ext = if (dot > 0) safe.substring(dot) else ""
-        for (i in 1..9999) {
-            candidate = File(dir, "$stem ($i)$ext")
-            if (!candidate.exists()) return candidate
-        }
-        return File(dir, "$stem-${System.currentTimeMillis()}$ext")
-    }
-
-    private fun urlEncode(value: String): String =
-        URLEncoder.encode(value, Charsets.UTF_8.name())
-
-    private fun receivedStatusMessage(type: String, sourceName: String): String {
-        if (type == "clipboard_text") return "已同步剪贴板文本：$sourceName"
-        if (type == "clipboard_image") return "已同步剪贴板图片：$sourceName"
-        if (type == "clipboard_file" || type == "file_transfer") return "已接收文件同步请求：$sourceName"
-        return when (type) {
-            "sms" -> "收到中继验证码：$sourceName"
-            "sms_message" -> "收到中继短信：$sourceName"
-            "app_notification" -> "收到中继通知：$sourceName"
-            "clipboard" -> "已同步剪贴板：$sourceName"
-            else -> "收到中继消息：$sourceName"
-        }
-    }
-
-    /** 把同步来的剪贴板内容写入本机系统剪贴板（写入不受后台限制）。 */
     private fun writeClipboard(text: String) {
         if (text.isBlank()) return
         runCatching {
@@ -1827,7 +1695,7 @@ class NodeReceiverService : Service() {
     private fun clipboardImageExtension(mime: String): String =
         if (normalizeClipboardImageMime(mime) == "image/jpeg") "jpg" else "png"
 
-    private fun pullRemoteClipboardImage(payload: JSONObject): Boolean {
+    private suspend fun pullRemoteClipboardImage(payload: JSONObject): Boolean {
         val manifest = payload.optJSONObject("fileManifest") ?: return false
         val mime = normalizeClipboardImageMime(manifest.optString("mime"))
         if (mime.isBlank()) return false
@@ -1853,7 +1721,7 @@ class NodeReceiverService : Service() {
         return true
     }
 
-    private fun pullRemoteClipboardText(payload: JSONObject): Boolean {
+    private suspend fun pullRemoteClipboardText(payload: JSONObject): Boolean {
         val manifest = payload.optJSONObject("fileManifest") ?: return false
         val mime = manifest.optString("mime").lowercase(Locale.ROOT)
         if (
@@ -1998,122 +1866,61 @@ class NodeReceiverService : Service() {
         ClipboardSyncState.rememberHash(this, ts, origin, hash, "image")
     }
 
-    private fun sha256Hex(bytes: ByteArray): String {
-        return MessageDigest.getInstance("SHA-256")
-            .digest(bytes)
-            .joinToString("") { "%02x".format(it) }
-    }
-
-    private fun formatBytes(size: Long): String {
-        if (size <= 0L) return "0 B"
-        val units = arrayOf("B", "KB", "MB", "GB")
-        var value = size.toDouble()
-        var index = 0
-        while (value >= 1024.0 && index < units.lastIndex) {
-            value /= 1024.0
-            index += 1
-        }
-        return if (index == 0) {
-            "$size ${units[index]}"
-        } else {
-            String.format(Locale.US, "%.1f %s", value, units[index])
-        }
-    }
-
-    // gossip 改写只扩展目标到本机授权邻居，绝不重置 relayTtl：入站 TTL 必须
-    // 一路衰减（转发在 enqueueRelayPayload 里 -1），否则网状拓扑下 TTL 安全网失效，
-    // 唯一防线退化为去重表，去重表滚动淘汰后旧版本会被重新处理并再次 gossip → 风暴。
     private fun rewriteClipboardGossipTargets(payload: JSONObject) {
-        val targets = DeviceStore.getEnabledDevices(this)
-            .filter { it.allowClipboard }
-            .map { it.id }
+        val targets = RouteManager.targetsForType(
+            context = this,
+            type = "clipboard_text",
+            respectLocalSendSettings = false
+        )
+            .map { it.device.id }
         if (targets.isEmpty()) return
         payload.put("targetDeviceIds", JSONArray(targets))
     }
 
     private fun rewriteClipboardImageGossipTargets(payload: JSONObject) {
-        val targets = DeviceStore.getEnabledDevices(this)
-            .filter { it.allowClipboardImage || it.allowClipboard }
-            .map { it.id }
+        val targets = RouteManager.targetsForType(
+            context = this,
+            type = "clipboard_image",
+            respectLocalSendSettings = false
+        )
+            .map { it.device.id }
         if (targets.isEmpty()) return
         payload.put("targetDeviceIds", JSONArray(targets))
     }
 
-    private fun writeHttpResponse(socket: Socket, code: Int) {
-        try {
-            val text = if (code in 200..299) "OK" else "ERR"
-            val status = when (code) {
-                200 -> "200 OK"
-                202 -> "202 Accepted"
-                400 -> "400 Bad Request"
-                403 -> "403 Forbidden"
-                else -> "500 Internal Server Error"
-            }
-            val bytes = text.toByteArray(Charsets.UTF_8)
-            val response = "HTTP/1.1 $status\r\n" +
-                "Content-Type: text/plain; charset=utf-8\r\n" +
-                "Content-Length: ${bytes.size}\r\n" +
-                "Connection: close\r\n\r\n"
-            socket.getOutputStream().write(response.toByteArray(Charsets.UTF_8))
-            socket.getOutputStream().write(bytes)
-            socket.getOutputStream().flush()
-        } catch (e: Exception) {
-            Log.w(TAG, "Relay response write skipped: ${e.message}")
-        }
+    private fun rewriteClipboardFileGossipTargets(payload: JSONObject) {
+        val targets = RouteManager.targetsForType(
+            context = this,
+            type = "clipboard_file",
+            respectLocalSendSettings = false
+        )
+            .map { it.device.id }
+        if (targets.isEmpty()) return
+        payload.put("targetDeviceIds", JSONArray(targets))
     }
 
-    private fun writeJsonHttpResponse(socket: Socket, code: Int, body: JSONObject) {
-        try {
-            val status = when (code) {
-                200 -> "200 OK"
-                202 -> "202 Accepted"
-                400 -> "400 Bad Request"
-                403 -> "403 Forbidden"
-                404 -> "404 Not Found"
-                409 -> "409 Conflict"
-                410 -> "410 Gone"
-                416 -> "416 Range Not Satisfiable"
-                else -> "500 Internal Server Error"
-            }
-            val bytes = body.toString().toByteArray(Charsets.UTF_8)
-            val response = "HTTP/1.1 $status\r\n" +
-                "Content-Type: application/json; charset=utf-8\r\n" +
-                "Content-Length: ${bytes.size}\r\n" +
-                "Connection: close\r\n\r\n"
-            socket.getOutputStream().write(response.toByteArray(Charsets.UTF_8))
-            socket.getOutputStream().write(bytes)
-            socket.getOutputStream().flush()
-        } catch (e: Exception) {
-            Log.w(TAG, "JSON response write skipped: ${e.message}")
-        }
-    }
-
-    private fun writeBinaryHttpResponse(
-        socket: Socket,
-        code: Int,
-        body: ByteArray,
-        contentRange: String,
-        totalSize: Long
+    private fun relayClipboardGossipAfterApply(
+        payload: JSONObject,
+        rewriteTargets: (JSONObject) -> Unit
     ) {
-        try {
-            val status = when (code) {
-                206 -> "206 Partial Content"
-                200 -> "200 OK"
-                else -> "$code OK"
+        val ttl = payload.optInt("relayTtl", payload.optInt("ttl", 0))
+        if (ttl <= 0) return
+        val nextPayload = JSONObject(payload.toString())
+        rewriteTargets(nextPayload)
+        val targets = nextPayload.optJSONArray("targetDeviceIds")
+        if (targets == null || targets.length() == 0) return
+        val relayIntent = Intent(this, WebSocketService::class.java).apply {
+            action = WebSocketService.ACTION_RELAY_SMS
+            putExtra(WebSocketService.EXTRA_RELAY_PAYLOAD, nextPayload.toString())
+        }
+        runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(relayIntent)
+            } else {
+                startService(relayIntent)
             }
-            val response = "HTTP/1.1 $status\r\n" +
-                "Content-Type: application/octet-stream\r\n" +
-                "Content-Length: ${body.size}\r\n" +
-                "Accept-Ranges: bytes\r\n" +
-                "Content-Range: $contentRange\r\n" +
-                "X-CodeBridge-File-Size: $totalSize\r\n" +
-                "Cache-Control: no-store\r\n" +
-                "Connection: close\r\n\r\n"
-            socket.getOutputStream().write(response.toByteArray(Charsets.UTF_8))
-            socket.getOutputStream().write(body)
-            socket.getOutputStream().flush()
-        } catch (e: Exception) {
-            Log.w(TAG, "Binary response write skipped: ${e.message}")
+        }.onFailure {
+            Log.w(TAG, "Clipboard gossip relay start skipped: ${it.message}")
         }
     }
 

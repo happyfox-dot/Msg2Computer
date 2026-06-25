@@ -11,7 +11,7 @@ const {
   createRecentDeliveryTracker
 } = require('../src/main/message-router')
 
-test('message settings default to receiving SMS and notifications but not clipboard/file sync', () => {
+test('message settings default to receiving SMS, notifications, and manual file requests only', () => {
   const settings = normalizeMessageSettings({})
 
   assert.equal(settings.receiveSmsCodes, true)
@@ -20,7 +20,9 @@ test('message settings default to receiving SMS and notifications but not clipbo
   assert.equal(settings.syncClipboardText, false)
   assert.equal(settings.syncClipboardImage, false)
   assert.equal(settings.syncClipboardFile, false)
-  assert.equal(settings.receiveFileTransfer, false)
+  assert.equal(settings.receiveFileTransfer, true)
+  assert.equal(canReceiveContentType('clipboard_file', settings), false)
+  assert.equal(canReceiveContentType('file_transfer', settings), true)
   assert.equal(settings.maxFileSizeMb, 50)
 })
 
@@ -62,6 +64,7 @@ test('per-node policy can block individual content types', () => {
   assert.equal(canPushContentToNode(target, 'app_notification'), false)
   assert.equal(canPushContentToNode(target, 'clipboard_text'), true)
   assert.equal(canPushContentToNode(target, 'clipboard_image'), false)
+  assert.equal(canPushContentToNode(target, 'clipboard_file'), true)
   assert.equal(canPushContentToNode(target, 'file_transfer'), true)
 })
 

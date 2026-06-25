@@ -1,24 +1,9 @@
 'use strict'
 
-function normalizeNetworkHost(value) {
-  const host = String(value || '').trim()
-  if (host.startsWith('::ffff:')) return host.slice(7)
-  return host
-}
-
-function collectNetworkHosts(...values) {
-  const hosts = []
-  const add = value => {
-    if (Array.isArray(value)) {
-      value.forEach(add)
-      return
-    }
-    const host = normalizeNetworkHost(value || '')
-    if (host && !hosts.includes(host)) hosts.push(host)
-  }
-  values.forEach(add)
-  return hosts
-}
+const {
+  normalizeNetworkHost,
+  collectNetworkHosts
+} = require('./network-utils')
 
 function primaryTrustedNodeHost(node = {}) {
   return collectNetworkHosts(

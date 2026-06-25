@@ -13,6 +13,7 @@ data class DesktopDevice(
     val port: Int,
     val pairingKey: String,
     val enabled: Boolean,
+    val revoked: Boolean = false,
     val lastSyncAt: Long,
     val connectionUpdatedAt: Long,
     val updatedAt: Long,
@@ -86,6 +87,7 @@ object DeviceStore {
                         port = normalizePortForType(deviceType, item.optInt("port", defaultPortForType(deviceType))),
                         pairingKey = pairingKey,
                         enabled = item.optBoolean("enabled", true),
+                        revoked = item.optBoolean("revoked", false),
                         lastSyncAt = item.optLong("lastSyncAt", 0L),
                         connectionUpdatedAt = item.optLong("connectionUpdatedAt", 0L),
                         updatedAt = item.optLong("updatedAt", System.currentTimeMillis()),
@@ -128,7 +130,7 @@ object DeviceStore {
     }
 
     fun getEnabledDevices(context: Context): List<DesktopDevice> =
-        getDevices(context).filter { it.enabled }
+        getDevices(context).filter { it.enabled && !it.revoked }
 
     fun findDevice(context: Context, id: String): DesktopDevice? =
         getDevices(context).firstOrNull { it.id == id }
@@ -163,6 +165,7 @@ object DeviceStore {
         policyAllowFileTransfer: Boolean? = null,
         policyMaxFileSizeMb: Int? = null,
         policyAutoAcceptFiles: Boolean? = null,
+        revoked: Boolean? = null,
         // 「启用」开关归本机用户所有：null（默认）表示本次调用不改写已存值，
         // 仅新建条目时取 true。拓扑同步（topology_sync/gossip）必须用默认值，
         // 否则用户在本机禁用的推送目标会被任何一次同步悄悄重新启用；
@@ -195,6 +198,7 @@ object DeviceStore {
                 port = normalizedPort,
                 pairingKey = pairingKey,
                 enabled = enabled ?: existing.enabled,
+                revoked = revoked ?: if (enabled == true) false else existing.revoked,
                 lastSyncAt = existing.lastSyncAt,
                 connectionUpdatedAt = existing.connectionUpdatedAt,
                 updatedAt = now,
@@ -233,6 +237,7 @@ object DeviceStore {
                 port = normalizedPort,
                 pairingKey = pairingKey,
                 enabled = enabled ?: true,
+                revoked = revoked ?: false,
                 lastSyncAt = 0L,
                 connectionUpdatedAt = 0L,
                 updatedAt = now,
@@ -292,6 +297,7 @@ object DeviceStore {
             old.port != next.port ||
             old.pairingKey != next.pairingKey ||
             old.enabled != next.enabled ||
+            old.revoked != next.revoked ||
             old.routeMetric != next.routeMetric ||
             old.routeNextHopId != next.routeNextHopId ||
             old.routeNextHopName != next.routeNextHopName ||
@@ -404,6 +410,7 @@ object DeviceStore {
                     .put("port", device.port)
                     .put("pairingKey", device.pairingKey)
                     .put("enabled", device.enabled)
+                    .put("revoked", device.revoked)
                     .put("lastSyncAt", device.lastSyncAt)
                     .put("connectionUpdatedAt", device.connectionUpdatedAt)
                     .put("updatedAt", device.updatedAt)

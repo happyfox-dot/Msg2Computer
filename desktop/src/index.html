@@ -1,9 +1,9 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>验证码同步</title>
+<title>楠岃瘉鐮佸悓姝?/title>
 <link rel="stylesheet" href="styles.css">
 <link rel="stylesheet" href="qr-styles.css">
 <link rel="stylesheet" href="notification.css">
@@ -12,269 +12,273 @@
 <body>
 <div id="app">
   <div id="titlebar">
-    <span class="title-text">🔐 验证码同步</span>
+    <span class="title-text">馃攼 楠岃瘉鐮佸悓姝?/span>
     <div class="titlebar-actions">
-      <button id="btn-min" title="最小化">─</button>
-      <button id="btn-close" title="隐藏">✕</button>
+      <button id="btn-min" title="鏈€灏忓寲">鈹€</button>
+      <button id="btn-close" title="闅愯棌">鉁?/button>
     </div>
   </div>
 
-  <!-- 标签页导航 -->
+  <!-- 鏍囩椤靛鑸?-->
   <div id="tabs-nav">
     <button class="tab-btn active" data-tab="sms">
-      <span class="tab-icon">📋</span>
-      <span class="tab-label">短信验证码</span>
+      <span class="tab-icon">馃搵</span>
+      <span class="tab-label">鐭俊楠岃瘉鐮?/span>
     </button>
     <button class="tab-btn" data-tab="totp">
-      <span class="tab-icon">⏱️</span>
-      <span class="tab-label">动态验证码</span>
+      <span class="tab-icon">鈴憋笍</span>
+      <span class="tab-label">鍔ㄦ€侀獙璇佺爜</span>
     </button>
     <button class="tab-btn" data-tab="topology">
-      <span class="tab-icon">◎</span>
-      <span class="tab-label">拓扑图</span>
+      <span class="tab-icon">鈼?/span>
+      <span class="tab-label">鎷撴墤鍥?/span>
     </button>
     <button class="tab-btn" data-tab="phones">
-      <span class="tab-icon">📲</span>
-      <span class="tab-label">已授权设备</span>
+      <span class="tab-icon">馃摬</span>
+      <span class="tab-label">宸叉巿鏉冭澶?/span>
       <span id="phones-count" class="tab-badge"></span>
     </button>
     <button class="tab-btn" data-tab="pairing">
-      <span class="tab-icon">🔗</span>
-      <span class="tab-label">配对</span>
+      <span class="tab-icon">馃敆</span>
+      <span class="tab-label">閰嶅</span>
     </button>
     <button class="tab-btn" data-tab="settings">
-      <span class="tab-icon">⚙️</span>
-      <span class="tab-label">设置</span>
+      <span class="tab-icon">鈿欙笍</span>
+      <span class="tab-label">璁剧疆</span>
     </button>
   </div>
 
-  <!-- 标签页内容容器 -->
+  <!-- 鏍囩椤靛唴瀹瑰鍣?-->
   <div id="tabs-content">
 
-    <!-- 短信验证码标签页 -->
+    <!-- 鐭俊楠岃瘉鐮佹爣绛鹃〉 -->
     <div class="tab-panel active" data-panel="sms">
       <div class="panel-header">
-        <h2 class="panel-title">短信验证码</h2>
-        <div class="display-mode-toggle" aria-label="短信显示模式">
-          <button id="btn-display-code" class="active" type="button">验证码</button>
-          <button id="btn-display-raw" type="button">原文</button>
+        <h2 class="panel-title">鐭俊楠岃瘉鐮?/h2>
+        <div class="display-mode-toggle" aria-label="鐭俊鏄剧ず妯″紡">
+          <button id="btn-display-code" class="active" type="button">楠岃瘉鐮?/button>
+          <button id="btn-display-raw" type="button">鍘熸枃</button>
         </div>
       </div>
       <div class="panel-body scrollable">
         <div id="codes-list">
-          <div class="empty-state">等待接收验证码...</div>
+          <div class="empty-state">绛夊緟鎺ユ敹楠岃瘉鐮?..</div>
         </div>
       </div>
     </div>
 
-    <!-- TOTP 动态验证码标签页 -->
+    <!-- TOTP 鍔ㄦ€侀獙璇佺爜鏍囩椤?-->
     <div class="tab-panel" data-panel="totp">
       <div class="panel-header">
-        <h2 class="panel-title">TOTP 动态验证码</h2>
+        <h2 class="panel-title">TOTP 鍔ㄦ€侀獙璇佺爜</h2>
         <div class="totp-actions">
-          <button id="btn-upload-qr" class="btn-action" title="上传二维码">📁 上传</button>
-          <button id="btn-paste-qr" class="btn-action" title="从剪贴板粘贴">📋 粘贴</button>
+          <button id="btn-upload-qr" class="btn-action" title="涓婁紶浜岀淮鐮?>馃搧 涓婁紶</button>
+          <button id="btn-paste-qr" class="btn-action" title="浠庡壀璐存澘绮樿创">馃搵 绮樿创</button>
           <label class="auto-monitor-label">
             <input type="checkbox" id="chk-auto-monitor">
-            <span>自动监听</span>
+            <span>鑷姩鐩戝惉</span>
           </label>
         </div>
       </div>
       <div class="panel-body scrollable">
-        <!-- 拖拽区域 -->
+        <!-- 鎷栨嫿鍖哄煙 -->
         <div id="qr-drop-zone" class="qr-drop-zone">
           <div class="drop-zone-content">
-            <div class="drop-icon">📷</div>
-            <p class="drop-title">拖拽二维码图片到这里</p>
-            <p class="drop-hint">支持 Google Authenticator 迁移和标准 TOTP 二维码</p>
+            <div class="drop-icon">馃摲</div>
+            <p class="drop-title">鎷栨嫿浜岀淮鐮佸浘鐗囧埌杩欓噷</p>
+            <p class="drop-hint">鏀寔 Google Authenticator 杩佺Щ鍜屾爣鍑?TOTP 浜岀淮鐮?/p>
           </div>
         </div>
 
         <div id="totp-list">
-          <div class="empty-state">暂无 TOTP 验证码</div>
+          <div class="empty-state">鏆傛棤 TOTP 楠岃瘉鐮?/div>
         </div>
       </div>
     </div>
 
-    <!-- 设备拓扑标签页 -->
+    <!-- 璁惧鎷撴墤鏍囩椤?-->
     <div class="tab-panel" data-panel="topology">
       <div class="panel-header">
-        <h2 class="panel-title">设备拓扑</h2>
-        <button id="btn-merge-network" class="btn-action" data-action="scan-lan-devices" type="button">发现并合并节点</button>
-        <button id="btn-refresh-topology" class="btn-action" type="button">刷新</button>
+        <h2 class="panel-title">璁惧鎷撴墤</h2>
+        <button id="btn-merge-network" class="btn-action" data-action="scan-lan-devices" type="button">鍙戠幇骞跺悎骞惰妭鐐?/button>
+        <button id="btn-refresh-topology" class="btn-action" type="button">鍒锋柊</button>
       </div>
       <div class="panel-body scrollable">
         <div id="topology-summary" class="topology-summary"></div>
         <div id="topology-graph" class="topology-graph">
-          <div class="empty-state">暂无拓扑数据</div>
+          <div class="empty-state">鏆傛棤鎷撴墤鏁版嵁</div>
         </div>
         <div id="topology-node-detail" class="topology-node-detail">
-          <div class="topology-node-detail-empty">点击或悬停节点查看设备详情</div>
+          <div class="topology-node-detail-empty">鐐瑰嚮鎴栨偓鍋滆妭鐐规煡鐪嬭澶囪鎯?/div>
         </div>
         <div id="topology-edge-list" class="topology-edge-list"></div>
       </div>
     </div>
 
-    <!-- 已授权设备标签页 -->
+    <!-- 宸叉巿鏉冭澶囨爣绛鹃〉 -->
     <div class="tab-panel" data-panel="phones">
       <div class="panel-header">
-        <h2 class="panel-title">已授权设备</h2>
+        <h2 class="panel-title">宸叉巿鏉冭澶?/h2>
       </div>
       <div class="panel-body scrollable">
         <div id="phones-list">
-          <div class="empty-state">暂无已授权设备</div>
+          <div class="empty-state">鏆傛棤宸叉巿鏉冭澶?/div>
         </div>
       </div>
     </div>
 
-    <!-- 配对标签页 -->
+    <!-- 閰嶅鏍囩椤?-->
     <div class="tab-panel" data-panel="pairing">
       <div class="panel-header">
-        <h2 class="panel-title">设备配对</h2>
+        <h2 class="panel-title">璁惧閰嶅</h2>
       </div>
       <div class="panel-body scrollable">
         <div id="qr-container">
-          <img id="qr-image" src="" alt="配对二维码" />
-          <p class="hint">使用手机端 App 扫描二维码，或在局域网内发现其它设备节点</p>
+          <img id="qr-image" src="" alt="閰嶅浜岀淮鐮? />
+          <p class="hint">浣跨敤鎵嬫満绔?App 鎵弿浜岀淮鐮侊紝鎴栧湪灞€鍩熺綉鍐呭彂鐜板叾瀹冭澶囪妭鐐?/p>
           <p id="pairing-address" class="pairing-address"></p>
         </div>
-        <button id="btn-refresh-qr" class="btn-secondary">🔄 重新生成配对码</button>
-        <button id="btn-copy-address" class="btn-secondary" type="button">📋 复制连接地址</button>
+        <button id="btn-refresh-qr" class="btn-secondary">馃攧 閲嶆柊鐢熸垚閰嶅鐮?/button>
+        <button id="btn-copy-address" class="btn-secondary" type="button">馃搵 澶嶅埗杩炴帴鍦板潃</button>
         <div class="lan-discovery-section">
           <div class="lan-discovery-header">
-            <span>局域网设备</span>
-            <button id="btn-scan-lan" class="btn-action" data-action="scan-lan-devices" type="button">发现并合并节点</button>
+            <span>灞€鍩熺綉璁惧</span>
+            <button id="btn-scan-lan" class="btn-action" data-action="scan-lan-devices" type="button">鍙戠幇骞跺悎骞惰妭鐐?/button>
           </div>
           <div id="lan-devices-list" class="lan-devices-list">
-            <div class="empty-state">点击“发现设备”扫描同一局域网内的客户端</div>
+            <div class="empty-state">鐐瑰嚮鈥滃彂鐜拌澶団€濇壂鎻忓悓涓€灞€鍩熺綉鍐呯殑瀹㈡埛绔?/div>
           </div>
         </div>
       </div>
     </div>
 
-    <!-- 设置标签页 -->
+    <!-- 璁剧疆鏍囩椤?-->
     <div class="tab-panel" data-panel="settings">
       <div class="panel-header">
-        <h2 class="panel-title">设置与诊断</h2>
+        <h2 class="panel-title">璁剧疆涓庤瘖鏂?/h2>
       </div>
       <div class="panel-body scrollable">
         <div class="settings-group">
-          <h3 class="settings-group-title">连接状态</h3>
+          <h3 class="settings-group-title">杩炴帴鐘舵€?/h3>
           <div class="settings-item">
-            <span class="settings-label">当前状态</span>
-            <span id="connection-status-detail" class="status-disconnected">● 等待同步</span>
+            <span class="settings-label">褰撳墠鐘舵€?/span>
+            <span id="connection-status-detail" class="status-disconnected">鈼?绛夊緟鍚屾</span>
           </div>
         </div>
 
         <div class="settings-group">
-          <h3 class="settings-group-title">统计信息</h3>
+          <h3 class="settings-group-title">缁熻淇℃伅</h3>
           <div class="settings-item">
-            <span class="settings-label">已授权设备</span>
-            <span id="stats-phones" class="settings-value">0 台</span>
+            <span class="settings-label">宸叉巿鏉冭澶?/span>
+            <span id="stats-phones" class="settings-value">0 鍙?/span>
           </div>
           <div class="settings-item">
-            <span class="settings-label">短信验证码</span>
-            <span id="stats-sms" class="settings-value">0 条</span>
+            <span class="settings-label">鐭俊楠岃瘉鐮?/span>
+            <span id="stats-sms" class="settings-value">0 鏉?/span>
           </div>
           <div class="settings-item">
-            <span class="settings-label">TOTP 验证码</span>
-            <span id="stats-totp" class="settings-value">0 个</span>
+            <span class="settings-label">TOTP 楠岃瘉鐮?/span>
+            <span id="stats-totp" class="settings-value">0 涓?/span>
           </div>
         </div>
 
         <div class="settings-group">
-          <h3 class="settings-group-title">接收内容</h3>
+          <h3 class="settings-group-title">鎺ユ敹鍐呭</h3>
           <label class="settings-item settings-checkbox">
-            <span class="settings-label">验证码短信</span>
+            <span class="settings-label">楠岃瘉鐮佺煭淇?/span>
             <input type="checkbox" id="chk-receive-sms-codes">
           </label>
           <label class="settings-item settings-checkbox">
-            <span class="settings-label">普通短信</span>
+            <span class="settings-label">鏅€氱煭淇?/span>
             <input type="checkbox" id="chk-receive-all-sms">
           </label>
           <label class="settings-item settings-checkbox">
-            <span class="settings-label">App 通知</span>
+            <span class="settings-label">App 閫氱煡</span>
             <input type="checkbox" id="chk-receive-notifications">
           </label>
         </div>
 
         <div class="settings-group">
-          <h3 class="settings-group-title">可信入网</h3>
+          <h3 class="settings-group-title">鍙俊鍏ョ綉</h3>
           <label class="settings-item settings-checkbox">
-            <span class="settings-label">允许其它设备请求加入本网络</span>
+            <span class="settings-label">鍏佽鍏跺畠璁惧璇锋眰鍔犲叆鏈綉缁?/span>
             <input type="checkbox" id="chk-allow-lan-join">
           </label>
           <div class="settings-item">
-            <span class="settings-label settings-hint">关闭后，本机仍会出现在局域网发现中，但会拒绝新的入网确认请求。</span>
+            <span class="settings-label settings-hint">鍏抽棴鍚庯紝鏈満浠嶄細鍑虹幇鍦ㄥ眬鍩熺綉鍙戠幇涓紝浣嗕細鎷掔粷鏂扮殑鍏ョ綉纭璇锋眰銆?/span>
           </div>
         </div>
 
         <div class="settings-group">
-          <h3 class="settings-group-title">剪贴板同步</h3>
+          <h3 class="settings-group-title">鍓创鏉垮悓姝?/h3>
           <label class="settings-item settings-checkbox">
-            <span class="settings-label">同步文本剪贴板</span>
+            <span class="settings-label">鍚屾鏂囨湰鍓创鏉?/span>
             <input type="checkbox" id="chk-sync-clipboard-text">
           </label>
           <label class="settings-item settings-checkbox">
-            <span class="settings-label">同步图片剪贴板</span>
+            <span class="settings-label">鍚屾鍥剧墖鍓创鏉?/span>
             <input type="checkbox" id="chk-sync-clipboard-image">
           </label>
           <label class="settings-item settings-checkbox">
-            <span class="settings-label">接收文件/文件剪贴板</span>
+            <span class="settings-label">鍚屾鏂囦欢鍓创鏉?/span>
             <input type="checkbox" id="chk-sync-clipboard-file">
           </label>
+          <label class="settings-item settings-checkbox">
+            <span class="settings-label">鎺ユ敹涓诲姩鏂囦欢浼犺緭</span>
+            <input type="checkbox" id="chk-receive-file-transfer">
+          </label>
           <div class="settings-item">
-            <span class="settings-label settings-hint">文本会自动同步；图片优先同步较小 PNG；文件默认关闭，开启后通过独立加密分片通道传输。</span>
+            <span class="settings-label settings-hint">鏂囨湰浼氳嚜鍔ㄥ悓姝ワ紱鍥剧墖浼樺厛鍚屾杈冨皬 PNG锛涗富鍔ㄦ枃浠朵紶杈撻粯璁ら渶瑕佺‘璁わ紝鏂囦欢鍓创鏉夸粛闇€鍗曠嫭寮€鍚€?/span>
           </div>
           <div class="settings-item">
-            <span class="settings-label">主动发送文件</span>
+            <span class="settings-label">涓诲姩鍙戦€佹枃浠?/span>
             <div class="update-control">
-              <button id="btn-send-file" class="btn-action" type="button">选择文件发送</button>
-              <button id="btn-send-folder" class="btn-action" type="button">发送文件夹</button>
+              <button id="btn-send-file" class="btn-action" type="button">閫夋嫨鏂囦欢鍙戦€?/button>
+              <button id="btn-send-folder" class="btn-action" type="button">鍙戦€佹枃浠跺す</button>
               <span id="file-transfer-status" class="settings-hint"></span>
             </div>
           </div>
           <div class="settings-item file-save-path-row">
-            <span class="settings-label">接收保存目录</span>
+            <span class="settings-label">鎺ユ敹淇濆瓨鐩綍</span>
             <div class="file-save-path-control">
               <span id="file-download-dir" class="settings-hint"></span>
-              <button id="btn-file-download-dir" class="btn-inline" type="button">选择</button>
-              <button id="btn-file-download-dir-default" class="btn-inline" type="button">默认</button>
-              <button id="btn-open-file-download-dir" class="btn-inline" type="button">打开</button>
+              <button id="btn-file-download-dir" class="btn-inline" type="button">閫夋嫨</button>
+              <button id="btn-file-download-dir-default" class="btn-inline" type="button">榛樿</button>
+              <button id="btn-open-file-download-dir" class="btn-inline" type="button">鎵撳紑</button>
             </div>
           </div>
           <div class="file-target-panel">
             <div class="file-panel-header">
-              <span>接收节点</span>
-              <button id="btn-refresh-file-targets" class="btn-inline" type="button">刷新</button>
+              <span>鎺ユ敹鑺傜偣</span>
+              <button id="btn-refresh-file-targets" class="btn-inline" type="button">鍒锋柊</button>
             </div>
             <div id="file-target-list" class="file-target-list"></div>
           </div>
           <div id="file-transfer-list" class="file-transfer-list"></div>
           <div class="file-history-panel">
             <div class="file-panel-header">
-              <span>接收历史</span>
-              <button id="btn-refresh-file-history" class="btn-inline" type="button">刷新</button>
+              <span>鎺ユ敹鍘嗗彶</span>
+              <button id="btn-refresh-file-history" class="btn-inline" type="button">鍒锋柊</button>
             </div>
             <div id="file-history-list" class="file-history-list"></div>
           </div>
         </div>
 
         <div class="settings-group">
-          <h3 class="settings-group-title">关于</h3>
+          <h3 class="settings-group-title">鍏充簬</h3>
           <div class="settings-item">
-            <span class="settings-label">版本号</span>
+            <span class="settings-label">鐗堟湰鍙?/span>
             <span id="app-version" class="settings-value">v1.0.29</span>
           </div>
           <div class="settings-item">
-            <span class="settings-label">软件更新</span>
+            <span class="settings-label">杞欢鏇存柊</span>
             <div class="update-control">
-              <button id="btn-check-update" class="btn-action" type="button">检查更新</button>
+              <button id="btn-check-update" class="btn-action" type="button">妫€鏌ユ洿鏂?/button>
               <span id="update-status-text" class="settings-hint"></span>
             </div>
           </div>
           <div class="settings-item">
-            <span class="settings-label">项目地址</span>
+            <span class="settings-label">椤圭洰鍦板潃</span>
             <a href="#" id="link-github" class="settings-link">GitHub</a>
           </div>
         </div>
@@ -284,13 +288,14 @@
   </div>
 
   <div id="status-bar">
-    <span id="connection-status" class="status-disconnected">● 等待同步</span>
+    <span id="connection-status" class="status-disconnected">鈼?绛夊緟鍚屾</span>
   </div>
 </div>
 
 <script src="totp.js"></script>
 <script src="device-helpers.js"></script>
-<script src="renderer.js"></script>
+<script src="renderer-parts/renderer-part-001.js"></script>
+<script src="renderer-parts/renderer-part-002.js"></script>
 <script src="qr-handler.js"></script>
 </body>
 </html>

@@ -8,8 +8,8 @@ import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import com.codesync.service.WebSocketService
 import com.codesync.util.ClipboardHistoryStore
-import com.codesync.util.DeviceStore
 import com.codesync.util.PhoneIdentityStore
+import com.codesync.util.RouteManager
 import com.codesync.util.SettingsStore
 
 /**
@@ -39,7 +39,7 @@ class ClipboardSyncActivity : AppCompatActivity() {
             Toast.makeText(this, R.string.clipboard_sync_disabled, Toast.LENGTH_SHORT).show()
             return
         }
-        if (DeviceStore.getEnabledDevices(this).none { it.allowClipboard }) {
+        if (RouteManager.targetsForType(this, "clipboard_text").isEmpty()) {
             Toast.makeText(this, R.string.clipboard_no_target, Toast.LENGTH_SHORT).show()
             return
         }

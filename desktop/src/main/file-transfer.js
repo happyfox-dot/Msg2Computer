@@ -65,14 +65,27 @@ function timingSafeStrEqual(a, b) {
   return crypto.timingSafeEqual(bufA, bufB)
 }
 
+function isPhoneSource(source = {}) {
+  const type = String(source.type || source.deviceType || '').toUpperCase()
+  return type.includes('PHONE') || type.includes('ANDROID')
+}
+
+function resolveChunkTransferKey(source = {}, identity = {}) {
+  // Android sources verify chunks with the source phone key; desktop sources
+  // verify with the requester's node key.
+  if (isPhoneSource(source)) return String(source.pairingKey || '').trim()
+  return String(identity.pairingKey || '').trim() || String(source.pairingKey || '').trim()
+}
+
 // relativePath 的目录部分（最后一段是文件名，由 manifest.name 决定）。
 // 逐段消毒并丢弃 ".."/"."，杜绝远端构造路径穿越。
 function safeRelativeDir(relativePath) {
   return String(relativePath || '')
     .split(/[\\/]+/)
     .slice(0, -1)
-    .map(part => sanitizeFileName(part))
     .filter(part => part && part !== '.' && part !== '..')
+    .map(part => sanitizeFileName(part))
+    .filter(Boolean)
     .slice(0, 8)
     .join(path.sep)
 }
@@ -464,6 +477,12 @@ function createFileTransfer(deps = {}) {
     }
 
     const identity = getIdentity()
+    const transferKey = resolveChunkTransferKey(source, identity)
+    if (!transferKey) {
+      onError({ phase: 'pull', fileId, error: 'missing chunk transfer key' })
+      incomingTransfers.delete(fileId)
+      return false
+    }
     const name = sanitizeFileName(manifest.name)
     const usePlainChunks = Array.isArray(manifest.chunkEncodings) && manifest.chunkEncodings.includes('none')
     const tmpPath = path.join(tmpDir, `${fileId}.part`)
@@ -536,7 +555,7 @@ function createFileTransfer(deps = {}) {
           for (let attempt = 0; attempt < 2; attempt++) {
             // nonce 每次请求重新生成：上一通道可能已把 nonce 送达源设备
             const nonce = generateNonce()
-            const authToken = hmacBase64(source.pairingKey, `${identity.id}|${nonce}|${fileId}|${offset}-${to}`)
+            const authToken = hmacBase64(transferKey, `${identity.id}|${nonce}|${fileId}|${offset}-${to}`)
             const query =
               `from=${offset}&to=${to}` +
               `&senderId=${encodeURIComponent(identity.id)}` +
@@ -577,7 +596,7 @@ function createFileTransfer(deps = {}) {
               lastChunkError = `chunk pull failed: all transports unreachable @${offset}`
               continue
             }
-            const candidate = usePlainChunks ? resp.body : decryptBytes(resp.body, source.pairingKey)
+            const candidate = usePlainChunks ? resp.body : decryptBytes(resp.body, transferKey)
             if (!candidate) {
               lastChunkError = `chunk decrypt failed @${offset}`
               continue

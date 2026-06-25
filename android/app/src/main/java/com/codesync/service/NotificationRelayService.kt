@@ -8,7 +8,7 @@ import android.os.Bundle
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import android.util.Log
-import com.codesync.util.DeviceStore
+import com.codesync.util.RouteManager
 import com.codesync.util.SettingsStore
 
 class NotificationRelayService : NotificationListenerService() {
@@ -50,7 +50,7 @@ class NotificationRelayService : NotificationListenerService() {
         }
         if (sbn.packageName == packageName) return
         if (sbn.isOngoing) return
-        val targets = DeviceStore.getEnabledDevices(this).filter { it.allowNotifications }
+        val targets = RouteManager.targetsForType(this, "app_notification").map { it.device }
         if (targets.isEmpty()) {
             Log.d(TAG, "收到通知但没有允许 App 通知的目标，package=${sbn.packageName}")
             WebSocketService.reportExternalStatus(this, "收到通知，但没有启用“应用通知”的推送目标")

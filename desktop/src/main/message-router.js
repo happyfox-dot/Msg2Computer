@@ -8,7 +8,7 @@ function normalizeMessageSettings(settings = {}) {
     syncClipboardText: settings.syncClipboardText === true || legacyClipboard,
     syncClipboardImage: settings.syncClipboardImage === true,
     syncClipboardFile: settings.syncClipboardFile === true,
-    receiveFileTransfer: settings.receiveFileTransfer === true,
+    receiveFileTransfer: settings.receiveFileTransfer !== false,
     autoAcceptFiles: settings.autoAcceptFiles === true,
     maxFileSizeMb: Number.isFinite(Number(settings.maxFileSizeMb))
       ? Math.max(1, Math.min(512, Math.round(Number(settings.maxFileSizeMb))))
@@ -57,7 +57,9 @@ function canPushContentToNode(target, type, codeTypes = {}) {
     return policy.allowClipboardText
   }
   if (type === codeTypes.CLIPBOARD_IMAGE || type === 'clipboard_image') return policy.allowClipboardImage
-  if (type === codeTypes.CLIPBOARD_FILE || type === 'clipboard_file') return policy.allowClipboardFile
+  if (type === codeTypes.CLIPBOARD_FILE || type === 'clipboard_file') {
+    return policy.allowClipboardFile || policy.allowFileTransfer
+  }
   if (type === codeTypes.FILE_TRANSFER || type === 'file_transfer') return policy.allowFileTransfer
   if (type === codeTypes.EXTERNAL_EVENT || type === 'external_event') return policy.allowExternalEvents
   if (type === 'totp' || type === 'totp_sync' || type === 'totp_seed' || type === 'totp_revoke') {

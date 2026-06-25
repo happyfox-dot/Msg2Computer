@@ -22,6 +22,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   openFileTransferDownloadDir: () => ipcRenderer.invoke('file-transfer-open-download-dir'),
   openFileTransferPath: (filePath) => ipcRenderer.invoke('file-transfer-open-path', filePath),
   revealFileTransferPath: (filePath) => ipcRenderer.invoke('file-transfer-reveal-path', filePath),
+  copyFileTransferPathsToClipboard: (filePaths) => ipcRenderer.invoke('file-transfer-copy-to-clipboard', filePaths),
   getLanJoinSettings: () => ipcRenderer.invoke('get-lan-join-settings'),
   setLanJoinSettings: (updates) => ipcRenderer.invoke('set-lan-join-settings', updates),
   isWindowVisible: () => ipcRenderer.invoke('is-window-visible'),

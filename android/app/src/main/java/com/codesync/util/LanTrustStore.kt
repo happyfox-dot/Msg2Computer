@@ -45,6 +45,20 @@ object LanTrustStore {
         }
     }
 
+    fun rollbackNetworkIdAdoption(
+        context: Context,
+        previousNetworkId: String,
+        adoptedNetworkId: String
+    ) {
+        val previous = previousNetworkId.trim()
+        val adopted = adoptedNetworkId.trim()
+        if (previous.isBlank() || adopted.isBlank() || previous == adopted) return
+        val prefs = SecurePrefs.get(context, PREFS_NAME)
+        prefs.edit().putString(KEY_NETWORK_ID, previous).apply()
+        DeviceStore.rewriteNetworkId(context, previous, listOf(adopted))
+        TopologyStore.rewriteNetworkId(context, previous, listOf(adopted))
+    }
+
     fun consumePendingMergeFrom(context: Context): List<String> {
         val prefs = SecurePrefs.get(context, PREFS_NAME)
         val raw = prefs.getString(KEY_PENDING_MERGE_FROM, "[]").orEmpty()

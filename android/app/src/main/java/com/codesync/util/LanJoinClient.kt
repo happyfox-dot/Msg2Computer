@@ -87,36 +87,46 @@ object LanJoinClient {
             mergeFromNetworkIds = mergeFromNetworkIds
         )
 
-        val device = DeviceStore.upsertDevice(
-            context = context,
-            host = node.optString("host", target.host).ifBlank { target.host },
-            port = node.optInt("port", target.port),
-            pairingKey = pairingKey,
-            name = node.optString("name", target.name).ifBlank { target.name },
-            deviceId = node.optString("id", target.id).ifBlank { target.id },
-            deviceType = node.optString("type", target.type).ifBlank { target.type },
-            altHosts = listOfNotNull(node.optString("tsHost").takeIf { it.isNotBlank() }),
-            networkId = networkId,
-            autoPaired = true,
-            trustSourceId = accept.optString("acceptedByNodeId", node.optString("id", target.id)),
-            trustLevel = "trusted_lan",
-            acceptedAt = acceptedAt,
-            capabilities = node.optJSONObject("capabilities")?.toString().orEmpty(),
-            enabled = true
-        )
-        applyContentPolicy(context, device.id, accept.optJSONObject("initialContentPolicy"))
-        val updatedDevice = DeviceStore.findDevice(context, device.id) ?: device
-        TopologyStore.markDeviceState(context, updatedDevice, enabled = true)
-        accept.optJSONObject("topologySnapshot")?.let {
-            TopologyStore.applyDelta(
+        return try {
+            val device = DeviceStore.upsertDevice(
                 context = context,
-                rawDelta = it,
-                allowNetworkMerge = true,
-                mergeToNetworkId = networkId,
-                mergeFromNetworkIds = mergeFromNetworkIds
+                host = node.optString("host", target.host).ifBlank { target.host },
+                port = node.optInt("port", target.port),
+                pairingKey = pairingKey,
+                name = node.optString("name", target.name).ifBlank { target.name },
+                deviceId = node.optString("id", target.id).ifBlank { target.id },
+                deviceType = node.optString("type", target.type).ifBlank { target.type },
+                altHosts = listOfNotNull(node.optString("tsHost").takeIf { it.isNotBlank() }),
+                networkId = networkId,
+                autoPaired = true,
+                trustSourceId = accept.optString("acceptedByNodeId", node.optString("id", target.id)),
+                trustLevel = "trusted_lan",
+                acceptedAt = acceptedAt,
+                capabilities = node.optJSONObject("capabilities")?.toString().orEmpty(),
+                enabled = true,
+                revoked = false
             )
+            applyContentPolicy(context, device.id, accept.optJSONObject("initialContentPolicy"))
+            val updatedDevice = DeviceStore.findDevice(context, device.id) ?: device
+            TopologyStore.markDeviceState(context, updatedDevice, enabled = true, revoked = false)
+            accept.optJSONObject("topologySnapshot")?.let {
+                TopologyStore.applyDelta(
+                    context = context,
+                    rawDelta = it,
+                    allowNetworkMerge = true,
+                    mergeToNetworkId = networkId,
+                    mergeFromNetworkIds = mergeFromNetworkIds
+                )
+            }
+            JoinResult(success = true, device = updatedDevice)
+        } catch (e: Exception) {
+            LanTrustStore.rollbackNetworkIdAdoption(
+                context = context,
+                previousNetworkId = previousNetworkId,
+                adoptedNetworkId = networkId
+            )
+            JoinResult(success = false, error = e.message ?: e.javaClass.simpleName)
         }
-        return JoinResult(success = true, device = updatedDevice)
     }
 
     fun contentPolicy(template: String): JSONObject {

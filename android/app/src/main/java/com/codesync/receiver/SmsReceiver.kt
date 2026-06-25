@@ -9,7 +9,7 @@ import android.provider.Telephony
 import android.util.Log
 import com.codesync.service.WebSocketService
 import com.codesync.util.CodeExtractor
-import com.codesync.util.DeviceStore
+import com.codesync.util.RouteManager
 import com.codesync.util.SettingsStore
 import com.codesync.util.SmsForwardDedupStore
 
@@ -41,7 +41,11 @@ class SmsReceiver : BroadcastReceiver() {
             sendAllSms -> "sms_message"
             else -> ""
         }
-        val enabledDevices = DeviceStore.getEnabledDevices(context)
+        val enabledDevices = if (contentType.isBlank()) {
+            emptyList()
+        } else {
+            RouteManager.targetsForType(context, contentType).map { it.device }
+        }
         // 只记录决策结果与目标数量，不记录设备名/IP/端口（拓扑信息也属敏感面）
         Log.d(
             TAG,

@@ -21,6 +21,8 @@ object SettingsStore {
     private const val KEY_SYNC_CLIPBOARD_IMAGE = "sync_clipboard_image_enabled"
     private const val KEY_SYNC_CLIPBOARD_FILE = "sync_clipboard_file_enabled"
     private const val KEY_RECEIVE_FILE_TRANSFER = "receive_file_transfer_enabled"
+    private const val KEY_RECEIVE_FILE_TRANSFER_DEFAULT_MIGRATED =
+        "receive_file_transfer_default_migrated_v2"
     private const val KEY_FILE_RECEIVE_SUBDIR = "file_receive_subdir"
 
     fun isForwardingEnabled(context: Context): Boolean =
@@ -86,11 +88,16 @@ object SettingsStore {
         prefs(context).edit().putBoolean(KEY_SYNC_CLIPBOARD_FILE, enabled).apply()
     }
 
-    fun isReceiveFileTransferEnabled(context: Context): Boolean =
-        prefs(context).getBoolean(KEY_RECEIVE_FILE_TRANSFER, false)
+    fun isReceiveFileTransferEnabled(context: Context): Boolean {
+        migrateReceiveFileTransferDefault(context)
+        return prefs(context).getBoolean(KEY_RECEIVE_FILE_TRANSFER, true)
+    }
 
     fun setReceiveFileTransferEnabled(context: Context, enabled: Boolean) {
-        prefs(context).edit().putBoolean(KEY_RECEIVE_FILE_TRANSFER, enabled).apply()
+        prefs(context).edit()
+            .putBoolean(KEY_RECEIVE_FILE_TRANSFER, enabled)
+            .putBoolean(KEY_RECEIVE_FILE_TRANSFER_DEFAULT_MIGRATED, true)
+            .apply()
     }
 
     fun getFileReceiveSubdir(context: Context): String =
@@ -136,4 +143,13 @@ object SettingsStore {
 
     private fun prefs(context: Context) =
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+    private fun migrateReceiveFileTransferDefault(context: Context) {
+        val prefs = prefs(context)
+        if (prefs.getBoolean(KEY_RECEIVE_FILE_TRANSFER_DEFAULT_MIGRATED, false)) return
+        prefs.edit()
+            .putBoolean(KEY_RECEIVE_FILE_TRANSFER, true)
+            .putBoolean(KEY_RECEIVE_FILE_TRANSFER_DEFAULT_MIGRATED, true)
+            .apply()
+    }
 }

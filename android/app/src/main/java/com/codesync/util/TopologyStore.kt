@@ -102,22 +102,26 @@ object TopologyStore {
         for (i in 0 until incomingNodes.length()) {
             val node = normalizeNode(incomingNodes.optJSONObject(i) ?: continue) ?: continue
             if (node.optString("id") == identity.id) continue
-            val existing = nodesById[node.optString("id")]
-            val missingTrustedDevice = DeviceStore.findDevice(context, node.optString("id")) == null &&
-                node.optString("pairingKey").isNotBlank() &&
-                node.optBoolean("routable", true) &&
-                node.optBoolean("enabled", true) &&
-                !node.optBoolean("revoked", false)
-            if (isSemanticUpdate(node, existing)) {
-                nodesById[node.optString("id")] = node
-                upsertDeviceFromNode(context, node)
+            val nodeId = node.optString("id")
+            val existing = nodesById[nodeId]
+            val candidate = mergeTopologyObject(existing, node)
+            val missingTrustedDevice = DeviceStore.findDevice(context, nodeId) == null &&
+                candidate.optString("pairingKey").isNotBlank() &&
+                candidate.optBoolean("routable", true) &&
+                candidate.optBoolean("enabled", true) &&
+                !candidate.optBoolean("revoked", false)
+            if (isSemanticUpdate(candidate, existing)) {
+                nodesById[nodeId] = candidate
+                upsertDeviceFromNode(context, candidate)
                 storageChanged = true
                 semanticChanged = true
             } else if (missingTrustedDevice) {
-                upsertDeviceFromNode(context, node)
+                nodesById[nodeId] = candidate
+                upsertDeviceFromNode(context, candidate)
+                storageChanged = true
                 semanticChanged = true
-            } else if (isVolatileRefresh(node, existing)) {
-                nodesById[node.optString("id")] = refreshVolatileFields(existing, node)
+            } else if (isVolatileRefresh(candidate, existing)) {
+                nodesById[nodeId] = refreshVolatileFields(existing, candidate)
                 storageChanged = true
             }
         }
@@ -126,12 +130,13 @@ object TopologyStore {
         for (i in 0 until incomingLinks.length()) {
             val link = normalizeLink(incomingLinks.optJSONObject(i) ?: continue) ?: continue
             val existing = linksById[link.optString("id")]
-            if (isSemanticUpdate(link, existing)) {
-                linksById[link.optString("id")] = link
+            val candidate = mergeTopologyObject(existing, link)
+            if (isSemanticUpdate(candidate, existing)) {
+                linksById[link.optString("id")] = candidate
                 storageChanged = true
                 semanticChanged = true
-            } else if (isVolatileRefresh(link, existing)) {
-                linksById[link.optString("id")] = refreshVolatileFields(existing, link)
+            } else if (isVolatileRefresh(candidate, existing)) {
+                linksById[link.optString("id")] = refreshVolatileFields(existing, candidate)
                 storageChanged = true
             }
         }
@@ -151,11 +156,16 @@ object TopologyStore {
         reason: String = "stored_topology",
         ttl: Int = DEFAULT_DELTA_TTL,
         mergeFromNetworkIds: List<String> = emptyList(),
-        connectedDeviceIds: Set<String> = emptySet()
+        connectedDeviceIds: Set<String> = emptySet(),
+        consumePendingMerge: Boolean = true
     ): JSONObject {
         val identity = PhoneIdentityStore.get(context)
         val now = System.currentTimeMillis()
-        val pendingMergeFrom = LanTrustStore.consumePendingMergeFrom(context)
+        val pendingMergeFrom = if (consumePendingMerge) {
+            LanTrustStore.consumePendingMergeFrom(context)
+        } else {
+            emptyList()
+        }
         val mergeFrom = (mergeFromNetworkIds + pendingMergeFrom)
             .map { it.trim() }
             .filter { it.isNotBlank() && it != LanTrustStore.getNetworkId(context) }
@@ -211,7 +221,7 @@ object TopologyStore {
 
         DeviceStore.getDevices(context).forEach { device ->
             val isPhone = isPhoneType(device.type)
-            val connected = connectedDeviceIds.contains(device.id)
+            val connected = connectedDeviceIds.contains(device.id) && device.enabled && !device.revoked
             val stateUpdatedAt = listOf(
                 device.updatedAt,
                 device.lastSyncAt,
@@ -246,8 +256,10 @@ object TopologyStore {
                 .put("allowFileTransfer", device.allowFileTransfer)
                 .put("maxFileSizeMb", device.maxFileSizeMb)
                 .put("autoAcceptFiles", device.autoAcceptFiles)
+                .put("revoked", device.revoked)
                 .put("connected", connected)
                 .put("status", when {
+                    device.revoked -> "revoked"
                     connected -> "online"
                     device.enabled -> "known"
                     else -> "disabled"
@@ -269,7 +281,7 @@ object TopologyStore {
                 .put("to", device.id)
                 .put("type", linkType)
                 .put("label", if (isPhone) "节点直连 relay" else "验证码推送")
-                .put("enabled", device.enabled)
+                .put("enabled", device.enabled && !device.revoked)
                 .put("allowSmsCodes", device.allowSmsCodes)
                 .put("allowSmsMessages", device.allowSmsMessages)
                 .put("allowNotifications", device.allowNotifications)
@@ -281,7 +293,8 @@ object TopologyStore {
                 .put("allowFileTransfer", device.allowFileTransfer)
                 .put("maxFileSizeMb", device.maxFileSizeMb)
                 .put("autoAcceptFiles", device.autoAcceptFiles)
-                .put("active", connected)
+                .put("revoked", device.revoked)
+                .put("active", connected && !device.revoked)
                 .put("routable", isDeviceRoutable(device))
                 .put("authority", "device_store")
                 .put("seq", stateUpdatedAt)
@@ -314,6 +327,18 @@ object TopologyStore {
         }
         return delta
     }
+
+    fun buildRouteSnapshot(
+        context: Context,
+        connectedDeviceIds: Set<String> = emptySet()
+    ): JSONObject =
+        buildDelta(
+            context = context,
+            reason = "route_snapshot",
+            ttl = 0,
+            connectedDeviceIds = connectedDeviceIds,
+            consumePendingMerge = false
+        )
 
     fun rewriteNetworkId(context: Context, targetNetworkId: String, mergeFromNetworkIds: List<String>) {
         val target = targetNetworkId.trim()
@@ -479,7 +504,7 @@ object TopologyStore {
         context: Context,
         device: DesktopDevice,
         enabled: Boolean = device.enabled,
-        revoked: Boolean = false
+        revoked: Boolean = device.revoked
     ) {
         val identity = PhoneIdentityStore.get(context)
         val now = System.currentTimeMillis()
@@ -620,7 +645,7 @@ object TopologyStore {
         } else {
             0L
         }
-        return JSONObject(raw.toString())
+        val result = JSONObject(raw.toString())
             .put("id", id)
             .put("name", raw.optString("name", raw.optString("deviceName", id)).ifBlank { id })
             .put("type", type)
@@ -633,7 +658,6 @@ object TopologyStore {
             .put("relayPort", raw.optInt("relayPort", raw.optInt("joinPort", if (isPhone) raw.optInt("port", LanDiscovery.NODE_RELAY_PORT) else LanDiscovery.NODE_RELAY_PORT)))
             .put("pairingKey", raw.optString("pairingKey", raw.optString("pk")).trim())
             .put("enabled", raw.optBoolean("enabled", true))
-            .put("revoked", raw.optBoolean("revoked", false))
             .put("routable", raw.optBoolean(
                 "routable",
                 rawNodeHasAddressOrRoute(raw, host) &&
@@ -645,6 +669,18 @@ object TopologyStore {
             .put("updatedAt", updatedAt)
             .put("lastSeen", lastSeen)
             .put("expiresAt", raw.optLong("expiresAt", updatedAt + ENTRY_TTL_MS))
+        if (raw.has("revoked")) {
+            result.put("revoked", raw.optBoolean("revoked", false))
+        } else if (raw.optString("status") == "revoked") {
+            result.put("revoked", true)
+        }
+        if (result.optBoolean("revoked", false)) {
+            result.put("enabled", false)
+            result.put("routable", false)
+            result.put("connected", false)
+            result.put("status", "revoked")
+        }
+        return result
     }
 
     private fun normalizeLink(raw: JSONObject): JSONObject? {
@@ -720,7 +756,8 @@ object TopologyStore {
             policyAllowClipboardFile = node.optBoolean("allowClipboardFile", false),
             policyAllowFileTransfer = node.optBoolean("allowFileTransfer", false),
             policyMaxFileSizeMb = node.optInt("maxFileSizeMb", 50),
-            policyAutoAcceptFiles = node.optBoolean("autoAcceptFiles", false)
+            policyAutoAcceptFiles = node.optBoolean("autoAcceptFiles", false),
+            revoked = node.optBoolean("revoked", false)
         )
     }
 
@@ -746,6 +783,46 @@ object TopologyStore {
             if (incoming.has(key)) result.put(key, incoming.opt(key))
         }
         return result
+    }
+
+    private fun mergeTopologyObject(existing: JSONObject?, incoming: JSONObject): JSONObject {
+        if (existing == null) return incoming
+        val result = JSONObject(existing.toString())
+        val iterator = incoming.keys()
+        while (iterator.hasNext()) {
+            val key = iterator.next()
+            val value = incoming.opt(key)
+            if (shouldPreserveExistingTopologyField(key, value)) continue
+            result.put(key, value)
+        }
+        if (result.optBoolean("revoked", false)) {
+            result.put("enabled", false)
+            result.put("routable", false)
+            result.put("connected", false)
+            result.put("status", "revoked")
+        }
+        return result
+    }
+
+    private fun shouldPreserveExistingTopologyField(key: String, value: Any?): Boolean {
+        return when (key) {
+            "pairingKey", "host", "tsHost", "relayHost", "networkId", "trustSourceId", "trustLevel" ->
+                value == null || value == JSONObject.NULL || value.toString().isBlank()
+            "capabilities" ->
+                value == null ||
+                    value == JSONObject.NULL ||
+                    (value is JSONObject && value.length() == 0) ||
+                    value.toString().isBlank()
+            "altHosts" ->
+                value == null ||
+                    value == JSONObject.NULL ||
+                    (value is JSONArray && value.length() == 0)
+            "port", "wsPort", "relayPort", "acceptedAt" ->
+                value == null ||
+                    value == JSONObject.NULL ||
+                    value.toString().toLongOrNull()?.let { it <= 0L } != false
+            else -> false
+        }
     }
 
     private fun semanticFingerprint(obj: JSONObject): String =
@@ -805,7 +882,7 @@ object TopologyStore {
     private fun isDeviceRoutable(
         device: DesktopDevice,
         enabled: Boolean = device.enabled,
-        revoked: Boolean = false
+        revoked: Boolean = device.revoked
     ): Boolean {
         if (!enabled || revoked || device.pairingKey.isBlank()) return false
         if (device.host.isNotBlank() || device.altHosts.any { it.isNotBlank() }) return true
@@ -894,12 +971,20 @@ object TopologyStore {
             prefs(context).edit().remove(key).apply()
             return JSONArray()
         }
-        return runCatching { JSONArray(raw) }
+        val parsed = runCatching { JSONArray(raw) }
             .getOrElse {
                 Log.e(TAG, "Failed to parse topology array: $key", it)
                 prefs(context).edit().remove(key).apply()
                 JSONArray()
             }
+        if (key == KEY_NODES || key == KEY_LINKS) {
+            val compacted = compactArrayForKey(key, parsed)
+            if (compacted.length() != parsed.length() || compacted.toString() != parsed.toString()) {
+                prefs(context).edit().putString(key, compacted.toString()).apply()
+            }
+            return compacted
+        }
+        return parsed
     }
 
     private fun saveArray(context: Context, key: String, array: JSONArray) {

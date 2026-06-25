@@ -68,7 +68,7 @@
     <string name="sync_file_transfer">允许发送文件</string>
     <string name="sync_file_transfer_desc">主动选择文件后，通过受信节点网络加密分片传输。</string>
     <string name="receive_file_transfer">接收其它节点文件</string>
-    <string name="receive_file_transfer_desc">默认关闭；开启后远端文件会保存到应用下载目录。</string>
+    <string name="receive_file_transfer_desc">默认开启；收到主动文件传输时先确认，接受后保存到应用下载目录。</string>
     <string name="send_file">选择文件发送</string>
     <string name="send_folder">发送文件夹</string>
     <string name="file_receive_history">接收文件历史</string>
