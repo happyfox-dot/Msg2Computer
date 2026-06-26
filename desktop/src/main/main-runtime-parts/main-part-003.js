@@ -657,7 +657,6 @@ function broadcastTopologyToAllPeers(reason = 'broadcast', options = {}) {
   }
   if (!preserveSource) {
     rememberLocalTopologyDelta(delta)
-    savePairingKey()
   }
 
   const topology = getTopologySnapshot()
@@ -1271,7 +1270,7 @@ function buildTotpSyncPayload(seed, action = 'add') {
   })
 }
 
-/** 鉴权成功时，把本机来源（desktop-local）的全部 TOTP 种子一次性下发给该手机。 */
+/** 节点可达时，把本机来源（desktop-local）的新增 TOTP 种子补推给该目标。 */
 function getTotpSyncCutoff(node) {
   return Number(node?.lastTotpSeedSyncAt || 0) || 0
 }
@@ -1293,97 +1292,80 @@ function markDesktopPeerTotpSeedSynced(peerId, timestamp = Date.now()) {
 }
 
 function sendLocalTotpSeedsToPhone(ws, sessionKey, phoneId) {
-  if (!ws || !sessionKey) return
   const phone = authorizedPhones.get(phoneId)
   if (!canPushContentToNode(phone, 'totp')) return
   const cutoff = getTotpSyncCutoff(phone)
   const localSeeds = Array.from(totpSeeds.values())
     .filter(seed => seed.phoneId === LOCAL_TOTP_SOURCE_ID && seed.secret)
     .filter(seed => (Number(seed.updatedAt || seed.createdAt || 0) || 0) > cutoff)
-  let sent = 0
-  for (const seed of localSeeds) {
-    try {
-      const payload = buildTotpSyncPayload(seed, 'add')
-      const encrypted = encryptMessage(payload, sessionKey)
-      ws.send(JSON.stringify({ type: 'totp_sync', payload: encrypted }))
-      sent += 1
-    } catch (e) {
-      console.error('下发 TOTP 种子失败:', e)
-    }
-  }
   if (localSeeds.length > 0) {
     console.log(`已向手机 ${phoneId} 下发 ${localSeeds.length} 个本机 TOTP 种子`)
   }
-  const tombstoneCount = sendTotpDeleteTombstonesToPhone(ws, sessionKey, phoneId, cutoff)
-  if (sent > 0 || tombstoneCount > 0) {
-    markPhoneTotpSeedSynced(phoneId)
-    console.log(`Sent ${sent + tombstoneCount} TOTP changes to phone ${phoneId}`)
-  }
+  const deliveries = localSeeds.map(seed =>
+    publishTotpChangeToTargets(seed, 'add', [phone]).catch(error => {
+      console.error('下发 TOTP 种子失败:', error)
+      return { delivered: 0, deliveredTargetIds: [] }
+    })
+  )
+  deliveries.push(sendTotpDeleteTombstonesToPhone(ws, sessionKey, phoneId, cutoff))
+  Promise.all(deliveries).then(results => {
+    const delivered = results.reduce((sum, result) => sum + Number(result.delivered || 0), 0)
+    if (results.some(result => (result.deliveredTargetIds || []).includes(phoneId))) {
+      markPhoneTotpSeedSynced(phoneId)
+      console.log(`Sent ${delivered} TOTP changes to phone ${phoneId}`)
+    }
+  }).catch(error => {
+    console.error('手机 TOTP 补推失败:', error)
+  })
 }
 
 function sendTotpDeleteTombstonesToPhone(ws, sessionKey, phoneId, cutoff = 0) {
-  if (!ws || !sessionKey) return 0
+  const phone = authorizedPhones.get(phoneId)
+  if (!phone) return Promise.resolve({ delivered: 0, deliveredTargetIds: [] })
   pruneTotpDeleteTombstones()
   const pendingTombstones = totpDeleteTombstones
     .filter(tombstone => (Number(tombstone.deletedAt || tombstone.updatedAt || 0) || 0) > cutoff)
-  let sent = 0
-  for (const tombstone of pendingTombstones) {
-    try {
-      const payload = buildTotpSyncPayload(tombstone, 'delete')
-      const encrypted = encryptMessage(payload, sessionKey)
-      if (!encrypted) continue
-      ws.send(JSON.stringify({ type: 'totp_sync', payload: encrypted }))
-      sent += 1
-    } catch (e) {
-      console.error('下发 TOTP 删除状态失败:', e)
-    }
-  }
-  return sent
+  if (pendingTombstones.length === 0) return Promise.resolve({ delivered: 0, deliveredTargetIds: [] })
+  return Promise.all(pendingTombstones.map(tombstone =>
+    publishTotpChangeToTargets(tombstone, 'delete', [phone]).catch(error => {
+      console.error('下发 TOTP 删除状态失败:', error)
+      return { delivered: 0, deliveredTargetIds: [] }
+    })
+  )).then(results => ({
+    delivered: results.reduce((sum, result) => sum + Number(result.delivered || 0), 0),
+    deliveredTargetIds: Array.from(new Set(results.flatMap(result => result.deliveredTargetIds || [])))
+  }))
 }
 
-/** 向所有在线手机广播一条 TOTP 同步消息（用于本机即时新增/删除）。 */
+/** 向允许接收 TOTP 的手机节点发布一条 TOTP 同步消息（用于本机即时新增/删除）。 */
 function broadcastTotpSyncToPhones(seed, action = 'add') {
   if (!seed) return
-  const payloadPlain = buildTotpSyncPayload(seed, action)
-  for (const [phoneId, connections] of activePhoneConnections.entries()) {
-    const phone = authorizedPhones.get(phoneId)
-    if (!canPushContentToNode(phone, 'totp')) continue
-    let delivered = false
-    for (const ws of connections) {
-      // 每条连接有各自的会话密钥（基于 nonce 派生），必须按 ws 取
-      const sessionKey = phoneSessionKeys.get(ws)
-      if (!sessionKey) continue
-      const encrypted = encryptMessage(payloadPlain, sessionKey)
-      if (!encrypted) continue
-      try {
-        ws.send(JSON.stringify({ type: 'totp_sync', payload: encrypted }))
-        delivered = true
-      } catch (e) {
-        console.error('广播 TOTP 同步失败:', e)
-      }
+  const targets = Array.from(authorizedPhones.values())
+    .filter(phone => canPushContentToNode(phone, 'totp'))
+  if (targets.length === 0) return
+  publishTotpChangeToTargets(seed, action, targets).then(result => {
+    const timestamp = Number(seed.updatedAt || seed.deletedAt || Date.now()) || Date.now()
+    for (const phoneId of result.deliveredTargetIds || []) {
+      markPhoneTotpSeedSynced(phoneId, timestamp)
     }
-    if (delivered) markPhoneTotpSeedSynced(phoneId, Number(seed.updatedAt || Date.now()) || Date.now())
-  }
+  }).catch(error => {
+    console.error('广播 TOTP 同步失败:', error)
+  })
 }
 
 function broadcastTotpSyncToDesktopPeers(seed, action = 'add') {
   if (!seed) return
-  const payloadPlain = buildTotpSyncPayload(seed, action)
-  for (const [peerId, ws] of activeDesktopPeerConnections.entries()) {
-    const peer = pairedDesktopPeers.get(peerId)
-    if (!canPushContentToNode(peer, 'totp')) continue
-    if (!ws || ws.readyState !== WebSocket.OPEN) continue
-    const sessionKey = ws.__codebridgeSessionKey
-    if (!sessionKey) continue
-    const encrypted = encryptMessage(payloadPlain, sessionKey)
-    if (!encrypted) continue
-    try {
-      ws.send(JSON.stringify({ type: 'totp_sync', payload: encrypted }))
-      markDesktopPeerTotpSeedSynced(peerId, Number(seed.updatedAt || Date.now()) || Date.now())
-    } catch (e) {
-      console.error('广播桌面 TOTP 同步失败:', e)
+  const targets = Array.from(pairedDesktopPeers.values())
+    .filter(peer => canPushContentToNode(peer, 'totp'))
+  if (targets.length === 0) return
+  publishTotpChangeToTargets(seed, action, targets).then(result => {
+    const timestamp = Number(seed.updatedAt || seed.deletedAt || Date.now()) || Date.now()
+    for (const peerId of result.deliveredTargetIds || []) {
+      markDesktopPeerTotpSeedSynced(peerId, timestamp)
     }
-  }
+  }).catch(error => {
+    console.error('广播桌面 TOTP 同步失败:', error)
+  })
 }
 
 // ==================== 剪贴板同步 ====================

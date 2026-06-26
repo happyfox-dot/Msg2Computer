@@ -75,6 +75,7 @@ class WebSocketService : Service() {
         const val ACTION_RELAY_SMS = "com.codesync.RELAY_SMS"
         const val ACTION_BROADCAST_TOPOLOGY = "com.codesync.BROADCAST_TOPOLOGY"
         const val ACTION_SEND_NOTIFICATION = "com.codesync.SEND_NOTIFICATION"
+        const val ACTION_SEND_NOTIFICATION_REMOVED = "com.codesync.SEND_NOTIFICATION_REMOVED"
         const val ACTION_SEND_CLIPBOARD = "com.codesync.SEND_CLIPBOARD"
         const val ACTION_SEND_FILE = "com.codesync.SEND_FILE"
 
@@ -85,6 +86,9 @@ class WebSocketService : Service() {
         const val EXTRA_TITLE = "title"
         const val EXTRA_APP_NAME = "app_name"
         const val EXTRA_PACKAGE_NAME = "package_name"
+        const val EXTRA_NOTIFICATION_KEY = "notification_key"
+        const val EXTRA_NOTIFICATION_ONGOING = "notification_ongoing"
+        const val EXTRA_NOTIFICATION_POST_TIME = "notification_post_time"
         const val EXTRA_TOTP_LABEL = "totp_label"
         const val EXTRA_TOTP_SECRET = "totp_secret"
         const val EXTRA_TOTP_ISSUER = "totp_issuer"
@@ -200,6 +204,7 @@ class WebSocketService : Service() {
             ACTION_DISCONNECT -> handleDisconnect()
             ACTION_SEND_SMS -> handleSendSms(intent)
             ACTION_SEND_NOTIFICATION -> handleSendNotification(intent)
+            ACTION_SEND_NOTIFICATION_REMOVED -> handleSendNotificationRemoved(intent)
             ACTION_SEND_CLIPBOARD -> handleSendClipboard(intent)
             ACTION_SEND_FILE -> handleSendFile(intent)
             ACTION_SEND_TOTP_SEED -> handleSendTotpSeed(intent)
@@ -266,6 +271,9 @@ class WebSocketService : Service() {
         val title = intent.getStringExtra(EXTRA_TITLE).orEmpty()
         val appName = intent.getStringExtra(EXTRA_APP_NAME)?.takeIf { it.isNotBlank() } ?: "通知"
         val packageName = intent.getStringExtra(EXTRA_PACKAGE_NAME).orEmpty()
+        val notificationKey = intent.getStringExtra(EXTRA_NOTIFICATION_KEY).orEmpty()
+        val notificationOngoing = intent.getBooleanExtra(EXTRA_NOTIFICATION_ONGOING, false)
+        val notificationPostTime = intent.getLongExtra(EXTRA_NOTIFICATION_POST_TIME, 0L)
         holdForwardLocks()
         enqueueAndDeliver(
             code = "",
@@ -275,7 +283,37 @@ class WebSocketService : Service() {
             rawMessage = body,
             title = title,
             appName = appName,
-            packageName = packageName
+            packageName = packageName,
+            notificationKey = notificationKey,
+            notificationOngoing = notificationOngoing,
+            notificationPostTime = notificationPostTime
+        )
+    }
+
+    private fun handleSendNotificationRemoved(intent: Intent) {
+        val title = intent.getStringExtra(EXTRA_TITLE).orEmpty()
+        val appName = intent.getStringExtra(EXTRA_APP_NAME)?.takeIf { it.isNotBlank() } ?: "通知"
+        val packageName = intent.getStringExtra(EXTRA_PACKAGE_NAME).orEmpty()
+        val notificationKey = intent.getStringExtra(EXTRA_NOTIFICATION_KEY).orEmpty()
+        if (notificationKey.isBlank()) {
+            stopIfNothingPending("空闲")
+            return
+        }
+        val notificationOngoing = intent.getBooleanExtra(EXTRA_NOTIFICATION_ONGOING, true)
+        val notificationPostTime = intent.getLongExtra(EXTRA_NOTIFICATION_POST_TIME, 0L)
+        holdForwardLocks()
+        enqueueAndDeliver(
+            code = "",
+            source = appName,
+            type = "app_notification_removed",
+            label = title,
+            rawMessage = "",
+            title = title,
+            appName = appName,
+            packageName = packageName,
+            notificationKey = notificationKey,
+            notificationOngoing = notificationOngoing,
+            notificationPostTime = notificationPostTime
         )
     }
 
@@ -437,7 +475,7 @@ class WebSocketService : Service() {
             type = payloadType,
             connectedDeviceIds = connectedDeviceIds,
             requestedTargetIds = requestedTargetIds
-        ).map { it.device }
+        ).filter { it.reachable }.map { it.device }
         if (targetDevices.isEmpty()) {
             stopIfNothingPending("没有允许接收文件的推送目标")
             return
@@ -838,6 +876,9 @@ class WebSocketService : Service() {
         title: String? = null,
         appName: String? = null,
         packageName: String? = null,
+        notificationKey: String? = null,
+        notificationOngoing: Boolean = false,
+        notificationPostTime: Long = 0L,
         clipVersionTs: Long = 0L,
         clipVersionOrigin: String = ""
     ) {
@@ -895,6 +936,9 @@ class WebSocketService : Service() {
                 if (!title.isNullOrBlank()) put("title", title)
                 if (!appName.isNullOrBlank()) put("appName", appName)
                 if (!packageName.isNullOrBlank()) put("packageName", packageName)
+                if (!notificationKey.isNullOrBlank()) put("notificationKey", notificationKey)
+                if (notificationOngoing) put("notificationOngoing", true)
+                if (notificationPostTime > 0L) put("notificationPostTime", notificationPostTime)
             }
             .toString()
 
@@ -1241,16 +1285,59 @@ class WebSocketService : Service() {
         updateConnectionState(statusMessage)
         armDeliveryDeadline()
 
-        val relayTargets = if (isRelaySupportedType(type)) eligibleDevices.filter { isPhoneDevice(it) } else emptyList()
-        val websocketTargets = eligibleDevices.filterNot { isPhoneDevice(it) }
         Log.d(
             TAG,
             "Dispatch $type msgId=$msgId targets=${eligibleDevices.size}, " +
-                "websocket=${websocketTargets.size}, relay=${relayTargets.size}, " +
+                "softbus=${eligibleDevices.count { deviceSupportsSoftBus(it) }}, " +
                 eligibleDevices.joinToString { "${it.name}/${it.type}/${it.host}:${it.port}" }
         )
-        relayTargets.forEach { deliverRelayToPhoneTarget(it, payload, msgId, type) }
-        websocketTargets.forEach { connectDevice(it, registerOnly = false, force = force) }
+        eligibleDevices.forEach { deliverPayloadToDevice(it, payload, msgId, type, force) }
+    }
+
+    private fun deliverPayloadToDevice(
+        device: DesktopDevice,
+        payload: String,
+        msgId: String,
+        type: String,
+        force: Boolean = false
+    ) {
+        val busEnvelope = buildBusinessBusEnvelope(payload, type)
+        if (busEnvelope != null && deviceSupportsSoftBus(device)) {
+            serviceScope.launch {
+                val deliveredByBus = deliverBusEnvelopeHttp(device, busEnvelope, rememberOutbound = false)
+                if (deliveredByBus) {
+                    DeviceStore.markDeviceSynced(this@WebSocketService, device.id)
+                    ackDelivery(device.id, msgId)
+                    updateConnectionState("softbus delivered to ${device.name}")
+                    checkAllDoneAndStop()
+                    return@launch
+                }
+                deliverLegacyPayloadToDevice(device, payload, msgId, type, force)
+            }
+            return
+        }
+        deliverLegacyPayloadToDevice(device, payload, msgId, type, force)
+    }
+
+    private fun buildBusinessBusEnvelope(payload: String, type: String): JSONObject? {
+        if (isTopologyPayloadType(type)) return null
+        return runCatching {
+            ContentBus.envelopeFromLegacyPayload(this, JSONObject(payload))
+        }.getOrNull()
+    }
+
+    private fun deliverLegacyPayloadToDevice(
+        device: DesktopDevice,
+        payload: String,
+        msgId: String,
+        type: String,
+        force: Boolean = false
+    ) {
+        if (isPhoneDevice(device) && isRelaySupportedType(type)) {
+            deliverRelayToPhoneTarget(device, payload, msgId, type, preferBus = false)
+        } else {
+            connectDevice(device, registerOnly = false, force = force)
+        }
     }
 
     private fun trimPendingPayloads() {
@@ -1262,12 +1349,18 @@ class WebSocketService : Service() {
         }
     }
 
-    private fun deliverRelayToPhoneTarget(device: DesktopDevice, payload: String, msgId: String, type: String) {
+    private fun deliverRelayToPhoneTarget(
+        device: DesktopDevice,
+        payload: String,
+        msgId: String,
+        type: String,
+        preferBus: Boolean = true
+    ) {
         serviceScope.launch {
             val maxAttempts = if (isTopologyPayloadType(type)) 1 else 4
             var success = false
             for (attempt in 1..maxAttempts) {
-                success = sendRelayHttp(device, payload)
+                success = sendRelayHttp(device, payload, preferBus = preferBus)
                 if (success) break
                 if (attempt < maxAttempts) {
                     delay(
@@ -1358,7 +1451,7 @@ class WebSocketService : Service() {
         }
     }
 
-    private fun sendRelayHttp(device: DesktopDevice, payload: String): Boolean {
+    private fun sendRelayHttp(device: DesktopDevice, payload: String, preferBus: Boolean = true): Boolean {
         val targetPort = relayHttpPort(device)
         if (targetPort <= 0 || device.pairingKey.isBlank()) return false
         val hosts = candidateHosts(device)
@@ -1366,7 +1459,7 @@ class WebSocketService : Service() {
         return try {
             val identity = PhoneIdentityStore.get(this)
             var busEnvelopeForFallback: JSONObject? = null
-            if (deviceSupportsSoftBus(device)) {
+            if (preferBus && deviceSupportsSoftBus(device)) {
                 busEnvelopeForFallback = runCatching {
                     ContentBus.envelopeFromLegacyPayload(this, JSONObject(payload))
                 }.getOrNull()
@@ -1456,12 +1549,21 @@ class WebSocketService : Service() {
         }
     }
 
-    private fun targetDevicesForType(type: String): List<DesktopDevice> =
-        RouteManager.targetsForType(
+    private fun targetDevicesForType(type: String): List<DesktopDevice> {
+        val options = RouteManager.targetsForType(
             context = this,
             type = type,
             connectedDeviceIds = connectedDeviceIds
-        ).map { it.device }
+        )
+        return if (requiresLiveDeliveryTarget(type)) {
+            options.filter { it.reachable }.map { it.device }
+        } else {
+            options.map { it.device }
+        }
+    }
+
+    private fun requiresLiveDeliveryTarget(type: String): Boolean =
+        type == "file_transfer" || type == "clipboard_file"
 
     private fun selectRelayNextTargets(
         payloadType: String,
@@ -1492,6 +1594,7 @@ class WebSocketService : Service() {
         return type == "sms" ||
             type == "sms_message" ||
             type == "app_notification" ||
+            type == "app_notification_removed" ||
             isClipboardTextType(type) ||
             type == "clipboard_image" ||
             type == "clipboard_file" ||
@@ -1509,6 +1612,7 @@ class WebSocketService : Service() {
             "sms" -> "正在投递验证码到 $targetCount 个设备节点"
             "sms_message" -> "正在投递短信到 $targetCount 个设备节点"
             "app_notification" -> "正在投递通知到 $targetCount 个设备节点"
+            "app_notification_removed" -> "正在同步通知状态到 $targetCount 个设备节点"
             "clipboard" -> "正在同步剪贴板到 $targetCount 个设备节点"
             else -> "正在同步 TOTP"
         }
@@ -1522,6 +1626,7 @@ class WebSocketService : Service() {
             "sms" -> "正在中继验证码到 $targetCount 个设备节点"
             "sms_message" -> "正在中继短信到 $targetCount 个设备节点"
             "app_notification" -> "正在中继通知到 $targetCount 个设备节点"
+            "app_notification_removed" -> "正在中继通知状态到 $targetCount 个设备节点"
             "clipboard" -> "正在中继剪贴板到 $targetCount 个设备节点"
             else -> "正在中继 TOTP 到 $targetCount 个设备节点"
         }

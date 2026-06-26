@@ -89,12 +89,16 @@ function createContentBus(deps = {}) {
     })
 
     let delivered = 0
+    const deliveredTargetIds = []
     for (const targetId of envelope.targetNodeIds) {
       const ok = await deliverEnvelopeToTarget(targetId, envelope)
-      if (ok) delivered += 1
+      if (ok) {
+        delivered += 1
+        deliveredTargetIds.push(targetId)
+      }
     }
     log(`bus publish ${topic} delivered=${delivered}/${envelope.targetNodeIds.length}`)
-    return { envelope, delivered }
+    return { envelope, delivered, deliveredTargetIds }
   }
 
   async function flushOutbox(limit = 20) {

@@ -259,17 +259,20 @@ object RouteManager {
         if (!device.enabled) return "disabled"
         if (device.revoked || device.pairingKey.isBlank()) return "offline"
         if (device.id in connectedDeviceIds) return "online"
-        val freshnessAt = maxOf(
+        val directFreshnessAt = maxOf(
             device.connectionUpdatedAt,
-            device.lastSyncAt,
-            device.routeUpdatedAt,
-            route?.updatedAt ?: 0L
+            device.lastSyncAt
         )
+        val activeRouteFreshnessAt = if (route?.active == true || route?.partiallyActive == true) {
+            route.updatedAt
+        } else {
+            0L
+        }
         val hasRoute = route != null || device.routeNextHopId.isNotBlank() || device.routeMetric > 0 || device.routePath.size > 1
         val hasAddress = device.host.isNotBlank() || device.altHosts.any { it.isNotBlank() }
         return when {
-            hasRoute && isRecent(freshnessAt, now) -> "reachable"
-            hasAddress && isRecent(freshnessAt, now) -> "reachable"
+            hasRoute && isRecent(activeRouteFreshnessAt, now) -> "reachable"
+            hasAddress && isRecent(directFreshnessAt, now) -> "reachable"
             hasRoute || hasAddress -> "known"
             else -> "offline"
         }

@@ -400,6 +400,15 @@
                         android:text="@string/open_notification_access"
                         app:cornerRadius="14dp" />
 
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btnNotificationAppPolicy"
+                        style="@style/Widget.Material3.Button.TonalButton"
+                        android:layout_width="match_parent"
+                        android:layout_height="48dp"
+                        android:layout_marginTop="8dp"
+                        android:text="@string/manage_notification_apps"
+                        app:cornerRadius="14dp" />
+
                     <TextView
                         android:id="@+id/txtNotificationAccessStatus"
                         android:layout_width="match_parent"
@@ -826,51 +835,9 @@
             android:orientation="vertical"
             android:visibility="gone">
 
-            <com.google.android.material.card.MaterialCardView
-                style="@style/CardSurface">
-
-                <LinearLayout
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:orientation="vertical"
-                    android:padding="16dp">
-
-                    <LinearLayout
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:gravity="center_vertical"
-                        android:orientation="horizontal">
-
-                        <TextView
-                            style="@style/SectionTitle"
-                            android:layout_width="0dp"
-                            android:layout_weight="1"
-                            android:text="@string/topology_section" />
-
-                        <com.google.android.material.button.MaterialButton
-                            android:id="@+id/btnRefreshTopology"
-                            style="@style/Widget.Material3.Button.TextButton"
-                            android:layout_width="wrap_content"
-                            android:layout_height="40dp"
-                            android:text="@string/refresh" />
-
-                    </LinearLayout>
-
-                    <com.codesync.ui.TopologyGraphView
-                        android:id="@+id/topologyGraph"
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:layout_marginTop="12dp" />
-
-                    <LinearLayout
-                        android:id="@+id/topologyList"
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:layout_marginTop="12dp"
-                        android:orientation="vertical" />
-
-                </LinearLayout>
-            </com.google.android.material.card.MaterialCardView>
+            <include
+                android:id="@+id/topologyContent"
+                layout="@layout/page_topology_content" />
 
         </LinearLayout>
 

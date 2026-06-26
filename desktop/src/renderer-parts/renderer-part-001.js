@@ -1,4 +1,5 @@
 const codes = []
+const ongoingNotifications = new Map()
 let authorizedPhones = []
 let desktopTotps = []
 let totpIntervals = new Map()
@@ -23,6 +24,42 @@ let messageSettings = {
   syncClipboardImage: true,
   syncClipboardFile: false,
   receiveFileTransfer: false
+}
+
+if (!window.electronAPI) {
+  const browserPreviewApi = {
+    copyToClipboard: async (text) => {
+      try {
+        await navigator.clipboard?.writeText?.(String(text || ''))
+      } catch (_) {}
+    },
+    getAppVersion: async () => 'browser-preview',
+    getAuthorizedPhones: async () => [],
+    getDesktopTotps: async () => [],
+    getFileTransferHistory: async () => [],
+    getFileTransferSettings: async () => ({ downloadDir: '', usingDefault: true }),
+    getFileTransferTargets: async () => [],
+    getLanDevices: async () => [],
+    getLanJoinSettings: async () => ({ allowJoinRequests: true }),
+    getMessageSettings: async () => ({ ...messageSettings }),
+    getPairingInfo: async () => ({ authorizedPhones: [], host: '', port: '', qrDataURL: '' }),
+    getTopology: async () => ({ localNodeId: 'browser-preview', nodes: [], edges: [] }),
+    hideWindow: () => {},
+    isWindowVisible: async () => true,
+    minimizeWindow: () => {},
+    openExternal: (url) => window.open(url, '_blank'),
+    regeneratePairing: async () => {},
+    scanLanDevices: async () => [],
+    setLanJoinSettings: async (settings) => settings,
+    setMessageSettings: async (settings) => ({ ...settings })
+  }
+
+  window.electronAPI = new Proxy(browserPreviewApi, {
+    get(target, prop) {
+      if (prop in target) return target[prop]
+      return async () => undefined
+    }
+  })
 }
 
 document.addEventListener('DOMContentLoaded', async () => {
@@ -998,6 +1035,18 @@ function addCode(codeInfo) {
     timestamp: codeInfo.timestamp || now,
     receivedAt: codeInfo.receivedAt || now
   }
+  if (isOngoingNotificationRemoval(normalized)) {
+    removeOngoingNotification(normalized)
+    renderCodes()
+    updateSettingsStats()
+    return
+  }
+  if (isOngoingNotificationUpdate(normalized)) {
+    upsertOngoingNotification(normalized)
+    renderCodes()
+    updateSettingsStats()
+    return
+  }
   const duplicateKey = getMessageDuplicateKey(normalized)
   const duplicate = codes.find(c =>
     getMessageDuplicateKey(c) === duplicateKey &&
@@ -1025,6 +1074,110 @@ function addCode(codeInfo) {
   }
 
   updateSettingsStats()
+}
+
+function ongoingNotificationKey(codeInfo = {}) {
+  const key = String(codeInfo.notificationKey || '').trim()
+  if (!key) return ''
+  const sourceId = String(codeInfo.sourceDeviceId || codeInfo.phoneId || codeInfo.sourceDeviceName || '').trim()
+  return `${sourceId}|${key}`
+}
+
+function isOngoingNotificationUpdate(codeInfo = {}) {
+  return (codeInfo.contentType || codeInfo.type) === 'app_notification' &&
+    codeInfo.notificationOngoing === true &&
+    Boolean(ongoingNotificationKey(codeInfo))
+}
+
+function isOngoingNotificationRemoval(codeInfo = {}) {
+  return (codeInfo.contentType || codeInfo.type) === 'app_notification_removed' &&
+    Boolean(ongoingNotificationKey(codeInfo))
+}
+
+function upsertOngoingNotification(codeInfo) {
+  const key = ongoingNotificationKey(codeInfo)
+  if (!key) return
+  const existing = ongoingNotifications.get(key)
+  const now = Date.now()
+  ongoingNotifications.set(key, {
+    ...(existing || {}),
+    ...codeInfo,
+    id: existing?.id || `ongoing-${now}-${Math.random().toString(36).slice(2, 8)}`,
+    type: 'app_notification',
+    contentType: 'app_notification',
+    firstSeenAt: existing?.firstSeenAt || codeInfo.timestamp || now,
+    updatedAt: now,
+    removedAt: 0
+  })
+  while (ongoingNotifications.size > 20) {
+    const oldest = Array.from(ongoingNotifications.entries())
+      .sort((a, b) => (a[1].updatedAt || a[1].timestamp || 0) - (b[1].updatedAt || b[1].timestamp || 0))[0]
+    if (!oldest) break
+    ongoingNotifications.delete(oldest[0])
+  }
+}
+
+function removeOngoingNotification(codeInfo) {
+  const key = ongoingNotificationKey(codeInfo)
+  if (!key) return
+  ongoingNotifications.delete(key)
+}
+
+function renderOngoingNotifications() {
+  const section = document.getElementById('ongoing-notifications-section')
+  const list = document.getElementById('ongoing-notifications-list')
+  if (!section || !list) return
+
+  const items = Array.from(ongoingNotifications.values())
+    .sort((a, b) => (b.updatedAt || b.timestamp || 0) - (a.updatedAt || a.timestamp || 0))
+  section.hidden = items.length === 0
+  if (!items.length) {
+    list.innerHTML = ''
+    return
+  }
+
+  list.innerHTML = items.map(item => {
+    const time = formatTime(item.updatedAt || item.timestamp)
+    const appName = item.appName || item.source || '通知'
+    const title = item.title || appName
+    const body = getRawMessage(item) || '持续通知正在显示'
+    const sourceName = item.sourceDeviceName || item.phoneName || '未知设备'
+    const packageName = item.packageName ? ` · ${item.packageName}` : ''
+    return `
+      <div class="ongoing-notification-card" data-id="${escapeHtml(item.id)}" title="点击查看详细内容">
+        <div class="ongoing-notification-main">
+          <div class="ongoing-notification-top">
+            <span class="ongoing-dot"></span>
+            <span class="ongoing-app">${escapeHtml(appName)}</span>
+            <span class="ongoing-time">${escapeHtml(time)}</span>
+          </div>
+          <div class="ongoing-title">${escapeHtml(title)}</div>
+          <div class="ongoing-body">${escapeHtml(body)}</div>
+          <div class="ongoing-meta">${escapeHtml(sourceName)}${escapeHtml(packageName)}</div>
+        </div>
+        <button class="ongoing-copy-btn" title="复制通知内容">复制</button>
+      </div>
+    `
+  }).join('')
+
+  list.querySelectorAll('.ongoing-copy-btn').forEach(button => {
+    button.addEventListener('click', function(e) {
+      e.stopPropagation()
+      const id = this.closest('.ongoing-notification-card')?.dataset.id
+      const item = items.find(candidate => candidate.id === id)
+      const value = getCopyValueForMessage(item)
+      if (value) window.electronAPI.copyToClipboard(value)
+    })
+  })
+
+  list.querySelectorAll('.ongoing-notification-card').forEach(card => {
+    card.addEventListener('click', function(e) {
+      if (e.target.closest('button')) return
+      const id = this.dataset.id
+      const item = items.find(candidate => candidate.id === id)
+      if (item) showMessageDetailDialog(item)
+    })
+  })
 }
 
 async function refreshTopology() {
@@ -1212,6 +1365,7 @@ function showLanJoinRequestModal(request) {
 }
 
 function renderCodes() {
+  renderOngoingNotifications()
   const smsCodes = codes.filter(c => c.type !== 'totp')
   const container = document.getElementById('codes-list')
 
@@ -1347,6 +1501,9 @@ function showMessageDetailDialog(codeInfo) {
   if (codeInfo.title) rows.push(['标题', codeInfo.title])
   if (codeInfo.appName) rows.push(['应用', codeInfo.appName])
   if (codeInfo.packageName) rows.push(['包名', codeInfo.packageName])
+  if (codeInfo.notificationKey) rows.push(['通知 Key', codeInfo.notificationKey])
+  if (codeInfo.notificationOngoing) rows.push(['持续通知', '是'])
+  if (codeInfo.notificationPostTime) rows.push(['通知时间', formatFullTime(codeInfo.notificationPostTime)])
   if (manifest && Object.keys(manifest).length) {
     rows.push(['文件名', manifest.name || ''])
     rows.push(['MIME', manifest.mime || ''])
@@ -1698,3 +1855,18 @@ function renderDirectedTopologyNode(node, pos) {
   const tsBadge = isTailscaleHost(node.lastIP)
     ? '<span class="topology-node-ts" title="通过 Tailscale 虚拟网连接">TS</span>'
     : ''
+  return `
+    <div class="topology-directed-node status-${escapeHtml(node.status || 'offline')} role-${escapeHtml(node.role || 'remote')}"
+      style="left:${pos.x / 10}%; top:${pos.y}px"
+      data-topology-node-id="${escapeHtml(node.id)}"
+      tabindex="0"
+      title="${escapeHtml(buildTopologyNodeTitle(node))}">
+      <div class="topology-node-icon">${icon}</div>
+      <div class="topology-node-main">
+        <div class="topology-node-name">${escapeHtml(node.name || node.id)}${tsBadge}</div>
+        <div class="topology-node-meta">${escapeHtml(typeName)} · ${escapeHtml(statusLabel)}${routeChip}</div>
+      </div>
+      <span class="topology-node-dot"></span>
+    </div>
+  `
+}

@@ -2,7 +2,7 @@
 
 app.on('before-quit', () => {
   // 退出前把防抖中未落盘的配对数据写掉
-  flushPendingPairingSave()
+  flushPendingPairingSave({ sync: true })
   busReliabilityStore?.flushSave?.()
   if (busOutboxFlushTimer) {
     clearInterval(busOutboxFlushTimer)

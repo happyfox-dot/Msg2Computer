@@ -41,6 +41,24 @@ test('legacy payload converts to bus envelope and back without losing routing fi
   assert.deepEqual(roundTrip.targetDeviceIds, ['B', 'C'])
 })
 
+test('notification removal legacy payload maps to dedicated bus topic', () => {
+  const legacy = {
+    type: 'app_notification_removed',
+    notificationKey: 'key-1',
+    targetDeviceIds: ['B'],
+    relayTtl: 2
+  }
+  const envelope = busEnvelope.fromLegacyPayload(legacy, {
+    identity: { id: 'A', name: 'Phone A', type: 'ANDROID_PHONE' },
+    networkId: 'net-1'
+  })
+
+  assert.equal(envelope.topic, busEnvelope.TOPICS.APP_NOTIFICATION_REMOVED)
+  const roundTrip = busEnvelope.toLegacyPayload(envelope)
+  assert.equal(roundTrip.type, 'app_notification_removed')
+  assert.equal(roundTrip.notificationKey, 'key-1')
+})
+
 test('route manager prefers LAN, then Tailscale, then relay fallback', () => {
   const routes = buildPeerRoutes({
     target: {

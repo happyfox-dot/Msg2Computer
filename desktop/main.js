@@ -23,6 +23,7 @@ const updater = require('./src/main/updater')
 const { createFileTransfer } = require('./src/main/file-transfer')
 const clipboardVersion = require('./src/main/clipboard-version')
 const trustedNode = require('./src/main/trusted-node')
+const { readJsonSync, writeJsonAtomic, writeJsonAtomicSync } = require('./src/main/async-json-file')
 
 let mainWindow = null
 let bubbleWindow = null

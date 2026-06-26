@@ -1,19 +1,3 @@
-  return `
-    <div class="topology-directed-node status-${escapeHtml(node.status || 'offline')} role-${escapeHtml(node.role || 'remote')}"
-      style="left:${pos.x / 10}%; top:${pos.y}px"
-      data-topology-node-id="${escapeHtml(node.id)}"
-      tabindex="0"
-      title="${escapeHtml(buildTopologyNodeTitle(node))}">
-      <div class="topology-node-icon">${icon}</div>
-      <div class="topology-node-main">
-        <div class="topology-node-name">${escapeHtml(node.name || node.id)}${tsBadge}</div>
-        <div class="topology-node-meta">${escapeHtml(typeName)} · ${escapeHtml(statusLabel)}${routeChip}</div>
-      </div>
-      <span class="topology-node-dot"></span>
-    </div>
-  `
-}
-
 // Tailscale 的 CGNAT 段 100.64.0.0/10
 function isTailscaleHost(address) {
   const parts = String(address || '').trim().split('.').map(Number)
@@ -871,6 +855,7 @@ function getContentTypeLabel(type) {
     sms: '验证码短信',
     sms_message: '普通短信',
     app_notification: 'App 通知',
+    app_notification_removed: 'App 通知结束',
     clipboard: '剪贴板',
     clipboard_text: '剪贴板文本',
     clipboard_image: '剪贴板图片',
@@ -882,7 +867,7 @@ function getContentTypeLabel(type) {
 function getMessageSourceText(codeInfo) {
   if (!codeInfo) return '未知来源'
   const contentType = codeInfo.contentType || codeInfo.type || 'sms'
-  if (contentType === 'app_notification') {
+  if (contentType === 'app_notification' || contentType === 'app_notification_removed') {
     return [codeInfo.appName || codeInfo.source || '通知', codeInfo.packageName || '']
       .filter(Boolean)
       .join(' · ')

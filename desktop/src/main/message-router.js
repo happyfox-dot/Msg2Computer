@@ -52,7 +52,7 @@ function canPushContentToNode(target, type, codeTypes = {}) {
   const policy = normalizePushContentPolicy(target.contentPolicy || target)
   if (type === codeTypes.SMS || type === 'sms') return policy.allowSmsCodes
   if (type === codeTypes.SMS_MESSAGE || type === 'sms_message') return policy.allowSmsMessages
-  if (type === codeTypes.APP_NOTIFICATION || type === 'app_notification') return policy.allowNotifications
+  if (type === codeTypes.APP_NOTIFICATION || type === 'app_notification' || type === 'app_notification_removed') return policy.allowNotifications
   if (type === codeTypes.CLIPBOARD_TEXT || type === 'clipboard_text' || type === codeTypes.CLIPBOARD || type === 'clipboard') {
     return policy.allowClipboardText
   }
@@ -73,7 +73,7 @@ function canReceiveContentType(type, settings = {}, codeTypes = {}) {
   const contentType = type || codeTypes.SMS || 'sms'
   if (contentType === codeTypes.SMS || contentType === 'sms') return normalized.receiveSmsCodes !== false
   if (contentType === codeTypes.SMS_MESSAGE || contentType === 'sms_message') return normalized.receiveAllSms !== false
-  if (contentType === codeTypes.APP_NOTIFICATION || contentType === 'app_notification') {
+  if (contentType === codeTypes.APP_NOTIFICATION || contentType === 'app_notification' || contentType === 'app_notification_removed') {
     return normalized.receiveNotifications !== false
   }
   if (contentType === codeTypes.CLIPBOARD_TEXT || contentType === 'clipboard_text' || contentType === codeTypes.CLIPBOARD || contentType === 'clipboard') {

@@ -665,6 +665,8 @@ class NodeReceiverService : Service() {
                             )
                         }
                     }
+                } else if (payloadType == "app_notification_removed") {
+                    WebSocketService.reportExternalStatus(this, "已同步通知状态：$sourceName")
                 } else {
                     notifyUserMessageRelay(payload)
                     WebSocketService.reportExternalStatus(this, receivedStatusMessage(payloadType, sourceName))
@@ -790,6 +792,8 @@ class NodeReceiverService : Service() {
                             )
                         }
                     }
+                } else if (payloadType == "app_notification_removed") {
+                    WebSocketService.reportExternalStatus(this, "已同步通知状态：$sourceName")
                 } else {
                     notifyUserMessageRelay(payload)
                     WebSocketService.reportExternalStatus(this, receivedStatusMessage(payloadType, sourceName))
@@ -878,6 +882,7 @@ class NodeReceiverService : Service() {
         return type == "sms" ||
             type == "sms_message" ||
             type == "app_notification" ||
+            type == "app_notification_removed" ||
             isClipboardTextPayload(type) ||
             type == "clipboard_image" ||
             type == "clipboard_file" ||

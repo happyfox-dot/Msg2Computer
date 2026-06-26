@@ -62,10 +62,16 @@ test('per-node policy can block individual content types', () => {
 
   assert.equal(canPushContentToNode(target, 'sms'), true)
   assert.equal(canPushContentToNode(target, 'app_notification'), false)
+  assert.equal(canPushContentToNode(target, 'app_notification_removed'), false)
   assert.equal(canPushContentToNode(target, 'clipboard_text'), true)
   assert.equal(canPushContentToNode(target, 'clipboard_image'), false)
   assert.equal(canPushContentToNode(target, 'clipboard_file'), true)
   assert.equal(canPushContentToNode(target, 'file_transfer'), true)
+})
+
+test('notification removal events follow notification receive policy', () => {
+  assert.equal(canReceiveContentType('app_notification_removed', { receiveNotifications: true }), true)
+  assert.equal(canReceiveContentType('app_notification_removed', { receiveNotifications: false }), false)
 })
 
 test('recent delivery tracker deduplicates and evicts old keys', () => {

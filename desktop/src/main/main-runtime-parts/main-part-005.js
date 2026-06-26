@@ -401,6 +401,37 @@ async function broadcastFileManifestToNodes(targetIds, basePayload) {
   return result.delivered
 }
 
+const ONGOING_NOTIFICATION_BUBBLE_KEY_TTL_MS = 6 * 60 * 60 * 1000
+const ONGOING_NOTIFICATION_BUBBLE_KEY_LIMIT = 300
+const ongoingNotificationBubbleKeys = new Map()
+
+function pruneOngoingNotificationBubbleKeys(now = Date.now()) {
+  for (const [key, seenAt] of ongoingNotificationBubbleKeys.entries()) {
+    if (!Number.isFinite(seenAt) || now - seenAt > ONGOING_NOTIFICATION_BUBBLE_KEY_TTL_MS) {
+      ongoingNotificationBubbleKeys.delete(key)
+    }
+  }
+  while (ongoingNotificationBubbleKeys.size > ONGOING_NOTIFICATION_BUBBLE_KEY_LIMIT) {
+    const oldestKey = ongoingNotificationBubbleKeys.keys().next().value
+    if (!oldestKey) break
+    ongoingNotificationBubbleKeys.delete(oldestKey)
+  }
+}
+
+function hasOngoingNotificationBubbleKey(key, now = Date.now()) {
+  if (!key) return false
+  pruneOngoingNotificationBubbleKeys(now)
+  return ongoingNotificationBubbleKeys.has(key)
+}
+
+function rememberOngoingNotificationBubbleKey(key, now = Date.now()) {
+  if (!key) return
+  pruneOngoingNotificationBubbleKeys(now)
+  if (ongoingNotificationBubbleKeys.has(key)) ongoingNotificationBubbleKeys.delete(key)
+  ongoingNotificationBubbleKeys.set(key, now)
+  pruneOngoingNotificationBubbleKeys(now)
+}
+
 function handleVerifyCode(codeData) {
   const {
     code,
@@ -412,6 +443,9 @@ function handleVerifyCode(codeData) {
     title,
     appName,
     packageName,
+    notificationKey,
+    notificationOngoing,
+    notificationPostTime,
     phoneId,
     phoneName,
     rawMessage,
@@ -456,6 +490,9 @@ function handleVerifyCode(codeData) {
     title: title || '',
     appName: appName || '',
     packageName: packageName || '',
+    notificationKey: notificationKey || '',
+    notificationOngoing: !!notificationOngoing,
+    notificationPostTime: notificationPostTime || 0,
     phoneId: phoneId || '',
     phoneName: phoneName || '未知手机',
     sourceDeviceId: sourceDeviceId || phoneId || '',
@@ -519,8 +556,21 @@ function handleVerifyCode(codeData) {
   } else if (codeInfo.type === CODE_TYPES.APP_NOTIFICATION) {
     const titleText = codeInfo.title || codeInfo.appName || codeInfo.source
     const bodyText = codeInfo.rawMessage || ''
-    showCodeBubble(codeInfo)
-    showNotification(`🔔 ${codeInfo.appName || '新通知'}`, `${titleText}\n${bodyText}\n来源设备: ${codeInfo.sourceDeviceName}`)
+    const ongoingKey = codeInfo.notificationOngoing && codeInfo.notificationKey
+      ? `${codeInfo.sourceDeviceId || codeInfo.phoneId || ''}|${codeInfo.notificationKey}`
+      : ''
+    const now = Date.now()
+    const shouldNotify = !ongoingKey || !hasOngoingNotificationBubbleKey(ongoingKey, now)
+    if (ongoingKey) rememberOngoingNotificationBubbleKey(ongoingKey, now)
+    if (shouldNotify) {
+      showCodeBubble(codeInfo)
+      showNotification(`🔔 ${codeInfo.appName || '新通知'}`, `${titleText}\n${bodyText}\n来源设备: ${codeInfo.sourceDeviceName}`)
+    }
+  } else if (codeInfo.type === CODE_TYPES.APP_NOTIFICATION_REMOVED) {
+    const ongoingKey = codeInfo.notificationKey
+      ? `${codeInfo.sourceDeviceId || codeInfo.phoneId || ''}|${codeInfo.notificationKey}`
+      : ''
+    if (ongoingKey) ongoingNotificationBubbleKeys.delete(ongoingKey)
   } else if (codeInfo.type === CODE_TYPES.CLIPBOARD || codeInfo.type === CODE_TYPES.CLIPBOARD_TEXT) {
     const textManifest = codeInfo.fileManifest || (codeData && codeData.fileManifest) || {}
     if (textManifest.inline === false && textManifest.fileId) {
@@ -650,12 +700,41 @@ function handleIncomingClipboardImageManifest(codeInfo, codeData, manifest, onAp
 // 的分片 GET 拉取。这里负责策略闸门与（必要时）用户确认。
 // 带 batchId 的 manifest 同批只确认一次，结论对整批生效（含确认后才到达的）。
 const fileBatchDecisions = new Map() // batchId -> { status, queue, expiresAt }
+const fileManifestDecisions = new Map() // manifestKey -> { status, started, expiresAt }
+const FILE_MANIFEST_DECISION_TTL_MS = 10 * 60 * 1000
 
 function pruneFileBatchDecisions() {
   const now = Date.now()
   for (const [batchId, entry] of fileBatchDecisions) {
     if (now > entry.expiresAt) fileBatchDecisions.delete(batchId)
   }
+  for (const [manifestKey, entry] of fileManifestDecisions) {
+    if (now > entry.expiresAt) fileManifestDecisions.delete(manifestKey)
+  }
+}
+
+function fileManifestPromptKey(codeInfo = {}, codeData = {}, manifest = {}) {
+  const source = String(
+    codeInfo.originDeviceId ||
+    codeInfo.sourceDeviceId ||
+    codeInfo.phoneId ||
+    manifest.originDeviceId ||
+    ''
+  ).trim()
+  const identity = String(
+    manifest.fileId ||
+    manifest.sha256 ||
+    codeInfo.originMessageId ||
+    codeInfo.relayMessageId ||
+    codeData.originMessageId ||
+    ''
+  ).trim()
+  const fallback = [
+    String(manifest.name || ''),
+    String(manifest.size || ''),
+    String(manifest.updatedAt || manifest.createdAt || codeInfo.timestamp || '')
+  ].join('|')
+  return `${source}|${identity || fallback}`
 }
 
 function incomingClipboardFileKey(codeInfo, codeData, manifest) {
@@ -761,9 +840,25 @@ function handleIncomingFileManifest(codeInfo, codeData) {
     return
   }
 
+  pruneFileBatchDecisions()
   const batchId = String((codeData && codeData.batchId) || codeInfo.batchId || '')
   if (!batchId) {
-    // 非批量：弹原生确认框。用户同意后才回连拉取。
+    // 非批量：同一 manifest 在对端重试/多路径 relay 时只弹一次。
+    const promptKey = fileManifestPromptKey(codeInfo, codeData, manifest)
+    const existing = fileManifestDecisions.get(promptKey)
+    if (existing) {
+      if (existing.status === 'accepted' && !existing.started) {
+        existing.started = true
+        beginPull()
+      }
+      return
+    }
+    const entry = {
+      status: 'pending',
+      started: false,
+      expiresAt: Date.now() + FILE_MANIFEST_DECISION_TTL_MS
+    }
+    fileManifestDecisions.set(promptKey, entry)
     dialog.showMessageBox(mainWindow || undefined, {
       type: 'question',
       buttons: ['接收', '拒绝'],
@@ -773,14 +868,19 @@ function handleIncomingFileManifest(codeInfo, codeData) {
       message: `${sourceName} 想发送文件`,
       detail: `${manifest.name || '文件'}（${formatBytes(size)}）\n来自: ${sourceName}`
     }).then(result => {
-      if (result.response === 0) beginPull()
+      entry.status = result.response === 0 ? 'accepted' : 'rejected'
+      entry.expiresAt = Date.now() + FILE_MANIFEST_DECISION_TTL_MS
+      if (entry.status === 'accepted' && !entry.started) {
+        entry.started = true
+        beginPull()
+      }
     }).catch(err => {
+      fileManifestDecisions.delete(promptKey)
       console.error('文件接收确认对话框失败:', err)
     })
     return
   }
 
-  pruneFileBatchDecisions()
   const existing = fileBatchDecisions.get(batchId)
   if (existing) {
     if (existing.status === 'accepted') beginPull()
@@ -889,6 +989,7 @@ const RELAY_FORWARD_TYPES = new Set([
   'sms',
   'sms_message',
   'app_notification',
+  'app_notification_removed',
   'clipboard',
   'clipboard_text',
   'clipboard_image',

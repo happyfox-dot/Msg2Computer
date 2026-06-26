@@ -19,6 +19,7 @@ object ContentBus {
         const val SMS_CODE = "sms.code"
         const val SMS_RAW = "sms.raw"
         const val APP_NOTIFICATION = "notification.app"
+        const val APP_NOTIFICATION_REMOVED = "notification.removed"
         const val TOTP_SEED = "totp.seed"
         const val TOTP_REVOKE = "totp.revoke"
         const val CLIPBOARD_TEXT = "clipboard.text"
@@ -32,6 +33,7 @@ object ContentBus {
         "sms" -> Topic.SMS_CODE
         "sms_message" -> Topic.SMS_RAW
         "app_notification" -> Topic.APP_NOTIFICATION
+        "app_notification_removed" -> Topic.APP_NOTIFICATION_REMOVED
         "totp_seed" -> Topic.TOTP_SEED
         "totp_revoke" -> Topic.TOTP_REVOKE
         "clipboard", "clipboard_text" -> Topic.CLIPBOARD_TEXT
@@ -46,6 +48,7 @@ object ContentBus {
         Topic.SMS_CODE -> "sms"
         Topic.SMS_RAW -> "sms_message"
         Topic.APP_NOTIFICATION -> "app_notification"
+        Topic.APP_NOTIFICATION_REMOVED -> "app_notification_removed"
         Topic.TOTP_SEED -> "totp_seed"
         Topic.TOTP_REVOKE -> "totp_revoke"
         Topic.CLIPBOARD_TEXT -> "clipboard_text"

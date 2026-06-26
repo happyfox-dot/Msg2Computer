@@ -62,6 +62,7 @@ const CODE_TYPES = {
   SMS: 'sms',
   SMS_MESSAGE: 'sms_message',
   APP_NOTIFICATION: 'app_notification',
+  APP_NOTIFICATION_REMOVED: 'app_notification_removed',
   CLIPBOARD: 'clipboard',
   CLIPBOARD_TEXT: 'clipboard_text',
   CLIPBOARD_IMAGE: 'clipboard_image',
@@ -84,6 +85,7 @@ const DEFAULT_MESSAGE_SETTINGS = {
   maxFileSizeMb: 50
 }
 const PAIRING_CONFIG_FILE = 'pairing.json'
+const TOPOLOGY_DELTA_BACKLOG_FILE = 'topology-delta-backlog.json'
 const FILE_TRANSFER_HISTORY_FILE = 'file-transfer-history.json'
 const BUS_RELIABILITY_FILE = 'bus-reliability.json'
 const FILE_TRANSFER_HISTORY_LIMIT = 300
@@ -98,7 +100,9 @@ const ROUTING_PROTOCOL_VERSION = 2
 const ROUTE_STALE_MS = 10 * 60 * 1000
 const TOPOLOGY_RECENT_REACHABLE_MS = 2 * 60 * 1000
 const TOPOLOGY_DELTA_TTL = 4
-const TOPOLOGY_DELTA_BACKLOG_LIMIT = 80
+const TOPOLOGY_DELTA_BACKLOG_LIMIT = 12
+const TOPOLOGY_DELTA_BACKLOG_PER_SOURCE_LIMIT = 3
+const TOPOLOGY_DELTA_BACKLOG_MAX_BYTES = 128 * 1024
 // 用户消息（短信/通知/剪贴板/TOTP 种子）的多跳续传 TTL，与安卓端 SMS_RELAY_TTL 一致。
 // 源设备直投所有目标的同时，收到消息的节点会把它续传给目标列表里
 // 自己可达而尚未在中继路径中的节点（去重由 originMessageId 保证）。
@@ -142,7 +146,7 @@ function showMainWindow() {
 function quitForUpdate() {
   app.isQuitting = true
   try {
-    flushPendingPairingSave()
+    flushPendingPairingSave({ sync: true })
   } catch (error) {
     console.warn('更新前保存配置失败:', error)
   }
@@ -782,6 +786,7 @@ function mergeTrustedNetworkId(targetNetworkId, mergeFromNetworkIds = []) {
   trustedNetworkId = target
   rewriteStoredNetworkIds(target, mergeFrom)
   mergeFrom.forEach(id => pendingNetworkMergeFromIds.add(id))
+  saveTopologyDeltaBacklog()
   savePairingKey()
   return mergeFrom
 }
@@ -1234,6 +1239,100 @@ function protectTopologyDeltaSecrets(delta = {}) {
   return protectedDelta
 }
 
+function compactTopologyNodeForBacklog(raw = {}) {
+  const node = normalizeLsdbNode(raw)
+  if (!node) return null
+  return {
+    id: node.id,
+    name: node.name,
+    type: node.type,
+    role: node.role,
+    host: node.host,
+    lastIP: node.lastIP,
+    port: node.port,
+    wsPort: node.wsPort,
+    relayPort: node.relayPort,
+    pairingKey: node.pairingKey,
+    tsHost: node.tsHost,
+    altHosts: node.altHosts,
+    networkId: node.networkId,
+    autoPaired: node.autoPaired,
+    trustSourceId: node.trustSourceId,
+    trustLevel: node.trustLevel,
+    acceptedAt: node.acceptedAt,
+    capabilities: node.capabilities,
+    enabled: node.enabled,
+    revoked: node.revoked,
+    contentPolicy: node.contentPolicy,
+    connected: node.connected,
+    status: node.status,
+    authority: node.authority,
+    routable: node.routable,
+    sourceId: node.sourceId,
+    seq: node.seq,
+    updatedAt: node.updatedAt,
+    lastSeen: node.lastSeen,
+    expiresAt: node.expiresAt
+  }
+}
+
+function compactTopologyLinkForBacklog(raw = {}) {
+  const link = normalizeLsdbLink(raw)
+  if (!link) return null
+  return {
+    id: link.id,
+    from: link.from,
+    to: link.to,
+    type: link.type,
+    label: link.label,
+    direction: link.direction,
+    enabled: link.enabled,
+    active: link.active,
+    routable: link.routable,
+    contentPolicy: link.contentPolicy,
+    authority: link.authority,
+    metric: link.metric,
+    description: link.description,
+    seq: link.seq,
+    updatedAt: link.updatedAt,
+    expiresAt: link.expiresAt
+  }
+}
+
+function compactTopologyDeltaForBacklog(delta = {}) {
+  if (!delta || delta.type !== 'topology_delta') return null
+  const nodes = Array.isArray(delta.nodes)
+    ? delta.nodes.map(compactTopologyNodeForBacklog).filter(Boolean)
+    : []
+  const links = Array.isArray(delta.links)
+    ? delta.links.map(compactTopologyLinkForBacklog).filter(Boolean)
+    : []
+  const compact = {
+    type: 'topology_delta',
+    version: delta.version || ROUTING_PROTOCOL_VERSION,
+    routingProtocol: delta.routingProtocol || 'link-state-spf',
+    controlPlane: delta.controlPlane !== false,
+    messageTypes: Array.isArray(delta.messageTypes) ? delta.messageTypes : ['node_advertisement', 'link_advertisement'],
+    reason: delta.reason || 'backlog',
+    sourceDeviceId: String(delta.sourceDeviceId || delta.originDeviceId || '').trim(),
+    sourceDeviceName: String(delta.sourceDeviceName || '').trim(),
+    sourceDeviceType: String(delta.sourceDeviceType || '').trim(),
+    originDeviceId: String(delta.originDeviceId || delta.sourceDeviceId || '').trim(),
+    networkId: String(delta.networkId || '').trim(),
+    seq: Number(delta.seq || 0),
+    ttl: Number.isFinite(Number(delta.ttl)) ? Number(delta.ttl) : TOPOLOGY_DELTA_TTL,
+    updatedAt: Number(delta.updatedAt || delta.seq || Date.now()) || Date.now(),
+    nodes,
+    links
+  }
+  if (delta.networkMerge === true) {
+    compact.networkMerge = true
+    compact.mergeFromNetworkIds = normalizeNetworkMergeIds(delta.mergeFromNetworkIds || [])
+    compact.mergedAt = Number(delta.mergedAt || compact.updatedAt) || compact.updatedAt
+  }
+  return compact.sourceDeviceId && compact.seq > 0 ? compact : null
+}
+
 function unprotectTopologyDeltaSecrets(delta = {}) {
   const plainDelta = JSON.parse(JSON.stringify(delta || {}))
   if (Array.isArray(plainDelta.nodes)) {
@@ -1247,18 +1346,115 @@ function unprotectTopologyDeltaSecrets(delta = {}) {
   return plainDelta
 }
 
+function deltaBacklogSourceId(delta = {}) {
+  return String(delta.sourceDeviceId || delta.originDeviceId || '').trim()
+}
+
+function trimTopologyDeltaBacklog(items = []) {
+  const perSourceCounts = new Map()
+  let kept = items
+    .map(compactTopologyDeltaForBacklog)
+    .filter(Boolean)
+    .sort((a, b) => Number(b.seq || 0) - Number(a.seq || 0))
+    .filter(delta => {
+      const sourceId = deltaBacklogSourceId(delta)
+      const count = perSourceCounts.get(sourceId) || 0
+      if (count >= TOPOLOGY_DELTA_BACKLOG_PER_SOURCE_LIMIT) return false
+      perSourceCounts.set(sourceId, count + 1)
+      return true
+    })
+    .slice(0, TOPOLOGY_DELTA_BACKLOG_LIMIT)
+    .reverse()
+
+  while (kept.length > 1 && Buffer.byteLength(JSON.stringify(kept), 'utf8') > TOPOLOGY_DELTA_BACKLOG_MAX_BYTES) {
+    kept = kept.slice(1)
+  }
+  return kept
+}
+
 function importTopologyDeltaBacklog(saved = []) {
-  topologyDeltaBacklog = (Array.isArray(saved) ? saved : [])
+  topologyDeltaBacklog = trimTopologyDeltaBacklog((Array.isArray(saved) ? saved : [])
     .map(unprotectTopologyDeltaSecrets)
-    .filter(delta => delta && delta.type === 'topology_delta' && Number(delta.seq || 0) > 0)
-    .sort((a, b) => Number(a.seq || 0) - Number(b.seq || 0))
-    .slice(-TOPOLOGY_DELTA_BACKLOG_LIMIT)
+    .filter(delta => delta && delta.type === 'topology_delta' && Number(delta.seq || 0) > 0))
 }
 
 function exportTopologyDeltaBacklog() {
+  topologyDeltaBacklog = trimTopologyDeltaBacklog(topologyDeltaBacklog)
   return topologyDeltaBacklog
-    .slice(-TOPOLOGY_DELTA_BACKLOG_LIMIT)
     .map(protectTopologyDeltaSecrets)
+}
+
+function buildTopologyDeltaBacklogState() {
+  return {
+    version: 1,
+    topologyDeltaBacklog: exportTopologyDeltaBacklog(),
+    updatedAt: Date.now()
+  }
+}
+
+function normalizeTopologyDeltaBacklogState(raw, legacyBacklog = []) {
+  if (Array.isArray(raw)) return raw
+  if (raw && Array.isArray(raw.topologyDeltaBacklog)) return raw.topologyDeltaBacklog
+  if (raw && Array.isArray(raw.deltas)) return raw.deltas
+  return Array.isArray(legacyBacklog) ? legacyBacklog : []
+}
+
+function loadTopologyDeltaBacklogState(legacyBacklog = []) {
+  const saved = readJsonSync(getTopologyDeltaBacklogPath(), null)
+  return normalizeTopologyDeltaBacklogState(saved, legacyBacklog)
+}
+
+let topologyBacklogSaveTimer = null
+let topologyBacklogSaveDirty = false
+let topologyBacklogSaveInFlight = null
+
+function saveTopologyDeltaBacklog() {
+  if (topologyBacklogSaveTimer) return
+  topologyBacklogSaveTimer = setTimeout(() => {
+    topologyBacklogSaveTimer = null
+    flushTopologyDeltaBacklogToDisk()
+  }, 500)
+  topologyBacklogSaveTimer.unref?.()
+}
+
+function flushPendingTopologyBacklogSave(options = {}) {
+  if (topologyBacklogSaveTimer) {
+    clearTimeout(topologyBacklogSaveTimer)
+    topologyBacklogSaveTimer = null
+  }
+  return flushTopologyDeltaBacklogToDisk(options)
+}
+
+function flushTopologyDeltaBacklogToDisk(options = {}) {
+  if (options.sync === true) {
+    topologyBacklogSaveDirty = false
+    try {
+      writeJsonAtomicSync(getTopologyDeltaBacklogPath(), buildTopologyDeltaBacklogState())
+    } catch (error) {
+      console.error('Failed to save topology delta backlog:', error)
+    }
+    return Promise.resolve()
+  }
+  topologyBacklogSaveDirty = true
+  if (!topologyBacklogSaveInFlight) {
+    topologyBacklogSaveInFlight = drainTopologyBacklogSaveQueue()
+      .finally(() => {
+        topologyBacklogSaveInFlight = null
+        if (topologyBacklogSaveDirty) flushTopologyDeltaBacklogToDisk()
+      })
+  }
+  return topologyBacklogSaveInFlight
+}
+
+async function drainTopologyBacklogSaveQueue() {
+  while (topologyBacklogSaveDirty) {
+    topologyBacklogSaveDirty = false
+    try {
+      await writeJsonAtomic(getTopologyDeltaBacklogPath(), buildTopologyDeltaBacklogState())
+    } catch (error) {
+      console.error('Failed to save topology delta backlog:', error)
+    }
+  }
 }
 
 function rememberTopologyDelta(delta = {}, options = {}) {
@@ -1269,14 +1465,15 @@ function rememberTopologyDelta(delta = {}, options = {}) {
   if (options.requireLocalSource === true && sourceDeviceId !== identity.id) return
   const seq = Number(delta.seq || 0)
   if (!Number.isFinite(seq) || seq <= 0) return
-  topologyDeltaBacklog = topologyDeltaBacklog
+  const compactDelta = compactTopologyDeltaForBacklog(delta)
+  if (!compactDelta) return
+  topologyDeltaBacklog = trimTopologyDeltaBacklog(topologyDeltaBacklog
     .filter(item => {
-      const itemSourceId = String(item.sourceDeviceId || item.originDeviceId || '').trim()
+      const itemSourceId = deltaBacklogSourceId(item)
       return itemSourceId !== sourceDeviceId || Number(item.seq || 0) !== seq
     })
-    .concat(JSON.parse(JSON.stringify(delta)))
-    .sort((a, b) => Number(a.seq || 0) - Number(b.seq || 0))
-    .slice(-TOPOLOGY_DELTA_BACKLOG_LIMIT)
+    .concat(compactDelta))
+  saveTopologyDeltaBacklog()
 }
 
 function rememberLocalTopologyDelta(delta = {}) {
@@ -1321,6 +1518,10 @@ function exportTopologyLsdb() {
 
 function getPairingConfigPath() {
   return path.join(app.getPath('userData'), PAIRING_CONFIG_FILE)
+}
+
+function getTopologyDeltaBacklogPath() {
+  return path.join(app.getPath('userData'), TOPOLOGY_DELTA_BACKLOG_FILE)
 }
 
 function getFileTransferHistoryPath() {
@@ -1690,7 +1891,10 @@ function loadOrCreatePairingKey() {
       allowLanJoinRequests = saved.allowLanJoinRequests !== false
       localEventToken = unprotectSecret(saved.localEventToken || '') || ''
       importSavedTopologyLsdb(saved.topologyLsdb || {})
-      importTopologyDeltaBacklog(saved.topologyDeltaBacklog || [])
+      importTopologyDeltaBacklog(loadTopologyDeltaBacklogState(saved.topologyDeltaBacklog || []))
+      if (Array.isArray(saved.topologyDeltaBacklog) && saved.topologyDeltaBacklog.length > 0) {
+        saveTopologyDeltaBacklog()
+      }
       pruneTotpDeleteTombstones()
       if (saved.pairingKey) {
         // 新格式是 safe:/plain: 前缀密文，旧版明文（base64 不含冒号）原样返回；
@@ -1726,6 +1930,8 @@ function loadOrCreatePairingKey() {
 }
 
 let pairingSaveTimer = null
+let pairingSaveDirty = false
+let pairingSaveInFlight = null
 
 // 调用极频繁（每次设备上线、每条消息落库都会触发），防抖合并 500ms 内的写盘
 function savePairingKey() {
@@ -1734,34 +1940,62 @@ function savePairingKey() {
     pairingSaveTimer = null
     flushPairingConfigToDisk()
   }, 500)
+  pairingSaveTimer.unref?.()
 }
 
-function flushPendingPairingSave() {
-  if (!pairingSaveTimer) return
-  clearTimeout(pairingSaveTimer)
-  pairingSaveTimer = null
-  flushPairingConfigToDisk()
+function flushPendingPairingSave(options = {}) {
+  if (pairingSaveTimer) {
+    clearTimeout(pairingSaveTimer)
+    pairingSaveTimer = null
+  }
+  const sync = options.sync === true || app.isQuitting === true
+  flushPendingTopologyBacklogSave({ sync })
+  return flushPairingConfigToDisk({ sync })
 }
 
-function flushPairingConfigToDisk() {
-  const configPath = getPairingConfigPath()
-  const tmpPath = `${configPath}.tmp`
-  try {
-    fs.mkdirSync(path.dirname(configPath), { recursive: true })
-    // 先写临时文件再原子替换：直接覆盖时写一半崩溃会损坏 JSON，
-    // 下次启动静默重置 pairingKey，所有已配对设备和 TOTP 种子全部丢失
-    fs.writeFileSync(
-      tmpPath,
-      JSON.stringify({
-        // 内容策略格式版本：v2 起 allowClipboard 默认 true（见 loadOrCreatePairingKey 迁移）
-        policyVersion: 4,
-        networkId: ensureTrustedNetworkId(),
-        allowLanJoinRequests,
-        localEventToken: protectSecret(ensureLocalEventToken()),
-        // 配对密钥是信任体系的根，与 TOTP 种子同样用 safeStorage（DPAPI）加密落盘；
-        // 旧版明文文件由 unprotectSecret 兼容读取，首次重新落盘即转为密文
-        pairingKey: protectSecret(pairingKey),
-        authorizedPhones: getAuthorizedPhones().map(phone => ({
+function flushPairingConfigToDisk(options = {}) {
+  if (options.sync === true) {
+    pairingSaveDirty = false
+    try {
+      writeJsonAtomicSync(getPairingConfigPath(), buildPairingConfigState())
+    } catch (error) {
+      console.error('Failed to save pairing config:', error)
+    }
+    return Promise.resolve()
+  }
+  pairingSaveDirty = true
+  if (!pairingSaveInFlight) {
+    pairingSaveInFlight = drainPairingConfigSaveQueue()
+      .finally(() => {
+        pairingSaveInFlight = null
+        if (pairingSaveDirty) flushPairingConfigToDisk()
+      })
+  }
+  return pairingSaveInFlight
+}
+
+async function drainPairingConfigSaveQueue() {
+  while (pairingSaveDirty) {
+    pairingSaveDirty = false
+    try {
+      await writeJsonAtomic(getPairingConfigPath(), buildPairingConfigState())
+    } catch (error) {
+      console.error('Failed to save pairing config:', error)
+    }
+  }
+}
+
+function buildPairingConfigState() {
+  return {
+    // 内容策略格式版本：v2 起 allowClipboard 默认 true（见 loadOrCreatePairingKey 迁移）
+    policyVersion: 4,
+    networkId: ensureTrustedNetworkId(),
+    allowLanJoinRequests,
+    localEventToken: protectSecret(ensureLocalEventToken()),
+    // 配对密钥是信任体系的根，与 TOTP 种子同样用 safeStorage（DPAPI）加密落盘；
+    // 旧版明文文件由 unprotectSecret 兼容读取，首次重新落盘即转为密文
+    pairingKey: protectSecret(pairingKey),
+    authorizedPhones: getAuthorizedPhones().map(phone => ({
           id: phone.id,
           name: phone.name,
           deviceType: phone.deviceType,
@@ -1782,7 +2016,7 @@ function flushPairingConfigToDisk() {
           connectionUpdatedAt: phone.connectionUpdatedAt || 0,
           pairingKey: protectSecret(phone.pairingKey)
         })),
-        desktopPeers: getPairedDesktopPeers().map(peer => ({
+    desktopPeers: getPairedDesktopPeers().map(peer => ({
           id: peer.id,
           name: peer.name,
           deviceType: peer.deviceType,

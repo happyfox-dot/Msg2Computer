@@ -303,11 +303,10 @@ function broadcastClipboardToNodes(text, options = {}) {
   // 旧实现查它导致桌面间剪贴板永远不发——死代码）。桌面间是对等互信关系，
   // 改为只受两端总开关控制：本端开了才会走到这里，对端有自己的接收开关把关。
   const targetDesktopPeerIds = new Set(
-    Array.from(activeDesktopPeerConnections.keys()).filter(peerId => {
-      if (exclude.has(peerId)) return false
-      const peer = pairedDesktopPeers.get(peerId)
-      return !!peer && peer.enabled !== false
-    })
+    getPairedDesktopPeers().filter(peer => {
+      if (exclude.has(peer.id)) return false
+      return !!peer && peer.enabled !== false && hasKnownDeliveryPath(peer)
+    }).map(peer => peer.id)
   )
   const targetDeviceIds = [
     ...targetPhones.map(phone => phone.id),
@@ -342,36 +341,18 @@ function broadcastClipboardToNodes(text, options = {}) {
     targetDeviceIds
   }
 
-  // 桌面对端：WS verify_code（payload 用各连接的会话密钥加密）
-  const peerPayloadPlain = JSON.stringify(basePayload)
-  let delivered = 0
-  for (const [peerId, ws] of activeDesktopPeerConnections.entries()) {
-    if (!targetDesktopPeerIds.has(peerId)) continue
-    if (!ws || ws.readyState !== WebSocket.OPEN) continue
-    const sessionKey = ws.__codebridgeSessionKey
-    if (!sessionKey) continue
-    const encrypted = encryptMessage(peerPayloadPlain, sessionKey)
-    if (!encrypted) continue
-    try {
-      ws.send(JSON.stringify({ type: 'verify_code', msgId: originMessageId, payload: encrypted }))
-      delivered += 1
-    } catch (e) {
-      console.error('剪贴板同步到桌面对端失败:', e)
+  // 统一走 ContentBus，底层由路由和策略决定 direct / relay / legacy fallback。
+  getContentBus().publish(busEnvelope.TOPICS.CLIPBOARD_TEXT, basePayload, {
+    targetNodeIds: targetDeviceIds,
+    ttl: basePayload.relayTtl,
+    routePath: relayPath
+  }).then(result => {
+    if (result.delivered > 0) {
+      console.log(`clipboard text synced v${clipTs}: delivered=${result.delivered}/${targetDeviceIds.length}`)
     }
-  }
-
-  // 手机节点：relay HTTP（每台用其 relay 配对密钥加密，独立打时间戳）
-  for (const phone of targetPhones) {
-    sendRelayEnvelopeToPhone(phone, basePayload).then(ok => {
-      if (!ok) console.warn(`剪贴板 relay 到手机失败: ${phone.name}`)
-    }).catch(error => {
-      console.error(`剪贴板 relay 异常 ${phone.name}:`, error.message)
-    })
-  }
-
-  if (delivered > 0 || targetPhones.length > 0) {
-    console.log(`剪贴板已同步 v${clipTs}：桌面对端 ${delivered}，手机 ${targetPhones.length}`)
-  }
+  }).catch(error => {
+    console.error('clipboard text sync failed:', error.message)
+  })
 }
 
 function broadcastClipboardImageToNodes(imageBuffer, sha256, options = {}) {
@@ -447,36 +428,6 @@ function broadcastClipboardImageToNodes(imageBuffer, sha256, options = {}) {
   }).catch(error => {
     console.error('clipboard image sync failed:', error.message)
   })
-  return
-
-  const peerPayloadPlain = JSON.stringify(basePayload)
-  let delivered = 0
-  for (const [peerId, ws] of activeDesktopPeerConnections.entries()) {
-    if (!targetDesktopPeerIds.has(peerId)) continue
-    if (!ws || ws.readyState !== WebSocket.OPEN) continue
-    const sessionKey = ws.__codebridgeSessionKey
-    if (!sessionKey) continue
-    const encrypted = encryptMessage(peerPayloadPlain, sessionKey)
-    if (!encrypted) continue
-    try {
-      ws.send(JSON.stringify({ type: 'verify_code', msgId: originMessageId, payload: encrypted }))
-      delivered += 1
-    } catch (e) {
-      console.error('剪贴板图片同步到桌面对端失败:', e)
-    }
-  }
-
-  for (const phone of targetPhones) {
-    sendRelayEnvelopeToPhone(phone, basePayload).then(ok => {
-      if (!ok) console.warn(`剪贴板图片 relay 到手机失败: ${phone.name}`)
-    }).catch(error => {
-      console.error(`剪贴板图片 relay 异常 ${phone.name}:`, error.message)
-    })
-  }
-
-  if (delivered > 0 || targetPhones.length > 0) {
-    console.log(`剪贴板图片已同步 v${clipTs}：桌面对端 ${delivered}，手机 ${targetPhones.length}`)
-  }
 }
 
 // ===== 剪贴板 LWW 应用 / gossip / 上线补推 =====
@@ -674,9 +625,24 @@ async function sendRelayEnvelopeToPhone(phone, basePayload, options = {}) {
   return false
 }
 
-function buildTotpSeedPushPayload(seed, targetPeer) {
+function normalizeTotpPushTargets(targets) {
+  return (Array.isArray(targets) ? targets : (targets ? [targets] : []))
+    .map(target => {
+      const id = String(target?.id || target?.phoneId || '').trim()
+      if (!id) return null
+      return {
+        id,
+        name: target.name || target.phoneName || id,
+        type: target.deviceType || target.type || 'UNKNOWN_DEVICE'
+      }
+    })
+    .filter(Boolean)
+}
+
+function buildTotpSeedPushData(seed, targets = []) {
   const identity = getDesktopIdentity()
-  return JSON.stringify({
+  const targetDevices = normalizeTotpPushTargets(targets)
+  return {
     type: 'totp_seed',
     id: seed.id,
     label: seed.label,
@@ -691,55 +657,106 @@ function buildTotpSeedPushPayload(seed, targetPeer) {
     sourceDeviceId: identity.id,
     sourceDeviceName: identity.name,
     sourceDeviceType: identity.type,
-    targetDevices: targetPeer ? [{
-      id: targetPeer.id,
-      name: targetPeer.name,
-      type: targetPeer.deviceType
-    }] : [],
+    targetDevices,
+    targetDeviceIds: targetDevices.map(target => target.id),
     pushAuthority: 'local_desktop',
     pushAuthorityDeviceId: identity.id,
+    originDeviceId: identity.id,
+    originDeviceName: identity.name,
+    relayPath: [identity.id],
+    relayTtl: USER_MESSAGE_RELAY_TTL,
+    relayPolicy: 'source_selected_targets',
     updatedAt: seed.updatedAt || Date.now()
+  }
+}
+
+function buildTotpRevokePushData(seed, targets = []) {
+  const identity = getDesktopIdentity()
+  const targetDevices = normalizeTotpPushTargets(targets)
+  return {
+    type: 'totp_revoke',
+    scope: 'seed',
+    id: seed.id,
+    label: seed.label,
+    secret: seed.secret,
+    issuer: seed.issuer,
+    accountName: seed.accountName,
+    algorithm: seed.algorithm,
+    digits: seed.digits,
+    period: seed.period,
+    timestamp: Number(seed.deletedAt || seed.updatedAt || Date.now()) || Date.now(),
+    phoneId: identity.id,
+    phoneName: identity.name,
+    sourceDeviceId: seed.sourceDeviceId || identity.id,
+    sourceDeviceName: seed.sourceDeviceName || identity.name,
+    sourceDeviceType: seed.sourceDeviceType || identity.type,
+    targetDevices,
+    targetDeviceIds: targetDevices.map(target => target.id),
+    pushAuthority: 'local_desktop',
+    pushAuthorityDeviceId: identity.id,
+    originDeviceId: identity.id,
+    originDeviceName: identity.name,
+    relayPath: [identity.id],
+    relayTtl: USER_MESSAGE_RELAY_TTL,
+    relayPolicy: 'source_selected_targets',
+    updatedAt: Number(seed.updatedAt || seed.deletedAt || Date.now()) || Date.now()
+  }
+}
+
+function publishTotpChangeToTargets(seed, action, targets = []) {
+  if (!seed) return Promise.resolve({ delivered: 0, deliveredTargetIds: [] })
+  const targetNodes = (Array.isArray(targets) ? targets : [targets]).filter(Boolean)
+  if (targetNodes.length === 0) return Promise.resolve({ delivered: 0, deliveredTargetIds: [] })
+  const payload = action === 'delete'
+    ? buildTotpRevokePushData(seed, targetNodes)
+    : buildTotpSeedPushData(seed, targetNodes)
+  const topic = action === 'delete'
+    ? busEnvelope.TOPICS.TOTP_REVOKE
+    : busEnvelope.TOPICS.TOTP_SEED
+  return getContentBus().publish(topic, payload, {
+    targetNodeIds: payload.targetDeviceIds,
+    ttl: payload.relayTtl,
+    routePath: payload.relayPath
   })
 }
 
 function sendLocalTotpSeedsToDesktopPeer(ws, sessionKey, peer) {
-  if (!ws || !sessionKey || !peer || ws.readyState !== WebSocket.OPEN) return
+  if (!peer) return
   if (!canPushContentToNode(peer, 'totp')) return
   const cutoff = getTotpSyncCutoff(peer)
   const localSeeds = getLocalTotpSeeds()
     .filter(seed => (Number(seed.updatedAt || seed.createdAt || 0) || 0) > cutoff)
-  let sent = 0
-  for (const seed of localSeeds) {
-    const payload = buildTotpSeedPushPayload(seed, peer)
-    const encrypted = encryptMessage(payload, sessionKey)
-    if (!encrypted) continue
-    ws.send(JSON.stringify({
-      type: 'verify_code',
-      msgId: `desktop-seed-${seed.id}-${Date.now()}`,
-      payload: encrypted
-    }))
-    sent += 1
-  }
-  const tombstoneCount = sendTotpDeleteTombstonesToDesktopPeer(ws, sessionKey, peer, cutoff)
-  if (sent > 0 || tombstoneCount > 0) {
-    markDesktopPeerTotpSeedSynced(peer.id)
-  }
+  const deliveries = localSeeds.map(seed =>
+    publishTotpChangeToTargets(seed, 'add', [peer]).catch(error => {
+      console.error('下发桌面 TOTP 种子失败:', error)
+      return { delivered: 0, deliveredTargetIds: [] }
+    })
+  )
+  deliveries.push(sendTotpDeleteTombstonesToDesktopPeer(ws, sessionKey, peer, cutoff))
+  Promise.all(deliveries).then(results => {
+    if (results.some(result => (result.deliveredTargetIds || []).includes(peer.id))) {
+      markDesktopPeerTotpSeedSynced(peer.id)
+    }
+  }).catch(error => {
+    console.error('桌面对端 TOTP 补推失败:', error)
+  })
 }
 
 function sendTotpDeleteTombstonesToDesktopPeer(ws, sessionKey, peer, cutoff = 0) {
-  if (!ws || !sessionKey || !peer || ws.readyState !== WebSocket.OPEN) return 0
+  if (!peer) return Promise.resolve({ delivered: 0, deliveredTargetIds: [] })
   pruneTotpDeleteTombstones()
   const pendingTombstones = totpDeleteTombstones
     .filter(tombstone => (Number(tombstone.deletedAt || tombstone.updatedAt || 0) || 0) > cutoff)
-  let sent = 0
-  for (const tombstone of pendingTombstones) {
-    const payload = buildTotpSyncPayload(tombstone, 'delete')
-    const encrypted = encryptMessage(payload, sessionKey)
-    if (!encrypted) continue
-    ws.send(JSON.stringify({ type: 'totp_sync', payload: encrypted }))
-    sent += 1
-  }
-  return sent
+  if (pendingTombstones.length === 0) return Promise.resolve({ delivered: 0, deliveredTargetIds: [] })
+  return Promise.all(pendingTombstones.map(tombstone =>
+    publishTotpChangeToTargets(tombstone, 'delete', [peer]).catch(error => {
+      console.error('下发桌面 TOTP 删除状态失败:', error)
+      return { delivered: 0, deliveredTargetIds: [] }
+    })
+  )).then(results => ({
+    delivered: results.reduce((sum, result) => sum + Number(result.delivered || 0), 0),
+    deliveredTargetIds: Array.from(new Set(results.flatMap(result => result.deliveredTargetIds || [])))
+  }))
 }
 
 function handleDesktopPeerTotpSync(peer, encryptedPayload, sessionKey) {

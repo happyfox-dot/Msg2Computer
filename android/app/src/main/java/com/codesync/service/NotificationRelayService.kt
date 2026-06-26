@@ -16,22 +16,28 @@ class NotificationRelayService : NotificationListenerService() {
     companion object {
         private const val TAG = "NotificationRelayService"
         private const val RECENT_WINDOW_MS = 5_000L
+        private const val ONGOING_SAME_CONTENT_WINDOW_MS = 60_000L
         private const val MAX_BODY_LENGTH = 2_000
     }
 
-    private val recentNotifications = LinkedHashMap<String, Long>()
+    private data class RecentNotification(
+        val signature: String,
+        val seenAt: Long
+    )
+
+    private val recentNotifications = LinkedHashMap<String, RecentNotification>()
     private var lastSkipStatus = ""
     private var lastSkipStatusAt = 0L
 
     override fun onListenerConnected() {
         super.onListenerConnected()
-        Log.i(TAG, "通知监听服务已连接")
-        WebSocketService.reportExternalStatus(this, "通知监听服务已连接")
+        Log.i(TAG, "Notification listener connected")
+        WebSocketService.reportExternalStatus(this, "App 通知监听已连接")
     }
 
     override fun onListenerDisconnected() {
         super.onListenerDisconnected()
-        Log.w(TAG, "通知监听服务已断开，尝试重新绑定")
+        Log.w(TAG, "Notification listener disconnected, requesting rebind")
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             runCatching {
                 NotificationListenerService.requestRebind(
@@ -44,16 +50,23 @@ class NotificationRelayService : NotificationListenerService() {
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
         sbn ?: return
         if (!SettingsStore.isSendNotificationsEnabled(this)) {
-            Log.d(TAG, "通知推送总开关关闭，跳过 package=${sbn.packageName}")
+            Log.d(TAG, "notification relay disabled, package=${sbn.packageName}")
             reportSkipStatus("App 通知推送开关未开启")
             return
         }
         if (sbn.packageName == packageName) return
-        if (sbn.isOngoing) return
+
+        val isOngoing = sbn.isOngoing
+        val appPolicy = SettingsStore.getNotificationAppPolicy(this, sbn.packageName)
+        if (!SettingsStore.isNotificationPackageAllowed(this, sbn.packageName, isOngoing)) {
+            Log.d(TAG, "notification skipped by app policy package=${sbn.packageName}, ongoing=$isOngoing")
+            return
+        }
+
         val targets = RouteManager.targetsForType(this, "app_notification").map { it.device }
         if (targets.isEmpty()) {
-            Log.d(TAG, "收到通知但没有允许 App 通知的目标，package=${sbn.packageName}")
-            WebSocketService.reportExternalStatus(this, "收到通知，但没有启用“应用通知”的推送目标")
+            Log.d(TAG, "notification received but no app_notification targets, package=${sbn.packageName}")
+            WebSocketService.reportExternalStatus(this, "收到 App 通知，但没有启用 App 通知的推送目标")
             return
         }
 
@@ -65,20 +78,29 @@ class NotificationRelayService : NotificationListenerService() {
         )
         val text = extractNotificationBody(notification)
         if (title.isBlank() && text.isBlank()) {
-            Log.d(TAG, "通知标题和正文为空，跳过 package=${sbn.packageName}")
-            reportSkipStatus("收到通知，但标题和正文为空")
+            Log.d(TAG, "notification has no title/body, package=${sbn.packageName}")
+            reportSkipStatus("收到 App 通知，但标题和正文为空")
             return
         }
 
         val appName = resolveAppName(sbn.packageName)
         val body = text.ifBlank { title }.take(MAX_BODY_LENGTH)
-        val dedupeKey = "${sbn.packageName}|${title}|${body}"
-        if (isRecentDuplicate(dedupeKey)) {
-            Log.d(TAG, "通知短时间重复，跳过 package=${sbn.packageName}")
+        val notificationKey = notificationKey(sbn)
+        val signature = notificationSignature(notification, title, body)
+        val dedupeKey = if (isOngoing) notificationKey else "${sbn.packageName}|$title|$body"
+        if (
+            isRecentDuplicate(
+                key = dedupeKey,
+                signature = signature,
+                throttleWindowMs = if (isOngoing) appPolicy.minIntervalMs else 0L,
+                duplicateWindowMs = if (isOngoing) ONGOING_SAME_CONTENT_WINDOW_MS else RECENT_WINDOW_MS
+            )
+        ) {
+            Log.d(TAG, "notification skipped by dedupe/throttle package=${sbn.packageName}, ongoing=$isOngoing")
             return
         }
 
-        Log.d(TAG, "收到通知，准备推送 package=${sbn.packageName}, targets=${targets.size}")
+        Log.d(TAG, "notification forwarding package=${sbn.packageName}, ongoing=$isOngoing, targets=${targets.size}")
 
         val intent = Intent(this, WebSocketService::class.java).apply {
             action = WebSocketService.ACTION_SEND_NOTIFICATION
@@ -86,6 +108,9 @@ class NotificationRelayService : NotificationListenerService() {
             putExtra(WebSocketService.EXTRA_MESSAGE_BODY, body)
             putExtra(WebSocketService.EXTRA_APP_NAME, appName)
             putExtra(WebSocketService.EXTRA_PACKAGE_NAME, sbn.packageName)
+            putExtra(WebSocketService.EXTRA_NOTIFICATION_KEY, notificationKey)
+            putExtra(WebSocketService.EXTRA_NOTIFICATION_ONGOING, isOngoing)
+            putExtra(WebSocketService.EXTRA_NOTIFICATION_POST_TIME, sbn.postTime)
         }
         runCatching {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -94,11 +119,48 @@ class NotificationRelayService : NotificationListenerService() {
                 startService(intent)
             }
         }.onFailure {
-            Log.e(TAG, "启动通知同步服务失败", it)
+            Log.e(TAG, "failed to start notification relay service", it)
             WebSocketService.reportExternalStatus(
                 this,
-                "收到通知，但启动同步服务失败：${it.message ?: it.javaClass.simpleName}"
+                "收到 App 通知，但启动同步服务失败：${it.message ?: it.javaClass.simpleName}"
             )
+        }
+    }
+
+    override fun onNotificationRemoved(sbn: StatusBarNotification?) {
+        sbn ?: return
+        if (!SettingsStore.isSendNotificationsEnabled(this)) return
+        if (sbn.packageName == packageName) return
+        if (!sbn.isOngoing) return
+        if (!SettingsStore.isNotificationPackageAllowed(this, sbn.packageName, ongoing = true)) return
+
+        val notification = sbn.notification
+        val title = notification?.let {
+            firstNonBlank(
+                extractText(it, Notification.EXTRA_TITLE),
+                extractText(it, Notification.EXTRA_TITLE_BIG),
+                extractText(it, Notification.EXTRA_SUB_TEXT)
+            )
+        }.orEmpty()
+        val notificationKey = notificationKey(sbn)
+        val appName = resolveAppName(sbn.packageName)
+        val intent = Intent(this, WebSocketService::class.java).apply {
+            action = WebSocketService.ACTION_SEND_NOTIFICATION_REMOVED
+            putExtra(WebSocketService.EXTRA_TITLE, title)
+            putExtra(WebSocketService.EXTRA_APP_NAME, appName)
+            putExtra(WebSocketService.EXTRA_PACKAGE_NAME, sbn.packageName)
+            putExtra(WebSocketService.EXTRA_NOTIFICATION_KEY, notificationKey)
+            putExtra(WebSocketService.EXTRA_NOTIFICATION_ONGOING, true)
+            putExtra(WebSocketService.EXTRA_NOTIFICATION_POST_TIME, sbn.postTime)
+        }
+        runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(intent)
+            } else {
+                startService(intent)
+            }
+        }.onFailure {
+            Log.e(TAG, "failed to start notification removal relay service", it)
         }
     }
 
@@ -161,6 +223,20 @@ class NotificationRelayService : NotificationListenerService() {
     private fun firstNonBlank(vararg values: String): String =
         values.firstOrNull { it.isNotBlank() }.orEmpty()
 
+    private fun notificationKey(sbn: StatusBarNotification): String =
+        runCatching { sbn.key }
+            .getOrDefault("${sbn.packageName}:${sbn.id}:${sbn.tag.orEmpty()}")
+
+    private fun notificationSignature(notification: Notification, title: String, body: String): String {
+        val progress = notification.extras.getInt(Notification.EXTRA_PROGRESS, -1)
+        val progressMax = notification.extras.getInt(Notification.EXTRA_PROGRESS_MAX, -1)
+        val progressIndeterminate = notification.extras.getBoolean(
+            Notification.EXTRA_PROGRESS_INDETERMINATE,
+            false
+        )
+        return listOf(title, body, progress, progressMax, progressIndeterminate).joinToString("|")
+    }
+
     private fun reportSkipStatus(message: String) {
         val now = System.currentTimeMillis()
         if (message == lastSkipStatus && now - lastSkipStatusAt < 30_000L) return
@@ -169,15 +245,31 @@ class NotificationRelayService : NotificationListenerService() {
         WebSocketService.reportExternalStatus(this, message)
     }
 
-    private fun isRecentDuplicate(key: String): Boolean {
+    private fun isRecentDuplicate(
+        key: String,
+        signature: String,
+        throttleWindowMs: Long,
+        duplicateWindowMs: Long
+    ): Boolean {
         val now = System.currentTimeMillis()
+        val retainWindowMs = maxOf(
+            ONGOING_SAME_CONTENT_WINDOW_MS,
+            duplicateWindowMs,
+            throttleWindowMs
+        )
         val iterator = recentNotifications.entries.iterator()
         while (iterator.hasNext()) {
-            if (now - iterator.next().value > RECENT_WINDOW_MS) iterator.remove()
+            if (now - iterator.next().value.seenAt > retainWindowMs) {
+                iterator.remove()
+            }
         }
         val lastSeen = recentNotifications[key]
-        if (lastSeen != null && now - lastSeen <= RECENT_WINDOW_MS) return true
-        recentNotifications[key] = now
+        if (lastSeen != null) {
+            val age = now - lastSeen.seenAt
+            if (lastSeen.signature == signature && age <= duplicateWindowMs) return true
+            if (throttleWindowMs > 0L && age <= throttleWindowMs) return true
+        }
+        recentNotifications[key] = RecentNotification(signature, now)
         while (recentNotifications.size > 80) {
             val first = recentNotifications.entries.firstOrNull() ?: break
             recentNotifications.remove(first.key)

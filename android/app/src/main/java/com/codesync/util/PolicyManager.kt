@@ -64,6 +64,7 @@ object PolicyManager {
     fun normalizeType(type: String): String =
         when (type.trim()) {
             "verify_code" -> "sms"
+            "app_notification_removed" -> "app_notification"
             else -> type.trim()
         }
 

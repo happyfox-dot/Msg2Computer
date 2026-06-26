@@ -7,7 +7,6 @@
         totpSeeds: getStoredTotpSeeds(),
         totpDeleteTombstones: getStoredTotpDeleteTombstones(),
         topologyLsdb: exportTopologyLsdb(),
-        topologyDeltaBacklog: exportTopologyDeltaBacklog(),
         messageSettings: normalizeMessageSettings(desktopMessageSettings),
         fileTransferDownloadDir: fileTransferDownloadDir || '',
         // 剪贴板 LWW 版本（仅哈希不含明文）：跨重启保持，避免补推用旧值盖新值
@@ -15,12 +14,6 @@
         clipboardImageSyncState: { ...clipboardImageSyncState },
         clipboardGlobalSyncState: { ...clipboardGlobalSyncState },
         updatedAt: Date.now()
-      }, null, 2),
-      'utf8'
-    )
-    fs.renameSync(tmpPath, configPath)
-  } catch (e) {
-    console.error('Failed to save pairing config:', e)
   }
 }
 

@@ -63,6 +63,7 @@ import com.codesync.util.PhoneIdentityStore
 import com.codesync.util.RouteManager
 import com.codesync.util.SettingsStore
 import com.codesync.util.TopologyStore
+import com.codesync.util.TopologyViewModel
 import com.codesync.util.TotpEntry
 import com.codesync.util.TotpStore
 import com.codesync.util.TotpUtil
@@ -89,10 +90,6 @@ import java.io.File
 import java.io.FileOutputStream
 
 class MainActivity : AppCompatActivity() {
-    private companion object {
-        const val TOPOLOGY_RECENT_REACHABLE_MS = 2 * 60 * 1000L
-    }
-
     internal lateinit var binding: ActivityMainBinding
     internal var totpUpdateJob: Job? = null
     private var notificationRebindJob: Job? = null
@@ -111,6 +108,8 @@ class MainActivity : AppCompatActivity() {
     private var pendingUpdatePageUrl: String = ""
     // 等待「安装未知应用」授权后继续下载的更新信息（去设置页授权 → onResume 续流程）
     private var pendingUpdateInfo: ApkUpdater.UpdateInfo? = null
+    private var topologyDirty = true
+    private var topologyModel: TopologyViewModel.Model? = null
 
 
 
@@ -412,10 +411,13 @@ class MainActivity : AppCompatActivity() {
             showTestPushDialog()
         }
 
-        binding.btnRefreshTopology.setOnClickListener {
+        binding.topologyContent.btnRefreshTopology.setOnClickListener {
             refreshDeviceList()
-            rebuildTopologyList()
+            rebuildTopologyList(force = true)
             refreshConnectionSnapshot()
+        }
+        binding.topologyContent.topologyGraph.setOnNodeClickListener { nodeId ->
+            showTopologyNodeDetail(nodeId)
         }
 
         binding.btnAddTotp.setOnClickListener {
@@ -514,7 +516,7 @@ class MainActivity : AppCompatActivity() {
         when (page) {
             MainPage.CLIPBOARD -> renderClipboardHistory()
             MainPage.DEVICES -> refreshDeviceList()
-            MainPage.TOPOLOGY -> rebuildTopologyList()
+            MainPage.TOPOLOGY -> if (topologyDirty || topologyModel == null) rebuildTopologyList(force = true)
             MainPage.TOTP -> rebuildTotpList()
             else -> Unit
         }
@@ -724,6 +726,9 @@ class MainActivity : AppCompatActivity() {
             refreshNotificationAccessStatus()
             Toast.makeText(this, R.string.notification_access_enable_prompt, Toast.LENGTH_LONG).show()
             startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+        }
+        binding.btnNotificationAppPolicy.setOnClickListener {
+            showNotificationAppPolicySheet()
         }
         // 受 Android 10+ 后台读剪贴板限制，手机→其它节点只能在前台主动触发：
         // 点击按钮时（App 处于前台，读剪贴板合法）读取当前剪贴板并投递。
@@ -1257,136 +1262,49 @@ class MainActivity : AppCompatActivity() {
                     .thenBy { it.device.name.lowercase(Locale.ROOT) }
             )
     }
-    internal fun rebuildTopologyList() {
-        val container = binding.topologyList
+    internal fun rebuildTopologyList(force: Boolean = false) {
+        if (currentMainPage != MainPage.TOPOLOGY && !force) {
+            topologyDirty = true
+            return
+        }
+        topologyDirty = false
+        val container = binding.topologyContent.topologyList
         container.removeAllViews()
 
         val phone = PhoneIdentityStore.get(this)
-        val devices = DeviceStore.getDevices(this)
         val remoteTotps = loadTotpEntries().filter { !it.isLocal && it.sourceDeviceId.isNotBlank() }
-        val pairedIds = devices.map { it.id }.toSet()
-        val discoveredPeers = discoveredLanNodes
-            .filter { it.id != phone.id && it.id !in pairedIds }
-            .distinctBy { it.id }
-
-        val graphNodes = mutableListOf(
-            TopologyGraphView.Node(
-                id = phone.id,
-                name = phone.name,
-                type = "ANDROID_PHONE",
-                status = "online",
-                local = true
-            )
+        val model = TopologyViewModel.build(
+            context = this,
+            discoveredLanNodes = discoveredLanNodes,
+            remoteTotps = remoteTotps,
+            connectedDeviceIds = WebSocketService.connectedDeviceIds
         )
-        val graphEdges = mutableListOf<TopologyGraphView.Edge>()
+        topologyModel = model
 
-        container.addView(
-            createTopologyRow(
-                title = "${deviceIcon("ANDROID_PHONE")} ${phone.name}",
-                meta = "${getString(R.string.topology_local_phone)} · 对等节点 · 来源设备",
-                detail = listOf(
-                    "设备：${phone.name}",
-                    "类型：ANDROID_PHONE",
-                    "角色：验证码来源设备",
-                    "推送目标：${devices.count { it.enabled }} / ${devices.size} 个节点",
-                    "局域网发现：${discoveredPeers.size} 个临近节点"
-                )
-            )
-        )
-
-        devices.forEach { device ->
-            // 路由信息（由桌面节点 SPF 计算后下发）：直连显示地址，多跳显示下一跳
-            val viaOtherNode = device.routeNextHopId.isNotBlank() && device.routeNextHopId != device.id
-            val deviceStatus = getTopologyDeviceStatus(device)
-            val deviceStateLabel = getTopologyDeviceStateLabel(device)
-            val tsTag = if (
-                LanDiscovery.isTailscaleAddress(device.host) ||
-                device.altHosts.any { LanDiscovery.isTailscaleAddress(it) }
-            ) " · TS" else ""
-            graphNodes.add(
+        binding.topologyContent.topologyGraph.setGraph(
+            model.nodes.map {
                 TopologyGraphView.Node(
-                    id = device.id,
-                    name = device.name,
-                    type = device.type,
-                    status = deviceStatus,
-                    meta = when {
-                        viaOtherNode -> "经 ${device.routeNextHopName.ifBlank { "中继节点" }}$tsTag · $deviceStateLabel"
-                        else -> device.host + tsTag + " · " + deviceStateLabel
-                    }
+                    id = it.id,
+                    name = it.name,
+                    type = it.type,
+                    status = it.status,
+                    local = it.local,
+                    meta = it.meta
                 )
-            )
-            graphEdges.add(
+            },
+            model.edges.map {
                 TopologyGraphView.Edge(
-                    from = phone.id,
-                    to = device.id,
-                    label = when {
-                        viaOtherNode -> "经 ${device.routeNextHopName.ifBlank { "中继" }}"
-                        device.routeMetric > 0 -> "SPF 路由"
-                        else -> "推送"
-                    },
-                    active = deviceStatus == "online",
-                    kind = when {
-                        deviceStatus == "reachable" -> "route"
-                        viaOtherNode -> "relay"
-                        else -> "push"
-                    },
-                    metric = device.routeMetric
+                    from = it.from,
+                    to = it.to,
+                    label = it.label,
+                    active = it.active,
+                    kind = it.kind,
+                    metric = it.metric
                 )
-            )
-        }
-
-        remoteTotps
-            .groupBy { it.sourceDeviceId }
-            .forEach { (sourceId, entries) ->
-                val first = entries.first()
-                val nodeId = sourceId.ifBlank { first.sourceDeviceName }
-                if (nodeId.isNotBlank() && graphNodes.none { it.id == nodeId }) {
-                    graphNodes.add(
-                        TopologyGraphView.Node(
-                            id = nodeId,
-                            name = first.sourceDeviceName.ifBlank { "远端节点" },
-                            type = first.sourceDeviceType,
-                            status = "synced"
-                        )
-                    )
-                }
-                if (nodeId.isNotBlank()) {
-                    graphEdges.add(
-                        TopologyGraphView.Edge(
-                            from = nodeId,
-                            to = phone.id,
-                            label = "TOTP 同步",
-                            active = false,
-                            kind = "totp"
-                        )
-                    )
-                }
             }
+        )
 
-        discoveredPeers.forEach { peer ->
-            graphNodes.add(
-                TopologyGraphView.Node(
-                    id = peer.id,
-                    name = peer.name,
-                    type = peer.type,
-                    status = "discovered",
-                    meta = "${peer.host} · 待配对"
-                )
-            )
-            graphEdges.add(
-                TopologyGraphView.Edge(
-                    from = phone.id,
-                    to = peer.id,
-                    label = "发现",
-                    active = false,
-                    kind = "discovery"
-                )
-            )
-        }
-
-        binding.topologyGraph.setGraph(graphNodes, graphEdges)
-
-        if (devices.isEmpty() && remoteTotps.isEmpty() && discoveredPeers.isEmpty()) {
+        if (model.nodes.size <= 1 && model.edges.isEmpty()) {
             container.addView(
                 TextView(this).apply {
                     text = getString(R.string.topology_empty)
@@ -1399,87 +1317,84 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        devices.forEach { device ->
-            val state = if (device.enabled) getString(R.string.push_enabled) else getString(R.string.push_disabled)
-            val connectionState = getTopologyDeviceStateLabel(device)
-            val lastSync = formatRelativeSyncTime(device.lastSyncAt)
-            val routeLine = when {
-                device.routeNextHopId.isNotBlank() && device.routeNextHopId != device.id ->
-                    "路由：经 ${device.routeNextHopName.ifBlank { device.routeNextHopId }} 中继" +
-                        (if (device.routeMetric > 0) "（metric ${device.routeMetric}）" else "")
-                device.routeMetric > 0 -> "路由：SPF 直连（metric ${device.routeMetric}）"
-                else -> "路由：直连"
-            }
-            val tailscaleHosts = (listOf(device.host) + device.altHosts)
-                .filter { LanDiscovery.isTailscaleAddress(it) }
+        val onlineCount = model.nodes.count { it.status == "online" }
+        val reachableCount = model.nodes.count { it.status == "reachable" }
+        val knownCount = model.nodes.count { it.status == "known" }
+        val discoveredCount = model.nodes.count { it.status == "discovered" }
+        container.addView(
+            createTopologyRow(
+                title = "${deviceIcon("ANDROID_PHONE")} ${phone.name}",
+                meta = "可信网络 · ${model.nodes.size} 个节点 · ${model.edges.size} 条链路",
+                detail = listOf(
+                    "networkId：${LanTrustStore.getNetworkId(this).ifBlank { "未建立" }}",
+                    "在线直连：$onlineCount",
+                    "近期可达：$reachableCount",
+                    "已知离线：$knownCount",
+                    "仅发现未授权：$discoveredCount",
+                    "说明：图中实线偏向在线/活跃链路，虚线表示近期可达、历史或发现链路"
+                )
+            )
+        )
+
+        model.nodes.filter { !it.local }.forEach { node ->
             container.addView(
                 createTopologyRow(
-                    title = "${deviceIcon("ANDROID_PHONE")} ${phone.name}  --  ${deviceIcon(device.type)} ${device.name}",
-                    meta = "${getString(R.string.topology_push_edge)} · $state · $connectionState · ${getString(R.string.status_last_sync, lastSync)}",
-                    detail = buildList {
-                        add("来源：${phone.name}")
-                        add("目标：${device.name}")
-                        add("地址：${device.host}:${device.port}")
-                        if (device.altHosts.isNotEmpty()) {
-                            add("备用地址：${device.altHosts.joinToString("、")}")
+                    title = "${deviceIcon(node.type)} ${node.name}",
+                    meta = "${TopologyViewModel.statusLabel(node.status)} · ${node.meta}",
+                    detail = node.detailLines
+                )
+            )
+        }
+
+        if (model.edges.isNotEmpty()) {
+            container.addView(
+                createTopologyRow(
+                    title = "链路状态",
+                    meta = "${model.edges.count { it.active }} 条在线 / ${model.edges.count { it.routable }} 条可路由",
+                    detail = model.edges.take(24).map { edge ->
+                        val from = model.nodeMap[edge.from]?.name ?: edge.from
+                        val to = model.nodeMap[edge.to]?.name ?: edge.to
+                        val state = when {
+                            edge.active -> "在线"
+                            edge.routable -> "可路由"
+                            edge.kind == "discovery" -> "仅发现"
+                            else -> "历史/离线"
                         }
-                        if (tailscaleHosts.isNotEmpty()) {
-                            add("Tailscale：${tailscaleHosts.joinToString("、")}（跨网段可达）")
-                        }
-                        add(routeLine)
-                        if (device.routePath.size > 2) {
-                            add("路径：${device.routePath.joinToString(" → ")}")
-                        }
-                        add("状态：$state")
-                        add("连接：$connectionState")
-                        add("推送内容：${deviceContentPolicySummary(device)}")
-                        add("上次同步：${formatFullSyncTime(device.lastSyncAt)}")
-                        add("权限：来源手机控制推送范围")
+                        "$from -- $to：${edge.label} · $state${if (edge.metric > 0) " · m=${edge.metric}" else ""}"
                     }
                 )
             )
         }
+    }
 
-        remoteTotps
-            .groupBy { it.sourceDeviceId }
-            .forEach { (_, entries) ->
-                val first = entries.first()
-                val sourceName = first.sourceDeviceName.ifBlank { "远端节点" }
-                container.addView(
-                    createTopologyRow(
-                        title = "${deviceIcon(first.sourceDeviceType)} $sourceName  --  ${deviceIcon("ANDROID_PHONE")} ${phone.name}",
-                        meta = "远端 TOTP 种子同步 · ${entries.size} 个验证码",
-                        detail = listOf(
-                            "来源：$sourceName",
-                            "目标：${phone.name}",
-                            "类型：${first.sourceDeviceType}",
-                            "同步内容：${entries.size} 个 TOTP 种子",
-                            "权限：远端来源只读，本机不再二次分发"
-                        )
-                    )
-                )
+    private fun showTopologyNodeDetail(nodeId: String) {
+        val model = topologyModel ?: return
+        val node = model.nodeMap[nodeId] ?: return
+        val relatedEdges = model.edges
+            .filter { it.from == nodeId || it.to == nodeId }
+            .take(12)
+            .map { edge ->
+                val from = model.nodeMap[edge.from]?.name ?: edge.from
+                val to = model.nodeMap[edge.to]?.name ?: edge.to
+                val state = when {
+                    edge.active -> "在线"
+                    edge.routable -> "可路由"
+                    edge.kind == "discovery" -> "仅发现"
+                    else -> "历史/离线"
+                }
+                "$from -- $to：${edge.label} · $state${if (edge.metric > 0) " · m=${edge.metric}" else ""}"
             }
-
-        discoveredPeers.forEach { peer ->
-            val pairHint = if (peer.type.contains("DESKTOP") && peer.pairingKey.isNotBlank()) {
-                "可配对"
-            } else {
-                "仅发现，暂未建立直连同步"
-            }
-            container.addView(
-                createTopologyRow(
-                    title = "${deviceIcon("ANDROID_PHONE")} ${phone.name}  ⇢  ${deviceIcon(peer.type)} ${peer.name}",
-                    meta = "局域网对等节点 · $pairHint · ${peer.host}:${peer.port}",
-                    detail = listOf(
-                        "节点：${peer.name}",
-                        "类型：${peer.type}",
-                        "地址：${peer.host}:${peer.port}",
-                        "状态：局域网已发现",
-                        "说明：手机节点会进入拓扑，但当前同步连接仍需受配对协议控制"
-                    )
-                )
-            )
+        val (dialog, content) = createBottomSheet(getString(R.string.topology_device_detail))
+        content.addView(TextView(this).apply {
+            text = (node.detailLines + listOf("关联链路：") + relatedEdges.ifEmpty { listOf("暂无关联链路") }).joinToString("\n")
+            setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_secondary))
+            textSize = 13f
+            setPadding(0, 12.dp(), 0, 4.dp())
+        })
+        addSheetButton(content, getString(android.R.string.ok), outlined = true) {
+            dialog.dismiss()
         }
+        dialog.show()
     }
 
     internal fun deviceIcon(type: String): String {
@@ -1591,7 +1506,11 @@ class MainActivity : AppCompatActivity() {
             )
             binding.tvConnectionStatus.setTextColor(color)
             binding.statusDot.backgroundTintList = ColorStateList.valueOf(color)
-            rebuildTopologyList()
+            if (currentMainPage == MainPage.TOPOLOGY) {
+                rebuildTopologyList(force = true)
+            } else {
+                topologyDirty = true
+            }
 
             val detailText = detail?.takeIf { it.isNotBlank() }
             binding.tvConnectionDetail.text = detailText.orEmpty()

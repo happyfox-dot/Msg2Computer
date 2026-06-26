@@ -9,14 +9,16 @@ import android.graphics.Path
 import android.graphics.PathMeasure
 import android.graphics.RectF
 import android.util.AttributeSet
+import android.view.MotionEvent
+import android.view.ViewConfiguration
 import android.view.View
 import kotlin.math.max
 import kotlin.math.min
 
 /**
- * 设备拓扑图。本机节点在左侧居中，远端节点按状态排序后排在右列；
- * 边按类别配色（推送/中继/TOTP/发现），可携带 metric 与文字标签，
- * 非活跃边画虚线。布局与绘制都很轻量，节点数 < 20 时无性能压力。
+ * 设备拓扑图。按本机到其它节点的链路距离分层展示，边按类别配色
+ * （推送/中继/TOTP/发现），可携带 metric 与文字标签。点击节点由
+ * Activity 展示完整详情。
  */
 class TopologyGraphView @JvmOverloads constructor(
     context: Context,
@@ -62,6 +64,10 @@ class TopologyGraphView @JvmOverloads constructor(
     private val edges = mutableListOf<Edge>()
     private val nodeRects = mutableMapOf<String, RectF>()
     private val dashEffect = DashPathEffect(floatArrayOf(dp(6f), dp(5f)), 0f)
+    private var onNodeClick: ((String) -> Unit)? = null
+    private var downX = 0f
+    private var downY = 0f
+    private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
 
     private val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
@@ -91,6 +97,11 @@ class TopologyGraphView @JvmOverloads constructor(
         color = COLOR_LABEL_BG
     }
     private val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+
+    fun setOnNodeClickListener(listener: ((String) -> Unit)?) {
+        onNodeClick = listener
+    }
+
     fun setGraph(newNodes: List<Node>, newEdges: List<Edge>) {
         nodes.clear()
         nodes.addAll(newNodes.distinctBy { it.id })
@@ -118,8 +129,9 @@ class TopologyGraphView @JvmOverloads constructor(
 
     override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
         val width = MeasureSpec.getSize(widthMeasureSpec)
-        val remoteCount = max(1, nodes.count { !it.local })
-        val desiredHeight = dp((140 + remoteCount * 66).coerceAtMost(520).toFloat()).toInt()
+        val layers = buildLayers()
+        val maxLayerSize = layers.values.maxOfOrNull { it.size } ?: max(1, nodes.size)
+        val desiredHeight = dp((72 + maxLayerSize * 76).coerceIn(180, 720).toFloat()).toInt()
         setMeasuredDimension(width, resolveSize(desiredHeight, heightMeasureSpec))
     }
 
@@ -139,35 +151,75 @@ class TopologyGraphView @JvmOverloads constructor(
 
     private fun layoutNodes() {
         nodeRects.clear()
-        val nodeWidth = min(dp(140f), width * 0.42f)
-        val nodeHeight = dp(54f)
-        val local = nodes.firstOrNull { it.local } ?: nodes.first()
-        val localX = dp(12f)
-        val localY = height / 2f - nodeHeight / 2f
-        nodeRects[local.id] = RectF(localX, localY, localX + nodeWidth, localY + nodeHeight)
-
-        // 在线节点排最前，近期可达其次，已知/历史节点再往后，离线和仅发现的排在下面
-        val remotes = nodes.filter { it.id != local.id }
-            .sortedWith(
-                compareByDescending<Node> { it.status == "online" }
-                    .thenByDescending { it.status == "reachable" }
-                    .thenByDescending { it.status == "known" }
-                    .thenBy { it.status == "discovered" }
-                    .thenBy { it.name.lowercase() }
-            )
-        if (remotes.isEmpty()) return
-
-        val rightX = width - nodeWidth - dp(12f)
+        val layers = buildLayers()
+        if (layers.isEmpty()) return
+        val layerKeys = layers.keys.sorted()
+        val layerCount = layerKeys.size
+        val horizontalPad = dp(12f)
+        val columnGap = dp(10f)
+        val nodeHeight = dp(58f)
+        val availableWidth = (width - horizontalPad * 2 - columnGap * max(0, layerCount - 1)).coerceAtLeast(dp(120f))
+        val nodeWidth = min(dp(150f), availableWidth / max(1, layerCount))
         val topPad = dp(8f)
-        val gap = if (remotes.size == 1) 0f else (height - nodeHeight - topPad * 2) / (remotes.size - 1)
-        remotes.forEachIndexed { index, node ->
-            val y = if (remotes.size == 1) {
-                height / 2f - nodeHeight / 2f
+        val rowGap = dp(12f)
+
+        layerKeys.forEachIndexed { layerIndex, layer ->
+            val columnNodes = layers[layer].orEmpty()
+            val x = if (layerCount == 1) {
+                width / 2f - nodeWidth / 2f
             } else {
-                topPad + index * gap
+                horizontalPad + layerIndex * (nodeWidth + columnGap)
             }
-            nodeRects[node.id] = RectF(rightX, y, rightX + nodeWidth, y + nodeHeight)
+            val contentHeight = columnNodes.size * nodeHeight + max(0, columnNodes.size - 1) * rowGap
+            val startY = max(topPad, height / 2f - contentHeight / 2f)
+            columnNodes.forEachIndexed { rowIndex, node ->
+                val y = startY + rowIndex * (nodeHeight + rowGap)
+                nodeRects[node.id] = RectF(x, y, x + nodeWidth, y + nodeHeight)
+            }
         }
+    }
+
+    private fun buildLayers(): Map<Int, List<Node>> {
+        if (nodes.isEmpty()) return emptyMap()
+        val local = nodes.firstOrNull { it.local } ?: nodes.first()
+        val byId = nodes.associateBy { it.id }
+        val adjacency = linkedMapOf<String, MutableSet<String>>()
+        nodes.forEach { adjacency[it.id] = linkedSetOf() }
+        edges
+            .filter { it.kind != "discovery" }
+            .forEach { edge ->
+                if (byId.containsKey(edge.from) && byId.containsKey(edge.to)) {
+                    adjacency[edge.from]?.add(edge.to)
+                    adjacency[edge.to]?.add(edge.from)
+                }
+            }
+
+        val distance = linkedMapOf(local.id to 0)
+        val queue = ArrayDeque<String>()
+        queue.add(local.id)
+        while (queue.isNotEmpty()) {
+            val current = queue.removeFirst()
+            val nextDistance = (distance[current] ?: 0) + 1
+            adjacency[current].orEmpty().forEach { next ->
+                if (!distance.containsKey(next)) {
+                    distance[next] = nextDistance
+                    queue.add(next)
+                }
+            }
+        }
+
+        val fallbackLayer = (distance.values.maxOrNull() ?: 0) + 1
+        return nodes
+            .groupBy { node ->
+                when {
+                    node.local -> 0
+                    node.status == "discovered" -> fallbackLayer
+                    else -> distance[node.id] ?: fallbackLayer
+                }
+            }
+            .mapValues { (_, layerNodes) ->
+                layerNodes.sortedWith(compareBy<Node> { statusRank(it.status) }.thenBy { it.name.lowercase() })
+            }
     }
 
     private fun edgeColor(edge: Edge): Int = when {
@@ -243,14 +295,24 @@ class TopologyGraphView @JvmOverloads constructor(
     }
 
     private fun statusText(status: String): String = when (status) {
-        "online" -> "在线"
+        "online" -> "在线直连"
         "reachable" -> "近期可达"
-        "known" -> "已知"
+        "known" -> "已知离线"
         "enabled" -> "已启用"
         "disabled" -> "已禁用"
         "synced" -> "已同步"
-        "discovered" -> "已发现"
+        "discovered" -> "仅发现"
         else -> "离线"
+    }
+
+    private fun statusRank(status: String): Int = when (status) {
+        "online" -> 0
+        "reachable" -> 1
+        "known" -> 2
+        "synced" -> 3
+        "discovered" -> 4
+        "disabled" -> 5
+        else -> 6
     }
 
     private fun drawNodes(canvas: Canvas) {
@@ -263,8 +325,8 @@ class TopologyGraphView @JvmOverloads constructor(
             } else {
                 COLOR_NODE_STROKE
             }
-            canvas.drawRoundRect(rect, dp(14f), dp(14f), nodePaint)
-            canvas.drawRoundRect(rect, dp(14f), dp(14f), strokePaint)
+            canvas.drawRoundRect(rect, dp(12f), dp(12f), nodePaint)
+            canvas.drawRoundRect(rect, dp(12f), dp(12f), strokePaint)
 
             // 右上角状态点
             dotPaint.color = accent
@@ -273,14 +335,42 @@ class TopologyGraphView @JvmOverloads constructor(
             val icon = if (node.type.uppercase().contains("PHONE")) "📱" else "💻"
             val title = (if (node.local) "$icon ${node.name} · 本机" else "$icon ${node.name}")
             textPaint.color = COLOR_TEXT
-            canvas.drawText(ellipsize(title, 14), rect.left + dp(11f), rect.top + dp(20f), textPaint)
+            canvas.drawText(ellipsize(title, 13), rect.left + dp(10f), rect.top + dp(21f), textPaint)
 
             val meta = node.meta.ifBlank {
                 "${if (node.type.uppercase().contains("PHONE")) "手机" else "电脑"} · ${statusText(node.status)}"
             }
             metaPaint.color = if (node.status == "online" || node.status == "reachable") accent else COLOR_META
-            canvas.drawText(ellipsize(meta, 18), rect.left + dp(11f), rect.top + dp(38f), metaPaint)
+            canvas.drawText(ellipsize(meta, 18), rect.left + dp(10f), rect.top + dp(40f), metaPaint)
         }
+    }
+
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                downX = event.x
+                downY = event.y
+                return nodeRects.values.any { it.contains(event.x, event.y) }
+            }
+            MotionEvent.ACTION_UP -> {
+                val moved = kotlin.math.abs(event.x - downX) > touchSlop ||
+                    kotlin.math.abs(event.y - downY) > touchSlop
+                if (!moved) {
+                    val hit = nodeRects.entries.firstOrNull { it.value.contains(event.x, event.y) }?.key
+                    if (hit != null) {
+                        performClick()
+                        onNodeClick?.invoke(hit)
+                        return true
+                    }
+                }
+            }
+        }
+        return super.onTouchEvent(event)
+    }
+
+    override fun performClick(): Boolean {
+        super.performClick()
+        return true
     }
 
     private fun ellipsize(value: String, maxChars: Int): String {

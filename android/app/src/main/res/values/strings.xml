@@ -54,6 +54,13 @@
     <string name="send_all_sms">推送全部短信</string>
     <string name="send_notifications">推送 App 通知</string>
     <string name="open_notification_access">打开通知使用权授权</string>
+    <string name="manage_notification_apps">按 App 管理通知推送</string>
+    <string name="notification_app_policy_title">App 通知推送管理</string>
+    <string name="notification_app_policy_desc">普通通知默认跟随全局开关；持续通知默认关闭，只会在这里为指定 App 打开后推送。</string>
+    <string name="notification_app_policy_empty">没有找到可管理的 App</string>
+    <string name="notification_policy_normal">普通</string>
+    <string name="notification_policy_ongoing">持续</string>
+    <string name="notification_policy_saved">App 通知策略已更新</string>
     <string name="notification_access_status_enabled_active">通知使用权已授权，正在监听 App 通知。</string>
     <string name="notification_access_status_enabled_inactive">通知使用权已授权，但“推送 App 通知”开关未开启。</string>
     <string name="notification_access_status_disabled">通知使用权未授权，无法读取其它 App 通知。</string>
