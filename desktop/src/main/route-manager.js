@@ -11,6 +11,7 @@ const TRANSPORT_PRIORITY = Object.freeze({
 const DEFAULT_ROUTE_FAILURE_PENALTY = 25
 const DEFAULT_ROUTE_COOLDOWN_MS = 30 * 1000
 const DEFAULT_ROUTE_HEALTH_TTL_MS = 10 * 60 * 1000
+const REACHABILITY_RECENT_MS = 2 * 60 * 1000
 
 function isTailscaleAddress(host) {
   const parts = String(host || '').trim().split('.')
@@ -38,6 +39,93 @@ function hostCandidates(node = {}) {
 
 function classifyDirectTransport(host) {
   return isTailscaleAddress(host) ? 'tailscale_direct' : 'lan_direct'
+}
+
+function isRecentTimestamp(timestamp, now = Date.now(), windowMs = REACHABILITY_RECENT_MS) {
+  const value = Number(timestamp || 0)
+  return Number.isFinite(value) && value > 0 && now - value <= windowMs
+}
+
+function hasRoutableAddress(node = {}) {
+  return hostCandidates(node).length > 0
+}
+
+function hasStoredRoute(node = {}, route = null) {
+  if (route) return true
+  if (node.routable === true) return true
+  if (String(node.routeNextHopId || '').trim()) return true
+  if (Number(node.routeMetric || 0) > 0) return true
+  return Array.isArray(node.routePath) && node.routePath.length > 1
+}
+
+function deriveReachabilitySnapshot(options = {}) {
+  const {
+    node = {},
+    route = null,
+    connected = false,
+    trusted = !!node.pairingKey,
+    discoveredOnly = node.discoveredOnly === true || node.authority === 'lan_discovery',
+    now = Date.now(),
+    recentMs = REACHABILITY_RECENT_MS,
+    recentDeliveryAt = 0
+  } = options
+
+  const enabled = node.enabled !== false
+  const revoked = node.revoked === true
+  const hasAddress = hasRoutableAddress(node)
+  const hasRoute = hasStoredRoute(node, route)
+  const recentDirectAt = Math.max(
+    Number(node.connectionUpdatedAt || 0) || 0,
+    Number(node.lastSyncAt || 0) || 0,
+    Number(node.lastSeen || 0) || 0,
+    Number(recentDeliveryAt || 0) || 0
+  )
+  const recentRouteAt = Math.max(
+    Number(node.routeUpdatedAt || 0) || 0,
+    route && (route.active === true || route.partiallyActive === true)
+      ? Number(route.updatedAt || 0) || 0
+      : 0
+  )
+  const routeActive = !!route
+    ? (route.active === true || route.partiallyActive === true)
+    : (hasRoute && recentRouteAt > 0)
+  const directRecent = hasAddress && isRecentTimestamp(recentDirectAt, now, recentMs)
+  const routeRecent = hasRoute && routeActive && isRecentTimestamp(recentRouteAt, now, recentMs)
+
+  let status = 'offline'
+  if (revoked) {
+    status = 'revoked'
+  } else if (!enabled) {
+    status = 'disabled'
+  } else if (connected) {
+    status = 'online'
+  } else if (trusted && (directRecent || routeRecent)) {
+    status = 'reachable'
+  } else if ((trusted && (hasAddress || hasRoute)) || (!trusted && hasAddress)) {
+    status = 'known'
+  }
+
+  return {
+    status,
+    discoveredOnly: discoveredOnly === true,
+    trusted: !!trusted,
+    connected: connected === true,
+    enabled,
+    revoked,
+    hasAddress,
+    hasRoute,
+    directRecent,
+    routeRecent,
+    recentDeliveryAt: recentDirectAt,
+    routeUpdatedAt: recentRouteAt,
+    activityAt: Math.max(recentDirectAt, recentRouteAt),
+    reachable: status === 'online' || status === 'reachable',
+    sendable: !discoveredOnly && !!trusted && (status === 'online' || status === 'reachable')
+  }
+}
+
+function isReachableStatus(status) {
+  return status === 'online' || status === 'reachable'
 }
 
 function buildPeerRoutes({ target = {}, topologyRoutes = [], hasActiveWs = false, preferDirect = true }) {
@@ -183,8 +271,13 @@ function createRouteHealthTracker(options = {}) {
 
 module.exports = {
   TRANSPORT_PRIORITY,
+  REACHABILITY_RECENT_MS,
   isTailscaleAddress,
   hostCandidates,
+  hasRoutableAddress,
+  hasStoredRoute,
+  deriveReachabilitySnapshot,
+  isReachableStatus,
   buildPeerRoutes,
   chooseBestRoute,
   routeHealthKey,

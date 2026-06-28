@@ -428,6 +428,10 @@ class MainActivity : AppCompatActivity() {
             showRevokeTotpAccessDialog()
         }
 
+        binding.btnTotpFullSync.setOnClickListener {
+            requestFullTotpSync()
+        }
+
         binding.btnDisconnect.setOnClickListener {
             showDisconnectTargetsDialog()
         }
@@ -1226,33 +1230,28 @@ class MainActivity : AppCompatActivity() {
             connectedDeviceIds = WebSocketService.connectedDeviceIds
         )
 
-    private fun getTopologyDeviceStateLabel(device: DesktopDevice): String = when (getTopologyDeviceStatus(device)) {
-        "online" -> "在线连接"
-        "reachable" -> "近期可达"
-        "known" -> "已知节点，当前未验证"
-        "disabled" -> getString(R.string.push_disabled)
-        else -> "离线"
-    }
+    private fun getTopologyDeviceStateLabel(device: DesktopDevice): String =
+        RouteManager.statusLabel(getTopologyDeviceStatus(device))
 
     private fun isFileTransferReachable(device: DesktopDevice): Boolean =
         isReachableTopologyStatus(getTopologyDeviceStatus(device))
 
     internal fun getFileTransferTargetOptions(): List<FileTransferTargetOption> {
-        return RouteManager.targetsForType(this, "file_transfer")
+        return RouteManager.targetsForType(
+            context = this,
+            type = "file_transfer",
+            connectedDeviceIds = WebSocketService.connectedDeviceIds,
+            includeDisallowed = true,
+            includeUnavailable = true,
+            reachableOnly = false
+        )
             .distinctBy { it.device.id }
             .map { option ->
-                val statusLabel = when (option.status) {
-                    "online" -> "在线连接"
-                    "reachable" -> "近期可达"
-                    "known" -> "已知节点"
-                    "disabled" -> "已禁用"
-                    else -> "离线"
-                }
                 FileTransferTargetOption(
                     device = option.device,
                     reachable = option.reachable,
                     allowed = option.allowed,
-                    statusLabel = statusLabel,
+                    statusLabel = RouteManager.statusLabel(option.status),
                     reason = option.reason
                 )
             }
@@ -1288,6 +1287,7 @@ class MainActivity : AppCompatActivity() {
                     name = it.name,
                     type = it.type,
                     status = it.status,
+                    discoveredOnly = it.discoveredOnly,
                     local = it.local,
                     meta = it.meta
                 )
@@ -1319,8 +1319,8 @@ class MainActivity : AppCompatActivity() {
 
         val onlineCount = model.nodes.count { it.status == "online" }
         val reachableCount = model.nodes.count { it.status == "reachable" }
-        val knownCount = model.nodes.count { it.status == "known" }
-        val discoveredCount = model.nodes.count { it.status == "discovered" }
+        val knownCount = model.nodes.count { it.status == "known" && !it.discoveredOnly }
+        val discoveredCount = model.nodes.count { it.status == "known" && it.discoveredOnly }
         container.addView(
             createTopologyRow(
                 title = "${deviceIcon("ANDROID_PHONE")} ${phone.name}",
@@ -1340,7 +1340,7 @@ class MainActivity : AppCompatActivity() {
             container.addView(
                 createTopologyRow(
                     title = "${deviceIcon(node.type)} ${node.name}",
-                    meta = "${TopologyViewModel.statusLabel(node.status)} · ${node.meta}",
+                    meta = "${TopologyViewModel.statusLabel(node.status, node.discoveredOnly)} · ${node.meta}",
                     detail = node.detailLines
                 )
             )

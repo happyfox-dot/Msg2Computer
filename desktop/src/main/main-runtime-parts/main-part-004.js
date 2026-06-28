@@ -73,8 +73,11 @@ function writeFilePathsToClipboard(filePaths) {
   if (paths.length === 0) return false
   if (process.platform !== 'win32') return false
   try {
-    const utf16 = Buffer.from(`${paths.join('\u0000')}\u0000\u0000`, 'utf16le')
-    clipboard.writeBuffer('FileNameW', utf16)
+    const wrote = writeWindowsFileDropList(paths, {
+      tmpDir: app.getPath('temp'),
+      timeoutMs: 5000
+    })
+    if (!wrote) return false
     lastClipboardFileSignature = getClipboardFileSignature(paths)
     return true
   } catch (error) {
@@ -291,27 +294,17 @@ function broadcastClipboardToNodes(text, options = {}) {
   relayPath.forEach(id => exclude.add(id))
   exclude.add(clipOrigin)
 
-  const targetPhones = getAuthorizedPhones().filter(phone =>
-    phone.enabled !== false &&
-    phone.revoked !== true &&
-    !exclude.has(phone.id) &&
-    canPushContentToNode(phone, CODE_TYPES.CLIPBOARD_TEXT) &&
-    phone.pairingKey &&
-    (phone.lastIP || phone.host)
-  )
-  // 桌面对端没有 per-device 剪贴板策略 UI（allowClipboard 恒为默认 false，
-  // 旧实现查它导致桌面间剪贴板永远不发——死代码）。桌面间是对等互信关系，
-  // 改为只受两端总开关控制：本端开了才会走到这里，对端有自己的接收开关把关。
-  const targetDesktopPeerIds = new Set(
-    getPairedDesktopPeers().filter(peer => {
-      if (exclude.has(peer.id)) return false
-      return !!peer && peer.enabled !== false && hasKnownDeliveryPath(peer)
-    }).map(peer => peer.id)
-  )
-  const targetDeviceIds = [
-    ...targetPhones.map(phone => phone.id),
-    ...Array.from(targetDesktopPeerIds)
-  ]
+  const targetDeviceIds = getTargetSelectionsForType(CODE_TYPES.CLIPBOARD_TEXT, {
+    excludeIds: exclude,
+    allowNode: node => {
+      const type = String(node.deviceType || node.type || '').toUpperCase()
+      if (type.includes('DESKTOP')) return true
+      return canPushContentToNode(node, CODE_TYPES.CLIPBOARD_TEXT)
+    },
+    permissionLabel: '剪贴板文本权限未开启'
+  })
+    .filter(target => target.selected)
+    .map(target => target.id)
   if (targetDeviceIds.length === 0) return
   // originMessageId 与版本绑定：同一版本经多条路径/多次补推到达同一节点时，
   // 接收端用既有去重表（手机 markRelayMessageSeen / 桌面 recentDeliveryKeys）
@@ -625,6 +618,138 @@ async function sendRelayEnvelopeToPhone(phone, basePayload, options = {}) {
   return false
 }
 
+function buildTotpResyncRequestPayload(targetId = '') {
+  const identity = getDesktopIdentity()
+  const requestId = `totp-resync-${identity.id}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`
+  const targetDeviceIds = String(targetId || '').trim() ? [String(targetId).trim()] : []
+  return {
+    type: 'totp_resync_request',
+    requestId,
+    originMessageId: requestId,
+    relayMessageId: requestId,
+    timestamp: Date.now(),
+    sourceDeviceId: identity.id,
+    sourceDeviceName: identity.name,
+    sourceDeviceType: identity.type,
+    originDeviceId: identity.id,
+    originDeviceName: identity.name,
+    targetDeviceIds,
+    relayPath: [identity.id],
+    relayTtl: USER_MESSAGE_RELAY_TTL,
+    relayPolicy: 'source_selected_targets'
+  }
+}
+
+function sendTotpResyncRequestWs(ws, sessionKey, targetId = '') {
+  if (!ws || ws.readyState !== WebSocket.OPEN || !sessionKey) return false
+  return sendEncryptedControlMessage(
+    ws,
+    sessionKey,
+    'totp_resync_request',
+    buildTotpResyncRequestPayload(targetId)
+  )
+}
+
+function handleTotpResyncRequest(ws, sessionKey, requester, encryptedPayload) {
+  if (!ws || !sessionKey || !requester || !encryptedPayload) return
+  const plain = decryptMessage(encryptedPayload, sessionKey)
+  if (!plain) return
+  try {
+    const request = JSON.parse(plain)
+    if (request.type && request.type !== 'totp_resync_request') return
+    const requesterId = String(requester.id || requester.phoneId || '').trim()
+    const requesterType = String(requester.deviceType || requester.type || '').toUpperCase()
+    console.log(`Full TOTP resync requested by ${requester.name || requesterId}`)
+    if (requesterType.includes('PHONE')) {
+      sendLocalTotpSeedsToPhone(ws, sessionKey, requesterId, { force: true })
+    } else {
+      sendLocalTotpSeedsToDesktopPeer(ws, sessionKey, requester, { force: true })
+    }
+  } catch (error) {
+    console.error('Failed to handle TOTP resync request:', error)
+  }
+}
+
+async function sendTotpResyncRequestToPhone(phone) {
+  if (!phone || phone.enabled === false || phone.revoked === true) return false
+  const connections = activePhoneConnections.get(phone.id)
+  if (connections) {
+    for (const ws of connections) {
+      const sessionKey = phoneSessionKeys.get(ws)
+      if (sendTotpResyncRequestWs(ws, sessionKey, phone.id)) return true
+    }
+  }
+  if (!phone.pairingKey || !hasDirectNodeAddress(phone)) return false
+  return sendRelayEnvelopeToPhone(phone, buildTotpResyncRequestPayload(phone.id), { skipBus: true })
+}
+
+async function sendTotpResyncRequestViaBus(target) {
+  const targetId = String(target?.id || target?.phoneId || '').trim()
+  if (!targetId) return false
+  const payload = buildTotpResyncRequestPayload(targetId)
+  const result = await getContentBus().publish(busEnvelope.TOPICS.TOTP_RESYNC_REQUEST, payload, {
+    targetNodeIds: [targetId],
+    ttl: payload.relayTtl,
+    routePath: payload.relayPath
+  }).catch(() => null)
+  return Number(result?.delivered || 0) > 0
+}
+
+async function requestFullTotpSync(requestedIds = []) {
+  const requestedSet = new Set(
+    (Array.isArray(requestedIds) ? requestedIds : [])
+      .map(id => String(id || '').trim())
+      .filter(Boolean)
+  )
+  const targets = getTargetSelectionsForType(CODE_TYPES.TOTP, {
+    requestedIds: requestedSet,
+    includeUnreachable: true,
+    permissionLabel: 'TOTP sync disabled'
+  }).filter(target => target.allowed && target.trusted)
+
+  let requested = 0
+  let queued = 0
+  const failed = []
+  for (const target of targets) {
+    const node = target.node || {}
+    const type = String(node.deviceType || node.type || target.type || '').toUpperCase()
+    if (type.includes('PHONE')) {
+      const ok = await sendTotpResyncRequestToPhone(node).catch(() => false) ||
+        await sendTotpResyncRequestViaBus(node)
+      if (ok) requested += 1
+      else failed.push(target.id)
+      continue
+    }
+
+    const ws = activeDesktopPeerConnections.get(target.id)
+    if (sendTotpResyncRequestWs(ws, ws?.__codebridgeSessionKey, target.id)) {
+      requested += 1
+    } else if (await sendTotpResyncRequestViaBus(node)) {
+      requested += 1
+    } else {
+      const peer = pairedDesktopPeers.get(target.id) || node
+      if (peer && peer.enabled !== false) {
+        pendingTotpResyncPeerIds.add(target.id)
+        connectDesktopPeer(peer, { showNotification: false })
+        queued += 1
+      } else {
+        failed.push(target.id)
+      }
+    }
+  }
+
+  if (requested + queued > 0) {
+    showNotification('TOTP full sync requested', `Requested ${requested}, queued ${queued}`)
+  }
+  return {
+    success: requested + queued > 0,
+    requested,
+    queued,
+    failed,
+    targetCount: targets.length
+  }
+}
+
 function normalizeTotpPushTargets(targets) {
   return (Array.isArray(targets) ? targets : (targets ? [targets] : []))
     .map(target => {
@@ -720,10 +845,10 @@ function publishTotpChangeToTargets(seed, action, targets = []) {
   })
 }
 
-function sendLocalTotpSeedsToDesktopPeer(ws, sessionKey, peer) {
+function sendLocalTotpSeedsToDesktopPeer(ws, sessionKey, peer, options = {}) {
   if (!peer) return
   if (!canPushContentToNode(peer, 'totp')) return
-  const cutoff = getTotpSyncCutoff(peer)
+  const cutoff = options.force === true ? 0 : getTotpSyncCutoff(peer)
   const localSeeds = getLocalTotpSeeds()
     .filter(seed => (Number(seed.updatedAt || seed.createdAt || 0) || 0) > cutoff)
   const deliveries = localSeeds.map(seed =>
@@ -857,6 +982,9 @@ function connectDesktopPeer(peer, options = {}) {
         savePairingKey()
         notifyDesktopPeersChanged({ topologyChanged: false })
         sendLocalTotpSeedsToDesktopPeer(ws, sessionKey, peer)
+        if (pendingTotpResyncPeerIds.delete(peer.id)) {
+          sendTotpResyncRequestWs(ws, sessionKey, peer.id)
+        }
         // 对端（重新）连上时补推本机当前剪贴板状态（LWW 防旧盖新）
         pushClipboardStateToDesktopPeer(ws, sessionKey, peer.id)
         requestTopologySnapshot(ws, sessionKey)
@@ -928,6 +1056,11 @@ function connectDesktopPeer(peer, options = {}) {
 
       if (message.type === 'totp_sync') {
         handleDesktopPeerTotpSync(peer, message.payload, ws.__codebridgeSessionKey)
+        return
+      }
+
+      if (message.type === 'totp_resync_request') {
+        handleTotpResyncRequest(ws, ws.__codebridgeSessionKey, peer, message.payload)
         return
       }
 
@@ -1136,12 +1269,11 @@ function getDesktopTotps() {
 function getDeviceStatusLabel(status) {
   return {
     online: '在线',
-    reachable: '可路由',
+    reachable: '近期可达',
     known: '已知节点',
     offline: '离线',
     disabled: '已禁用',
     revoked: '已撤销',
-    discovered: '已发现',
     synced: '已同步'
   }[status] || '未知'
 }
@@ -1154,34 +1286,44 @@ function isRecentTopologyTimestamp(value, windowMs = TOPOLOGY_RECENT_REACHABLE_M
 function getTopologyFreshnessAt(node = {}) {
   return Math.max(
     Number(node.connectionUpdatedAt || 0) || 0,
+    Number(node.lastSyncAt || 0) || 0,
     Number(node.lastSeen || 0) || 0,
     Number(node.routeUpdatedAt || 0) || 0
   )
 }
 
 function hasTopologyPathCandidate(node = {}) {
-  return hasDirectNodeAddress(node) ||
-    node.routable === true ||
-    !!String(node.routeNextHopId || '').trim() ||
-    Number(node.routeMetric || 0) > 0 ||
-    (Array.isArray(node.routePath) && node.routePath.length > 1)
+  return hasDirectNodeAddress(node) || !!deriveRouteReachabilitySnapshot({
+    node,
+    trusted: true
+  }).hasRoute
 }
 
-function getLayeredTopologyStatus(node = {}, options = {}) {
-  if (node.revoked === true) return 'revoked'
-  if (node.enabled === false) return 'disabled'
+function getNodeReachabilitySnapshot(node = {}, options = {}) {
   const id = String(node.id || node.phoneId || '').trim()
   const connected = Object.prototype.hasOwnProperty.call(options, 'connected')
     ? options.connected === true
     : (node.connected === true || hasActiveWsForNode(id))
-  if (connected) return 'online'
-  const trusted = options.trusted === true || !!node.pairingKey || !!lookupPeerPairingKey(id)
-  const hasPath = options.hasPath === true || hasTopologyPathCandidate(node)
-  if (trusted && hasPath && isRecentTopologyTimestamp(getTopologyFreshnessAt(node), options.recentMs)) {
-    return 'reachable'
-  }
-  if (trusted && hasPath) return 'known'
-  return 'offline'
+  const trusted = Object.prototype.hasOwnProperty.call(options, 'trusted')
+    ? options.trusted === true
+    : (!!node.pairingKey || !!lookupPeerPairingKey(id))
+  return deriveRouteReachabilitySnapshot({
+    node,
+    route: options.route || null,
+    connected,
+    trusted,
+    discoveredOnly: options.discoveredOnly === true || node.discoveredOnly === true || node.authority === 'lan_discovery',
+    recentMs: options.recentMs || TOPOLOGY_RECENT_REACHABLE_MS,
+    recentDeliveryAt: options.recentDeliveryAt || Math.max(
+      Number(node.connectionUpdatedAt || 0) || 0,
+      Number(node.lastSyncAt || 0) || 0,
+      Number(node.lastSeen || 0) || 0
+    )
+  })
+}
+
+function getLayeredTopologyStatus(node = {}, options = {}) {
+  return getNodeReachabilitySnapshot(node, options).status
 }
 
 function getPhoneTopologyStatus(phone) {
@@ -1201,6 +1343,7 @@ function normalizeTopologyDevice(device, fallback = {}) {
     role: fallback.role || 'remote',
     status: fallback.status || 'offline',
     authority: fallback.authority || '',
+    discoveredOnly: device.discoveredOnly === true || fallback.discoveredOnly === true,
     contentPolicy: normalizePushContentPolicy(device.contentPolicy || device || fallback),
     lastSeen: device.lastSeen || fallback.lastSeen || 0,
     lastIP: device.lastIP || device.host || fallback.lastIP || ''
@@ -1215,7 +1358,6 @@ function getTopologyStatusPriority(status) {
     reachable: 4,
     known: 3,
     synced: 2,
-    discovered: 1,
     offline: 0
   }[status] ?? 0
 }
@@ -1233,6 +1375,7 @@ function mergeTopologyNode(nodes, node) {
     name: node.name || existing.name,
     type: node.type || existing.type,
     role: existing.role === 'local_desktop' ? existing.role : (node.role || existing.role),
+    discoveredOnly: node.discoveredOnly === true ? true : (node.discoveredOnly === false ? false : existing.discoveredOnly === true),
     status: getTopologyStatusPriority(existing.status) >= getTopologyStatusPriority(node.status)
       ? existing.status
       : (node.status || existing.status)
@@ -1480,13 +1623,25 @@ function getTopologySnapshot() {
   lanDevices.forEach(device => {
     const alreadyKnown = authorizedPhones.has(device.id) || pairedDesktopPeers.has(device.id)
     if (alreadyKnown) return
+    const reachability = getNodeReachabilitySnapshot({
+      id: device.id,
+      host: device.host || '',
+      authority: 'lan_discovery',
+      discoveredOnly: true
+    }, {
+      trusted: false,
+      connected: false,
+      discoveredOnly: true,
+      recentDeliveryAt: device.discoveredAt || 0
+    })
     mergeTopologyNode(nodes, {
       id: device.id,
       name: device.name,
       type: device.deviceType || 'UNKNOWN_DEVICE',
       role: String(device.deviceType || '').includes('PHONE') ? 'phone' : 'peer',
-      status: 'discovered',
-      enabled: false,
+      status: reachability.status,
+      discoveredOnly: true,
+      enabled: true,
       connected: false,
       lastSeen: device.discoveredAt || 0,
       lastIP: device.host || '',

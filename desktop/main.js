@@ -17,12 +17,16 @@ const relayClient = require('./src/main/relay-client')
 const busEnvelope = require('./src/main/bus-envelope')
 const { createContentBus } = require('./src/main/content-bus')
 const { createBusReliabilityStore } = require('./src/main/bus-reliability')
-const { createRouteHealthTracker } = require('./src/main/route-manager')
+const {
+  createRouteHealthTracker,
+  deriveReachabilitySnapshot: deriveRouteReachabilitySnapshot
+} = require('./src/main/route-manager')
 const { registerDesktopIpc } = require('./src/main/desktop-ipc')
 const updater = require('./src/main/updater')
 const { createFileTransfer } = require('./src/main/file-transfer')
 const clipboardVersion = require('./src/main/clipboard-version')
 const trustedNode = require('./src/main/trusted-node')
+const { writeWindowsFileDropList } = require('./src/main/windows-file-clipboard')
 const { readJsonSync, writeJsonAtomic, writeJsonAtomicSync } = require('./src/main/async-json-file')
 
 let mainWindow = null

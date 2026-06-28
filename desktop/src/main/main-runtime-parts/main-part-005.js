@@ -2,6 +2,16 @@
           return
         }
 
+        if (message.type === 'totp_resync_request') {
+          const phone = authorizedPhones.get(connectionPhoneId) || {
+            id: connectionPhoneId,
+            name: connectionPhoneName,
+            deviceType: 'ANDROID_PHONE'
+          }
+          handleTotpResyncRequest(ws, connectionSessionKey, phone, message.payload)
+          return
+        }
+
         if (message.type === 'verify_code') {
           const msgId = typeof message.msgId === 'string' ? message.msgId : ''
           // 手机端 ACK 丢失后会重连重发同一 msgId：重复消息只补 ACK，不再次弹泡/写剪贴板
@@ -1032,6 +1042,20 @@ function isLocalTargetOfPayload(codeData) {
   return ids.includes(getDesktopIdentity().id)
 }
 
+function handlePlainTotpResyncRequest(request, lastHopDeviceId = '') {
+  const requesterId = String(request.sourceDeviceId || request.originDeviceId || lastHopDeviceId || '').trim()
+  if (!requesterId || requesterId === getDesktopIdentity().id) return
+  const resolved = resolveForwardTarget(requesterId)
+  const node = resolved?.node || authorizedPhones.get(requesterId) || pairedDesktopPeers.get(requesterId)
+  if (!node) return
+  const type = String(node.deviceType || node.type || '').toUpperCase()
+  if (type.includes('PHONE')) {
+    sendLocalTotpSeedsToPhone(null, null, requesterId, { force: true })
+  } else {
+    sendLocalTotpSeedsToDesktopPeer(null, null, node, { force: true })
+  }
+}
+
 // 在已知节点表里解析续传目标：桌面对端 → 已授权手机 → 拓扑 LSDB（gossip 学到的）
 function resolveForwardTarget(targetId) {
   const peer = pairedDesktopPeers.get(targetId)
@@ -1264,6 +1288,13 @@ function dispatchInboundCodeData(codeData, lastHopDeviceId = '') {
     if (isLocalTarget) handleTotpSeed(codeData)
   } else if (codeData.type === 'totp_revoke') {
     if (isLocalTarget) handleTotpRevoke(codeData)
+  } else if (codeData.type === 'totp_resync_request') {
+    if (isLocalTarget) {
+      handlePlainTotpResyncRequest(codeData, lastHopDeviceId)
+    } else {
+      forwardRelayedMessage(codeData, lastHopDeviceId)
+    }
+    return
   } else if (isLocalTarget) {
     handleVerifyCode(codeData)
   }
@@ -1325,21 +1356,7 @@ function findRouteForTarget(routes = [], targetId = '') {
   return routes.find(route => String(route.destinationId || route.to || '') === id) || null
 }
 
-function getFileTransferTargetStatus(node = {}, snapshotNode = null, route = null) {
-  if (node.enabled === false) return 'disabled'
-  if (node.revoked === true) return 'revoked'
-  const id = String(node.id || node.phoneId || '').trim()
-  const connected = node.connected === true || hasActiveWsForNode(id)
-  if (connected) return 'online'
-  const merged = { ...(snapshotNode || {}), ...node }
-  if (route?.active === true || route?.partiallyActive === true) return 'reachable'
-  return getLayeredTopologyStatus(merged, {
-    connected: false,
-    hasPath: !!route || hasTopologyPathCandidate(merged)
-  })
-}
-
-function getFileTransferTargets() {
+function buildUnifiedTargetCatalog() {
   const identity = getDesktopIdentity()
   const nodes = new Map()
   const topologySnapshot = getTopologySnapshot()
@@ -1356,7 +1373,7 @@ function getFileTransferTargets() {
   const append = (raw, fallbackKind = 'node') => {
     if (!raw) return
     const id = String(raw.id || raw.phoneId || '').trim()
-    if (!id || id === identity.id || raw.enabled === false || raw.revoked === true) return
+    if (!id || id === identity.id) return
 
     const mergedRecord = mergeTrustedNodeRecord(id, raw)
     const previous = nodes.get(id) || {}
@@ -1416,18 +1433,11 @@ function getFileTransferTargets() {
       const hosts = collectNetworkHosts(node.lastIP, node.host, node.relayHost, node.tsHost, node.altHosts)
       const snapshotNode = snapshotNodeById.get(id) || null
       const route = findRouteForTarget(routes, id)
-      const status = getFileTransferTargetStatus(node, snapshotNode, route)
-      const reachable = status === 'online' || status === 'reachable'
-      const trusted = !!lookupPeerPairingKey(id)
-      const allowed = trusted && canPushContentToNode(node, CODE_TYPES.FILE_TRANSFER)
-      const routeLabel = route && String(route.nextHopId || '') && String(route.nextHopId || '') !== id
-        ? `经 ${route.nextHopName || route.nextHopId}`
-        : ''
-      const reason = !trusted
-        ? '未完成可信配对'
-        : (!reachable
-            ? (status === 'known' ? '已知节点，当前未验证可达' : '当前不可达')
-            : (!allowed ? '文件传输权限未开启' : routeLabel))
+      const reachability = getNodeReachabilitySnapshot({ ...(snapshotNode || {}), ...node }, {
+        connected: node.connected === true || hasActiveWsForNode(id),
+        trusted: !!(node.pairingKey || lookupPeerPairingKey(id)),
+        route
+      })
       return {
         id,
         name: node.name || id,
@@ -1435,48 +1445,98 @@ function getFileTransferTargets() {
         kind: node.kind || inferKind(node),
         host: hosts[0] || '',
         lastSeen: node.lastSeen || 0,
-        status,
-        statusLabel: getDeviceStatusLabel(status),
-        reachable,
-        trusted,
-        allowed,
-        selected: reachable && allowed,
-        reason,
+        status: reachability.status,
+        statusLabel: getDeviceStatusLabel(reachability.status),
+        reachable: reachability.reachable,
+        trusted: reachability.trusted,
+        sendable: reachability.sendable,
+        reason: '',
         routeNextHopId: route?.nextHopId || '',
         routeNextHopName: route?.nextHopName || '',
         routeMetric: route?.metric || 0,
-        maxFileSizeMb: Number(node.contentPolicy?.maxFileSizeMb || node.maxFileSizeMb || desktopMessageSettings.maxFileSizeMb || 50)
+        maxFileSizeMb: Number(node.contentPolicy?.maxFileSizeMb || node.maxFileSizeMb || desktopMessageSettings.maxFileSizeMb || 50),
+        node,
+        snapshotNode,
+        route,
+        reachability
       }
     })
     .sort((a, b) => {
-      if (a.selected !== b.selected) return a.selected ? -1 : 1
       if (a.reachable !== b.reachable) return a.reachable ? -1 : 1
+      if (a.trusted !== b.trusted) return a.trusted ? -1 : 1
       return String(a.name || a.id).localeCompare(String(b.name || b.id), 'zh-Hans-CN')
     })
 }
 
+function buildTargetReason(target, allowed, permissionLabel = '未开启推送权限') {
+  if (target.status === 'revoked') return '已被源设备撤销授权'
+  if (target.status === 'disabled') return '当前节点已禁用'
+  if (!target.trusted) return '未完成可信配对'
+  if (!target.reachable) {
+    if (target.status === 'known') return '已知节点，当前未验证可达'
+    return '当前不可达'
+  }
+  if (!allowed) return permissionLabel
+  if (target.routeNextHopId && target.routeNextHopId !== target.id) {
+    return `经 ${target.routeNextHopName || target.routeNextHopId}`
+  }
+  return ''
+}
+
+function getTargetSelectionsForType(type, options = {}) {
+  const requestedIds = options.requestedIds instanceof Set
+    ? options.requestedIds
+    : new Set(Array.isArray(options.requestedIds) ? options.requestedIds.map(id => String(id || '').trim()).filter(Boolean) : [])
+  const excludedIds = options.excludeIds instanceof Set
+    ? options.excludeIds
+    : new Set(Array.isArray(options.excludeIds) ? options.excludeIds.map(id => String(id || '').trim()).filter(Boolean) : [])
+  const allowNode = typeof options.allowNode === 'function'
+    ? options.allowNode
+    : (node => canPushContentToNode(node, type))
+  const permissionLabel = options.permissionLabel || '未开启推送权限'
+  const includeUntrusted = options.includeUntrusted === true
+  const includeUnreachable = options.includeUnreachable === true
+
+  return buildUnifiedTargetCatalog()
+    .filter(target => !excludedIds.has(target.id))
+    .filter(target => requestedIds.size === 0 || requestedIds.has(target.id))
+    .map(target => {
+      const allowed = target.trusted && allowNode(target.node)
+      const selected = target.sendable && allowed
+      const reason = buildTargetReason(target, allowed, permissionLabel)
+      return {
+        ...target,
+        allowed,
+        selected,
+        reason
+      }
+    })
+    .filter(target => includeUntrusted || target.trusted || target.status === 'revoked' || target.status === 'disabled')
+    .filter(target => includeUnreachable || target.reachable || target.status === 'known' || target.status === 'offline' || target.status === 'revoked' || target.status === 'disabled')
+    .sort((a, b) => {
+      if (a.selected !== b.selected) return a.selected ? -1 : 1
+      if (a.reachable !== b.reachable) return a.reachable ? -1 : 1
+      if (a.trusted !== b.trusted) return a.trusted ? -1 : 1
+      return String(a.name || a.id).localeCompare(String(b.name || b.id), 'zh-Hans-CN')
+    })
+}
+
+function getFileTransferTargets() {
+  return getTargetSelectionsForType(CODE_TYPES.FILE_TRANSFER, {
+    includeUntrusted: true,
+    includeUnreachable: true,
+    permissionLabel: '文件传输权限未开启'
+  })
+}
+
 function getDefaultClipboardFileTargetIds() {
-  const ids = []
-  for (const phone of getAuthorizedPhones()) {
-    if (phone.enabled === false || phone.revoked === true) continue
-    if (!hasKnownDeliveryPath(phone)) continue
-    if (
-      canPushContentToNode(phone, CODE_TYPES.CLIPBOARD_FILE) ||
-      canPushContentToNode(phone, CODE_TYPES.FILE_TRANSFER)
-    ) {
-      ids.push(phone.id)
-    }
-  }
-  for (const peer of getPairedDesktopPeers()) {
-    if (peer.enabled === false || !hasKnownDeliveryPath(peer)) continue
-    if (
-      canPushContentToNode(peer, CODE_TYPES.CLIPBOARD_FILE) ||
-      canPushContentToNode(peer, CODE_TYPES.FILE_TRANSFER)
-    ) {
-      ids.push(peer.id)
-    }
-  }
-  return Array.from(new Set(ids))
+  return getTargetSelectionsForType(CODE_TYPES.CLIPBOARD_FILE, {
+    allowNode: node =>
+      canPushContentToNode(node, CODE_TYPES.CLIPBOARD_FILE) ||
+      canPushContentToNode(node, CODE_TYPES.FILE_TRANSFER)
+  })
+    .filter(target => target.selected)
+    .map(target => target.id)
 }
 
 async function selectAndSendFile(targetIds = []) {
@@ -1671,6 +1731,7 @@ registerDesktopIpc(ipcMain, {
   },
   getAuthorizedPhones: () => getAuthorizedPhones(),
   getDesktopTotps: () => getDesktopTotps(),
+  requestTotpResync: targetIds => requestFullTotpSync(targetIds),
   getTopology: () => getTopologySnapshot(),
   getMessageSettings: () => normalizeMessageSettings(desktopMessageSettings),
   setMessageSettings: updates => {

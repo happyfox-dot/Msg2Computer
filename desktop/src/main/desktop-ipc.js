@@ -8,6 +8,7 @@ function registerDesktopIpc(ipcMain, handlers) {
   handle('regenerate-pairing', () => handlers.regeneratePairing())
   handle('get-authorized-phones', () => handlers.getAuthorizedPhones())
   handle('get-desktop-totps', () => handlers.getDesktopTotps())
+  handle('request-totp-resync', (event, targetIds) => handlers.requestTotpResync(targetIds))
   handle('get-topology', () => handlers.getTopology())
   handle('get-message-settings', () => handlers.getMessageSettings())
   handle('set-message-settings', (event, updates) => handlers.setMessageSettings(updates))

@@ -168,6 +168,9 @@
     <string name="totp_unpin">取消置顶</string>
     <string name="totp_pinned">已置顶「%1$s」</string>
     <string name="totp_unpinned">已取消置顶「%1$s」</string>
+    <string name="totp_full_sync">全量同步</string>
+    <string name="totp_full_sync_no_targets">暂无可同步的可信节点</string>
+    <string name="totp_full_sync_requested">已请求可信节点全量同步 TOTP</string>
     <string name="totp_manage_access">管理 TOTP 显示权限</string>
 
     <!-- 断开对话框 -->

@@ -38,10 +38,27 @@ object RouteManager {
         val device: DesktopDevice,
         val deliveryDevice: DesktopDevice,
         val route: RouteInfo?,
+        val snapshot: ReachabilitySnapshot,
         val status: String,
         val reachable: Boolean,
         val allowed: Boolean,
         val reason: String
+    )
+
+    data class ReachabilitySnapshot(
+        val status: String,
+        val discoveredOnly: Boolean,
+        val trusted: Boolean,
+        val connected: Boolean,
+        val enabled: Boolean,
+        val revoked: Boolean,
+        val hasAddress: Boolean,
+        val hasRoute: Boolean,
+        val recentDeliveryAt: Long,
+        val routeFreshnessAt: Long,
+        val activityAt: Long,
+        val reachable: Boolean,
+        val sendable: Boolean
     )
 
     private data class RouteNode(
@@ -133,33 +150,38 @@ object RouteManager {
         connectedDeviceIds: Set<String> = emptySet(),
         requestedTargetIds: Set<String> = emptySet(),
         excludedDeviceIds: Set<String> = emptySet(),
-        respectLocalSendSettings: Boolean = true
+        respectLocalSendSettings: Boolean = true,
+        includeDisallowed: Boolean = false,
+        includeUnavailable: Boolean = false,
+        reachableOnly: Boolean = true
     ): List<TargetOption> {
         val routes = refreshStoredRoutes(context, connectedDeviceIds)
-        val devices = DeviceStore.getEnabledDevices(context)
+        val devices = (if (includeUnavailable) DeviceStore.getDevices(context) else DeviceStore.getEnabledDevices(context))
             .filter { it.id !in excludedDeviceIds }
             .filter { requestedTargetIds.isEmpty() || it.id in requestedTargetIds }
             .distinctBy { it.id }
         val byId = devices.associateBy { it.id }
         return devices
             .mapNotNull { device ->
+                val snapshot = snapshotForDevice(device, route = routes[device.id], connectedDeviceIds = connectedDeviceIds)
                 val allowed = if (respectLocalSendSettings) {
                     PolicyManager.canSendTo(context, type, device)
                 } else {
                     PolicyManager.canForwardTo(type, device)
                 }
-                if (!allowed) return@mapNotNull null
+                if (!includeDisallowed && !allowed) return@mapNotNull null
+                if (reachableOnly && !snapshot.sendable) return@mapNotNull null
                 val route = routes[device.id]
                 val delivery = deliveryDeviceForTarget(device, route, byId, emptySet(), emptySet())
-                val status = statusForDevice(device, route, connectedDeviceIds)
                 TargetOption(
                     device = device,
                     deliveryDevice = delivery,
                     route = route,
-                    status = status,
-                    reachable = isReachableStatus(status),
-                    allowed = true,
-                    reason = routeReason(device, route, status)
+                    snapshot = snapshot,
+                    status = snapshot.status,
+                    reachable = snapshot.reachable,
+                    allowed = allowed,
+                    reason = routeReason(device, route, snapshot, allowed)
                 )
             }
             .sortedWith(
@@ -255,27 +277,117 @@ object RouteManager {
         route: RouteInfo? = null,
         connectedDeviceIds: Set<String> = emptySet(),
         now: Long = System.currentTimeMillis()
-    ): String {
-        if (!device.enabled) return "disabled"
-        if (device.revoked || device.pairingKey.isBlank()) return "offline"
-        if (device.id in connectedDeviceIds) return "online"
-        val directFreshnessAt = maxOf(
-            device.connectionUpdatedAt,
-            device.lastSyncAt
+    ): String =
+        snapshotForDevice(device, route, connectedDeviceIds, now).status
+
+    fun snapshotForDevice(
+        device: DesktopDevice,
+        route: RouteInfo? = null,
+        connectedDeviceIds: Set<String> = emptySet(),
+        now: Long = System.currentTimeMillis()
+    ): ReachabilitySnapshot {
+        val hasRoute = route != null ||
+            device.routeNextHopId.isNotBlank() ||
+            device.routeMetric > 0 ||
+            device.routePath.size > 1
+        val routeFreshnessAt = max(
+            device.routeUpdatedAt,
+            if (route?.active == true || route?.partiallyActive == true) route.updatedAt else 0L
         )
-        val activeRouteFreshnessAt = if (route?.active == true || route?.partiallyActive == true) {
-            route.updatedAt
-        } else {
-            0L
-        }
-        val hasRoute = route != null || device.routeNextHopId.isNotBlank() || device.routeMetric > 0 || device.routePath.size > 1
-        val hasAddress = device.host.isNotBlank() || device.altHosts.any { it.isNotBlank() }
-        return when {
-            hasRoute && isRecent(activeRouteFreshnessAt, now) -> "reachable"
-            hasAddress && isRecent(directFreshnessAt, now) -> "reachable"
-            hasRoute || hasAddress -> "known"
-            else -> "offline"
-        }
+        return buildReachabilitySnapshot(
+            trusted = device.pairingKey.isNotBlank(),
+            enabled = device.enabled,
+            revoked = device.revoked,
+            connected = device.id in connectedDeviceIds,
+            hasAddress = device.host.isNotBlank() || device.altHosts.any { it.isNotBlank() },
+            hasRoute = hasRoute,
+            routeActive = if (route != null) route.active || route.partiallyActive else hasRoute && routeFreshnessAt > 0L,
+            recentDeliveryAt = max(device.connectionUpdatedAt, device.lastSyncAt),
+            routeFreshnessAt = routeFreshnessAt,
+            discoveredOnly = false,
+            now = now
+        )
+    }
+
+    fun snapshotForNode(
+        raw: JSONObject,
+        device: DesktopDevice? = null,
+        route: RouteInfo? = null,
+        connectedDeviceIds: Set<String> = emptySet(),
+        now: Long = System.currentTimeMillis(),
+        localNodeId: String = ""
+    ): ReachabilitySnapshot {
+        val id = raw.optString("id", raw.optString("deviceId")).trim()
+        val trusted = device?.pairingKey?.isNotBlank() == true ||
+            raw.optString("pairingKey", raw.optString("pk")).isNotBlank()
+        val enabled = device?.enabled ?: raw.optBoolean("enabled", true)
+        val revoked = device?.revoked ?: raw.optBoolean("revoked", false)
+        val connected = id.isNotBlank() && (id == localNodeId || id in connectedDeviceIds || raw.optBoolean("connected", false))
+        val rawAltHosts = jsonArrayToList(raw.optJSONArray("altHosts"))
+        val hasAddress = (device?.host?.isNotBlank() == true) ||
+            (device?.altHosts?.any { it.isNotBlank() } == true) ||
+            raw.optString("host").isNotBlank() ||
+            raw.optString("tsHost").isNotBlank() ||
+            raw.optString("relayHost").isNotBlank() ||
+            rawAltHosts.isNotEmpty()
+        val hasRoute = route != null ||
+            (device?.routeNextHopId?.isNotBlank() == true) ||
+            (device?.routeMetric ?: 0) > 0 ||
+            (device?.routePath?.size ?: 0) > 1 ||
+            raw.optBoolean("routable", false) ||
+            raw.optString("routeNextHopId").isNotBlank() ||
+            raw.optInt("routeMetric", 0) > 0 ||
+            jsonArrayToList(raw.optJSONArray("routePath")).size > 1
+        val routeFreshnessAt = max(
+            max(device?.routeUpdatedAt ?: 0L, raw.optLong("routeUpdatedAt", 0L)),
+            if (route?.active == true || route?.partiallyActive == true) route.updatedAt else 0L
+        )
+        val recentDeliveryAt = listOf(
+            device?.connectionUpdatedAt ?: 0L,
+            device?.lastSyncAt ?: 0L,
+            raw.optLong("lastSeen", 0L),
+            raw.optLong("updatedAt", 0L)
+        ).maxOrNull() ?: 0L
+        return buildReachabilitySnapshot(
+            trusted = trusted,
+            enabled = enabled,
+            revoked = revoked,
+            connected = connected,
+            hasAddress = hasAddress,
+            hasRoute = hasRoute,
+            routeActive = if (route != null) route.active || route.partiallyActive else hasRoute && routeFreshnessAt > 0L,
+            recentDeliveryAt = recentDeliveryAt,
+            routeFreshnessAt = routeFreshnessAt,
+            discoveredOnly = raw.optBoolean("discoveredOnly", false) || raw.optString("authority") == "lan_discovery",
+            now = now
+        )
+    }
+
+    fun snapshotForDiscoveryNode(
+        hasAddress: Boolean = true,
+        now: Long = System.currentTimeMillis()
+    ): ReachabilitySnapshot =
+        buildReachabilitySnapshot(
+            trusted = false,
+            enabled = true,
+            revoked = false,
+            connected = false,
+            hasAddress = hasAddress,
+            hasRoute = false,
+            routeActive = false,
+            recentDeliveryAt = now,
+            routeFreshnessAt = 0L,
+            discoveredOnly = true,
+            now = now
+        )
+
+    fun statusLabel(status: String): String = when (status) {
+        "online" -> "在线直连"
+        "reachable" -> "近期可达"
+        "known" -> "已知节点"
+        "revoked" -> "已撤销"
+        "disabled" -> "已禁用"
+        else -> "离线"
     }
 
     fun isReachableStatus(status: String): Boolean =
@@ -403,9 +515,23 @@ object RouteManager {
         return candidatesById[nextHopId] ?: target
     }
 
-    private fun routeReason(device: DesktopDevice, route: RouteInfo?, status: String): String {
+    private fun routeReason(
+        device: DesktopDevice,
+        route: RouteInfo?,
+        snapshot: ReachabilitySnapshot,
+        allowed: Boolean
+    ): String {
+        if (snapshot.revoked) return "已被源设备撤销授权"
+        if (!snapshot.enabled) return "当前节点已禁用"
+        if (!snapshot.trusted) return "未完成可信配对"
+        if (!snapshot.reachable) {
+            return when (snapshot.status) {
+                "known" -> "已知节点，当前未验证可达"
+                else -> "当前不可达"
+            }
+        }
+        if (!allowed) return "当前内容类型未开启"
         val parts = mutableListOf<String>()
-        if (!isReachableStatus(status)) parts.add(status)
         if (route != null && route.nextHopId.isNotBlank() && route.nextHopId != device.id) {
             parts.add("via ${route.nextHopName.ifBlank { route.nextHopId }}")
             parts.add("SPF ${route.metric}")
@@ -425,6 +551,53 @@ object RouteManager {
 
     private fun isRecent(timestamp: Long, now: Long): Boolean =
         timestamp > 0L && now - timestamp <= RECENT_REACHABLE_MS
+
+    private fun buildReachabilitySnapshot(
+        trusted: Boolean,
+        enabled: Boolean,
+        revoked: Boolean,
+        connected: Boolean,
+        hasAddress: Boolean,
+        hasRoute: Boolean,
+        routeActive: Boolean,
+        recentDeliveryAt: Long,
+        routeFreshnessAt: Long,
+        discoveredOnly: Boolean,
+        now: Long
+    ): ReachabilitySnapshot {
+        val directRecent = hasAddress && isRecent(recentDeliveryAt, now)
+        val routeRecent = hasRoute && routeActive && isRecent(routeFreshnessAt, now)
+        val status = when {
+            revoked -> "revoked"
+            !enabled -> "disabled"
+            connected -> "online"
+            trusted && (directRecent || routeRecent) -> "reachable"
+            (trusted && (hasAddress || hasRoute)) || (!trusted && hasAddress) -> "known"
+            else -> "offline"
+        }
+        return ReachabilitySnapshot(
+            status = status,
+            discoveredOnly = discoveredOnly,
+            trusted = trusted,
+            connected = connected,
+            enabled = enabled,
+            revoked = revoked,
+            hasAddress = hasAddress,
+            hasRoute = hasRoute,
+            recentDeliveryAt = recentDeliveryAt,
+            routeFreshnessAt = routeFreshnessAt,
+            activityAt = max(recentDeliveryAt, routeFreshnessAt),
+            reachable = isReachableStatus(status),
+            sendable = !discoveredOnly && trusted && isReachableStatus(status)
+        )
+    }
+
+    private fun jsonArrayToList(array: JSONArray?): List<String> {
+        if (array == null) return emptyList()
+        return (0 until array.length()).mapNotNull { index ->
+            array.optString(index).takeIf { it.isNotBlank() }
+        }
+    }
 
     private fun isRoutableNode(node: JSONObject, currentNetworkId: String): Boolean {
         val id = node.optString("id").trim()

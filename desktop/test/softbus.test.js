@@ -10,6 +10,8 @@ const {
   buildPeerRoutes,
   chooseBestRoute,
   createRouteHealthTracker,
+  deriveReachabilitySnapshot,
+  isReachableStatus,
   isTailscaleAddress
 } = require('../src/main/route-manager')
 const {
@@ -92,6 +94,88 @@ test('route health penalizes recently failed direct routes', () => {
   const ranked = tracker.rankRoutes(targetId, routes)
 
   assert.equal(ranked[0].transportType, 'relay_route')
+})
+
+test('reachability snapshot marks connected peers online and recent direct peers reachable', () => {
+  const now = 1_000_000
+  const online = deriveReachabilitySnapshot({
+    node: { id: 'B', host: '192.168.31.20', pairingKey: 'key' },
+    trusted: true,
+    connected: true,
+    now
+  })
+  const reachable = deriveReachabilitySnapshot({
+    node: {
+      id: 'C',
+      host: '192.168.31.30',
+      pairingKey: 'key',
+      lastSeen: now - 10_000
+    },
+    trusted: true,
+    now
+  })
+
+  assert.equal(online.status, 'online')
+  assert.equal(isReachableStatus(online.status), true)
+  assert.equal(reachable.status, 'reachable')
+  assert.equal(reachable.sendable, true)
+})
+
+test('reachability snapshot keeps stale or untrusted nodes out of sendable targets', () => {
+  const now = 1_000_000
+  const known = deriveReachabilitySnapshot({
+    node: {
+      id: 'D',
+      host: '192.168.31.40',
+      pairingKey: 'key',
+      lastSeen: now - 10 * 60 * 1000
+    },
+    trusted: true,
+    now
+  })
+  const routeKnown = deriveReachabilitySnapshot({
+    node: {
+      id: 'E',
+      routeNextHopId: 'B',
+      routeMetric: 15,
+      routeUpdatedAt: now - 15 * 60 * 1000
+    },
+    route: {
+      destinationId: 'E',
+      nextHopId: 'B',
+      metric: 15,
+      active: true,
+      partiallyActive: false,
+      updatedAt: now - 15 * 60 * 1000
+    },
+    trusted: true,
+    now
+  })
+  const untrusted = deriveReachabilitySnapshot({
+    node: { id: 'F', host: '192.168.31.50' },
+    trusted: false,
+    now
+  })
+
+  assert.equal(known.status, 'known')
+  assert.equal(known.sendable, false)
+  assert.equal(routeKnown.status, 'known')
+  assert.equal(routeKnown.reachable, false)
+  assert.equal(untrusted.status, 'known')
+  assert.equal(untrusted.sendable, false)
+})
+
+test('discovery-only nodes reuse known status with discoveredOnly marker', () => {
+  const snapshot = deriveReachabilitySnapshot({
+    node: { id: 'G', host: '192.168.31.60', authority: 'lan_discovery', discoveredOnly: true },
+    trusted: false,
+    discoveredOnly: true,
+    now: 1_000_000
+  })
+
+  assert.equal(snapshot.status, 'known')
+  assert.equal(snapshot.discoveredOnly, true)
+  assert.equal(snapshot.sendable, false)
 })
 
 test('bus reliability store deduplicates inbound messages and retries pending outbound', () => {

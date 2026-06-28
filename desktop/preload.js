@@ -8,6 +8,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   regeneratePairing: () => ipcRenderer.invoke('regenerate-pairing'),
   getAuthorizedPhones: () => ipcRenderer.invoke('get-authorized-phones'),
   getDesktopTotps: () => ipcRenderer.invoke('get-desktop-totps'),
+  requestTotpResync: (targetIds) => ipcRenderer.invoke('request-totp-resync', targetIds),
   getTopology: () => ipcRenderer.invoke('get-topology'),
   getMessageSettings: () => ipcRenderer.invoke('get-message-settings'),
   setMessageSettings: (updates) => ipcRenderer.invoke('set-message-settings', updates),

@@ -36,6 +36,7 @@ if (!window.electronAPI) {
     getAppVersion: async () => 'browser-preview',
     getAuthorizedPhones: async () => [],
     getDesktopTotps: async () => [],
+    requestTotpResync: async () => ({ success: false, requested: 0, queued: 0, targetCount: 0 }),
     getFileTransferHistory: async () => [],
     getFileTransferSettings: async () => ({ downloadDir: '', usingDefault: true }),
     getFileTransferTargets: async () => [],
@@ -71,6 +72,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   setupLanDiscovery()
   setupSettings()
   setupQRCodeFeatures() // 新增：二维码功能
+  setupTotpResync()
 
   window.electronAPI.onNewCode((codeInfo) => {
     addCode(codeInfo)
@@ -1021,6 +1023,35 @@ async function refreshDesktopTotps() {
   if (!Array.isArray(desktopTotps)) desktopTotps = []
   updateTotpDisplay()
   await refreshTopology()
+}
+
+function setupTotpResync() {
+  const button = document.getElementById('btn-resync-totp')
+  if (!button || !window.electronAPI.requestTotpResync) return
+
+  button.addEventListener('click', async () => {
+    const originalText = button.textContent
+    button.disabled = true
+    button.textContent = '同步中'
+    try {
+      const result = await window.electronAPI.requestTotpResync()
+      if (result?.success) {
+        showNotification(
+          '已请求全量同步',
+          `已请求 ${result.requested || 0} 个节点，排队 ${result.queued || 0} 个`
+        )
+        setTimeout(() => refreshDesktopTotps(), 1800)
+      } else {
+        showNotification('没有可同步节点', '请确认可信节点已允许 TOTP 且处于可达状态')
+      }
+    } catch (error) {
+      console.error('Failed to request full TOTP sync:', error)
+      showNotification('全量同步失败', error.message || '请求失败')
+    } finally {
+      button.disabled = false
+      button.textContent = originalText
+    }
+  })
 }
 
 function addCode(codeInfo) {

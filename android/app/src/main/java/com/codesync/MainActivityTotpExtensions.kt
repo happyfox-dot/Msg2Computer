@@ -222,6 +222,16 @@ fun MainActivity.syncDeletedTotpToDesktop(entry: TotpEntry) {
     refreshConnectionSnapshot()
 }
 
+fun MainActivity.requestFullTotpSync() {
+    if (DeviceStore.getEnabledDevices(this).isEmpty()) {
+        Toast.makeText(this, R.string.totp_full_sync_no_targets, Toast.LENGTH_SHORT).show()
+        return
+    }
+    startServiceForAction(WebSocketService.ACTION_REQUEST_TOTP_RESYNC)
+    Toast.makeText(this, R.string.totp_full_sync_requested, Toast.LENGTH_SHORT).show()
+    refreshConnectionSnapshot()
+}
+
 /** 从相册选择的图片中解析二维码 */
 fun MainActivity.handleImageFromGallery(uri: Uri) {
     try {
@@ -651,4 +661,3 @@ fun MainActivity.copyToClipboard(text: String) {
     // 不在 Toast 里回显验证码：Toast 可被无障碍服务/截屏读取。
     Toast.makeText(this, "已复制", Toast.LENGTH_SHORT).show()
 }
-

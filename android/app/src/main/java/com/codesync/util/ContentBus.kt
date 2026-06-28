@@ -22,6 +22,7 @@ object ContentBus {
         const val APP_NOTIFICATION_REMOVED = "notification.removed"
         const val TOTP_SEED = "totp.seed"
         const val TOTP_REVOKE = "totp.revoke"
+        const val TOTP_RESYNC_REQUEST = "totp.resync_request"
         const val CLIPBOARD_TEXT = "clipboard.text"
         const val CLIPBOARD_IMAGE = "clipboard.image"
         const val CLIPBOARD_FILE = "clipboard.file"
@@ -36,6 +37,7 @@ object ContentBus {
         "app_notification_removed" -> Topic.APP_NOTIFICATION_REMOVED
         "totp_seed" -> Topic.TOTP_SEED
         "totp_revoke" -> Topic.TOTP_REVOKE
+        "totp_resync_request" -> Topic.TOTP_RESYNC_REQUEST
         "clipboard", "clipboard_text" -> Topic.CLIPBOARD_TEXT
         "clipboard_image" -> Topic.CLIPBOARD_IMAGE
         "clipboard_file" -> Topic.CLIPBOARD_FILE
@@ -51,6 +53,7 @@ object ContentBus {
         Topic.APP_NOTIFICATION_REMOVED -> "app_notification_removed"
         Topic.TOTP_SEED -> "totp_seed"
         Topic.TOTP_REVOKE -> "totp_revoke"
+        Topic.TOTP_RESYNC_REQUEST -> "totp_resync_request"
         Topic.CLIPBOARD_TEXT -> "clipboard_text"
         Topic.CLIPBOARD_IMAGE -> "clipboard_image"
         Topic.CLIPBOARD_FILE -> "clipboard_file"

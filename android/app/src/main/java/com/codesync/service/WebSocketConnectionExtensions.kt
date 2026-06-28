@@ -195,6 +195,12 @@ fun WebSocketService.connectDevice(device: DesktopDevice, registerOnly: Boolean,
                             scheduleCloseAfterIdle(device.id)
                         }
                     }
+                    "totp_resync_request" -> {
+                        handleTotpResyncRequest(connection, msg.optString("payload"))
+                        if (!deviceHasPending(device.id)) {
+                            scheduleCloseAfterIdle(device.id)
+                        }
+                    }
                     "topology_sync" -> {
                         handleTopologySync(connection, msg.optString("payload"))
                     }
@@ -570,9 +576,12 @@ fun WebSocketService.handleTopologySync(connection: DeviceConnection, encryptedP
                 policyAllowTotp = node.optBoolean("allowTotp", true),
                 policyAllowClipboard = node.optBoolean(
                     "allowClipboardText",
-                    node.optBoolean("allowClipboard", false)
+                    node.optBoolean("allowClipboard", true)
                 ),
-                policyAllowClipboardImage = node.optBoolean("allowClipboardImage", false),
+                policyAllowClipboardImage = node.optBoolean(
+                    "allowClipboardImage",
+                    node.optBoolean("allowImages", node.optBoolean("allowClipboard", true))
+                ),
                 policyAllowClipboardFile = node.optBoolean("allowClipboardFile", false),
                 policyAllowFileTransfer = node.optBoolean("allowFileTransfer", false),
                 policyMaxFileSizeMb = node.optInt("maxFileSizeMb", 50),

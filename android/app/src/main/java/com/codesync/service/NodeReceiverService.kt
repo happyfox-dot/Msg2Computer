@@ -93,9 +93,6 @@ class NodeReceiverService : Service() {
         // 仅内存留存（窗口期外的旧 nonce 必被时间窗拦截，无需跨重启持久化）。
         private const val RELAY_NONCE_TTL_MS = RELAY_REPLAY_WINDOW_MS
         private const val RELAY_NONCE_LIMIT_PER_SENDER = 300
-        private const val TOPOLOGY_GOSSIP_MIN_INTERVAL_MS = 5_000L
-        @Volatile
-        private var lastTopologyGossipBroadcastAt = 0L
     }
 
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -498,7 +495,6 @@ class NodeReceiverService : Service() {
     }
 
     private fun broadcastTopologyChange(reason: String) {
-        if (shouldThrottleTopologyGossip(reason)) return
         val intent = Intent(this, WebSocketService::class.java).apply {
             action = WebSocketService.ACTION_BROADCAST_TOPOLOGY
             putExtra(WebSocketService.EXTRA_TOPOLOGY_REASON, reason)
@@ -507,16 +503,6 @@ class NodeReceiverService : Service() {
             startForegroundService(intent)
         } else {
             startService(intent)
-        }
-    }
-
-    private fun shouldThrottleTopologyGossip(reason: String): Boolean {
-        if (reason != "topology_delta_received") return false
-        val now = System.currentTimeMillis()
-        synchronized(NodeReceiverService::class.java) {
-            if (now - lastTopologyGossipBroadcastAt < TOPOLOGY_GOSSIP_MIN_INTERVAL_MS) return true
-            lastTopologyGossipBroadcastAt = now
-            return false
         }
     }
 
@@ -875,6 +861,7 @@ class NodeReceiverService : Service() {
         return isUserMessagePayload(type) ||
             type == "totp_seed" ||
             type == "totp_revoke" ||
+            type == "totp_resync_request" ||
             isTopologyPayload(type)
     }
 
@@ -935,7 +922,23 @@ class NodeReceiverService : Service() {
                     WebSocketService.reportExternalStatus(this, "已同步删除 ${removed.size} 个中继 TOTP")
                 }
             }
+            "totp_resync_request" -> handleTotpResyncRequestPayload(payload)
         }
+    }
+
+    private fun handleTotpResyncRequestPayload(payload: JSONObject) {
+        val requesterId = payload.optString("sourceDeviceId", payload.optString("originDeviceId")).trim()
+        if (requesterId.isBlank()) return
+        val intent = Intent(this, WebSocketService::class.java).apply {
+            action = WebSocketService.ACTION_SEND_ALL_TOTP_SEEDS
+            putStringArrayListExtra(WebSocketService.EXTRA_TARGET_DEVICE_IDS, arrayListOf(requesterId))
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(intent)
+        } else {
+            startService(intent)
+        }
+        WebSocketService.reportExternalStatus(this, "收到全量 TOTP 同步请求")
     }
 
     private fun normalizeSecret(secret: String?): String {

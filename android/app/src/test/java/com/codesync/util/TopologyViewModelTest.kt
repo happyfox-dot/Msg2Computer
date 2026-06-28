@@ -71,7 +71,8 @@ class TopologyViewModelTest {
         assertEquals("phone-a", model.localNodeId)
         assertEquals("online", model.nodeMap.getValue("phone-a").status)
         assertEquals("online", model.nodeMap.getValue("desktop-b").status)
-        assertEquals("discovered", model.nodeMap.getValue("phone-c").status)
+        assertEquals("known", model.nodeMap.getValue("phone-c").status)
+        assertTrue(model.nodeMap.getValue("phone-c").discoveredOnly)
         assertTrue(model.nodeMap.getValue("desktop-b").detailLines.any { it.contains("networkId：net-1") })
         assertTrue(model.nodeMap.getValue("desktop-b").detailLines.any { it.startsWith("允许内容：") })
 

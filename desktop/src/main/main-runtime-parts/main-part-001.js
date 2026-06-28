@@ -11,6 +11,7 @@ let pairedDesktopPeers = new Map()
 let activeDesktopPeerConnections = new Map()
 let desktopPeerHostAttempts = new Map()
 let desktopPeerReconnectTimer = null
+let pendingTotpResyncPeerIds = new Set()
 let discoverySocket = null
 let lanJoinServer = null
 let localNotifyServer = null

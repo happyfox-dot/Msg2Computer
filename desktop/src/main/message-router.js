@@ -62,7 +62,7 @@ function canPushContentToNode(target, type, codeTypes = {}) {
   }
   if (type === codeTypes.FILE_TRANSFER || type === 'file_transfer') return policy.allowFileTransfer
   if (type === codeTypes.EXTERNAL_EVENT || type === 'external_event') return policy.allowExternalEvents
-  if (type === 'totp' || type === 'totp_sync' || type === 'totp_seed' || type === 'totp_revoke') {
+  if (type === 'totp' || type === 'totp_sync' || type === 'totp_seed' || type === 'totp_revoke' || type === 'totp_resync_request') {
     return policy.allowTotp
   }
   return true

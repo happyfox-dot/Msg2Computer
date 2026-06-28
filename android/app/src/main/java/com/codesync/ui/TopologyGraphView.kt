@@ -31,6 +31,7 @@ class TopologyGraphView @JvmOverloads constructor(
         val name: String,
         val type: String,
         val status: String,
+        val discoveredOnly: Boolean = false,
         val local: Boolean = false,
         // 第二行说明文字（地址 / 路由信息），为空时回退为「类型 · 状态」
         val meta: String = ""
@@ -213,12 +214,12 @@ class TopologyGraphView @JvmOverloads constructor(
             .groupBy { node ->
                 when {
                     node.local -> 0
-                    node.status == "discovered" -> fallbackLayer
+                    node.discoveredOnly -> fallbackLayer
                     else -> distance[node.id] ?: fallbackLayer
                 }
             }
             .mapValues { (_, layerNodes) ->
-                layerNodes.sortedWith(compareBy<Node> { statusRank(it.status) }.thenBy { it.name.lowercase() })
+                layerNodes.sortedWith(compareBy<Node> { statusRank(it) }.thenBy { it.name.lowercase() })
             }
     }
 
@@ -288,30 +289,31 @@ class TopologyGraphView @JvmOverloads constructor(
     private fun statusColor(node: Node): Int = when (node.status) {
         "online" -> COLOR_ACTIVE
         "reachable" -> Color.rgb(96, 165, 250)
-        "known" -> Color.rgb(224, 176, 96)
+        "known" -> if (node.discoveredOnly) COLOR_META else Color.rgb(224, 176, 96)
+        "revoked" -> Color.rgb(180, 84, 84)
         "synced" -> COLOR_TOTP
-        "discovered" -> COLOR_META
         else -> COLOR_IDLE
     }
 
-    private fun statusText(status: String): String = when (status) {
-        "online" -> "在线直连"
-        "reachable" -> "近期可达"
-        "known" -> "已知离线"
-        "enabled" -> "已启用"
-        "disabled" -> "已禁用"
-        "synced" -> "已同步"
-        "discovered" -> "仅发现"
+    private fun statusText(node: Node): String = when {
+        node.status == "known" && node.discoveredOnly -> "仅发现未授权"
+        node.status == "online" -> "在线直连"
+        node.status == "reachable" -> "近期可达"
+        node.status == "known" -> "已知节点"
+        node.status == "revoked" -> "已撤销"
+        node.status == "enabled" -> "已启用"
+        node.status == "disabled" -> "已禁用"
+        node.status == "synced" -> "已同步"
         else -> "离线"
     }
 
-    private fun statusRank(status: String): Int = when (status) {
-        "online" -> 0
-        "reachable" -> 1
-        "known" -> 2
-        "synced" -> 3
-        "discovered" -> 4
-        "disabled" -> 5
+    private fun statusRank(node: Node): Int = when {
+        node.status == "online" -> 0
+        node.status == "reachable" -> 1
+        node.status == "known" && !node.discoveredOnly -> 2
+        node.status == "synced" -> 3
+        node.status == "known" && node.discoveredOnly -> 4
+        node.status == "disabled" || node.status == "revoked" -> 5
         else -> 6
     }
 
@@ -338,7 +340,7 @@ class TopologyGraphView @JvmOverloads constructor(
             canvas.drawText(ellipsize(title, 13), rect.left + dp(10f), rect.top + dp(21f), textPaint)
 
             val meta = node.meta.ifBlank {
-                "${if (node.type.uppercase().contains("PHONE")) "手机" else "电脑"} · ${statusText(node.status)}"
+                "${if (node.type.uppercase().contains("PHONE")) "手机" else "电脑"} · ${statusText(node)}"
             }
             metaPaint.color = if (node.status == "online" || node.status == "reachable") accent else COLOR_META
             canvas.drawText(ellipsize(meta, 18), rect.left + dp(10f), rect.top + dp(40f), metaPaint)

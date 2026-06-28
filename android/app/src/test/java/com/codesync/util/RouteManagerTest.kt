@@ -1,12 +1,41 @@
 package com.codesync.util
 
+import android.content.Context
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.After
+import org.junit.Before
 import org.junit.Test
 
 class RouteManagerTest {
+    private lateinit var context: InMemoryContext
+
+    @Before
+    fun setUp() {
+        context = InMemoryContext()
+        SecurePrefs.setTestProviderForTests { ctx, name ->
+            ctx.getSharedPreferences(name, Context.MODE_PRIVATE)
+        }
+        context.getSharedPreferences("phone_identity", Context.MODE_PRIVATE)
+            .edit()
+            .putString("phone_id", "phone-a")
+            .putString("phone_name", "Phone A")
+            .putString("pairing_key", "phone-key")
+            .apply()
+        context.getSharedPreferences("lan_trust", Context.MODE_PRIVATE)
+            .edit()
+            .putString("network_id", "net-1")
+            .apply()
+    }
+
+    @After
+    fun tearDown() {
+        SecurePrefs.setTestProviderForTests(null)
+    }
+
     @Test
     fun computesSpfNextHopFromLsdbLinks() {
         val nodes = JSONArray()
@@ -57,6 +86,90 @@ class RouteManagerTest {
         assertTrue(routes.none { it.destinationId == "phone-d" })
     }
 
+    @Test
+    fun snapshotForDeviceDistinguishesOnlineReachableAndKnown() {
+        val now = 1_000_000L
+        val online = trustedDevice(connectionUpdatedAt = now - 1_000L)
+        val reachable = trustedDevice(
+            id = "node-c",
+            host = "192.0.2.30",
+            lastSyncAt = now - 20_000L
+        )
+        val known = trustedDevice(
+            id = "node-d",
+            host = "192.0.2.40",
+            lastSyncAt = now - 10 * 60 * 1000L
+        )
+
+        assertEquals(
+            "online",
+            RouteManager.snapshotForDevice(online, connectedDeviceIds = setOf("node-b"), now = now).status
+        )
+        assertEquals(
+            "reachable",
+            RouteManager.snapshotForDevice(reachable, connectedDeviceIds = emptySet(), now = now).status
+        )
+        val knownSnapshot = RouteManager.snapshotForDevice(known, connectedDeviceIds = emptySet(), now = now)
+        assertEquals("known", knownSnapshot.status)
+        assertFalse(knownSnapshot.sendable)
+    }
+
+    @Test
+    fun targetsForTypeCanExposeUnavailableNodesForUiButNotForSenders() {
+        SettingsStore.setSendAllSmsEnabled(context, true)
+        DeviceStore.upsertDevice(
+            context = context,
+            host = "192.0.2.10",
+            port = 19529,
+            pairingKey = "desktop-key",
+            name = "Desktop B",
+            deviceId = "desktop-b",
+            deviceType = "WINDOWS_DESKTOP",
+            networkId = "net-1",
+            policyAllowSmsCodes = true
+        )
+        DeviceStore.upsertDevice(
+            context = context,
+            host = "192.0.2.20",
+            port = 19529,
+            pairingKey = "desktop-key-2",
+            name = "Desktop C",
+            deviceId = "desktop-c",
+            deviceType = "WINDOWS_DESKTOP",
+            networkId = "net-1",
+            policyAllowSmsCodes = false
+        )
+        DeviceStore.markDeviceSynced(context, "desktop-b", System.currentTimeMillis())
+        DeviceStore.setDeviceEnabled(context, "desktop-c", false)
+
+        val senderTargets = RouteManager.targetsForType(
+            context = context,
+            type = "sms",
+            connectedDeviceIds = emptySet()
+        )
+        val uiTargets = RouteManager.targetsForType(
+            context = context,
+            type = "sms",
+            connectedDeviceIds = emptySet(),
+            includeDisallowed = true,
+            includeUnavailable = true,
+            reachableOnly = false
+        )
+
+        assertEquals(listOf("desktop-b"), senderTargets.map { it.device.id })
+        assertTrue(uiTargets.any { it.device.id == "desktop-b" && it.status == "reachable" && it.allowed })
+        assertTrue(uiTargets.any { it.device.id == "desktop-c" && it.status == "disabled" && !it.allowed })
+    }
+
+    @Test
+    fun discoverySnapshotUsesKnownStatusWithDiscoveryMarker() {
+        val snapshot = RouteManager.snapshotForDiscoveryNode(hasAddress = true, now = 1_000L)
+
+        assertEquals("known", snapshot.status)
+        assertTrue(snapshot.discoveredOnly)
+        assertFalse(snapshot.sendable)
+    }
+
     private fun node(
         id: String,
         name: String,
@@ -89,4 +202,28 @@ class RouteManagerTest {
             .put("routable", routable)
             .put("active", active)
             .put("updatedAt", 1_000L)
+
+    private fun trustedDevice(
+        id: String = "node-b",
+        host: String = "192.0.2.10",
+        lastSyncAt: Long = 0L,
+        connectionUpdatedAt: Long = 0L
+    ): DesktopDevice =
+        DesktopDevice(
+            id = id,
+            name = id,
+            type = "WINDOWS_DESKTOP",
+            host = host,
+            port = 19529,
+            pairingKey = "pair-key",
+            enabled = true,
+            lastSyncAt = lastSyncAt,
+            connectionUpdatedAt = connectionUpdatedAt,
+            updatedAt = 0L,
+            routeMetric = 0,
+            routeNextHopId = "",
+            routeNextHopName = "",
+            routePath = emptyList(),
+            routeUpdatedAt = 0L
+        )
 }

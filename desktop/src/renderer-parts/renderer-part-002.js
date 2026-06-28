@@ -61,7 +61,8 @@ function mergeTopologyViewNode(nodeMap, node) {
     type: node.type || 'ANDROID_PHONE',
     role: node.role || 'remote',
     status: node.status || 'offline',
-    statusLabel: node.statusLabel || getTopologyStatusLabel(node.status || 'offline'),
+    discoveredOnly: node.discoveredOnly === true,
+    statusLabel: node.statusLabel || getTopologyStatusLabel(node),
     authority: node.authority || '',
     enabled: node.enabled,
     revoked: node.revoked,
@@ -81,9 +82,12 @@ function mergeTopologyViewNode(nodeMap, node) {
     nodeMap.set(normalized.id, normalized)
     return
   }
-  const preferredStatus = getTopologyStatusRank(existing.status) >= getTopologyStatusRank(normalized.status)
-    ? existing.status
-    : normalized.status
+  const existingRank = getTopologyStatusRank(existing)
+  const normalizedRank = getTopologyStatusRank(normalized)
+  const preferredStatus = existingRank >= normalizedRank ? existing.status : normalized.status
+  const preferredDiscoveredOnly = existingRank >= normalizedRank
+    ? existing.discoveredOnly === true
+    : normalized.discoveredOnly === true
   nodeMap.set(normalized.id, {
     ...existing,
     ...normalized,
@@ -91,7 +95,11 @@ function mergeTopologyViewNode(nodeMap, node) {
     type: normalized.type || existing.type,
     role: existing.role === 'local_desktop' ? existing.role : normalized.role,
     status: preferredStatus,
-    statusLabel: getTopologyStatusLabel(preferredStatus),
+    discoveredOnly: preferredDiscoveredOnly,
+    statusLabel: getTopologyStatusLabel({
+      status: preferredStatus,
+      discoveredOnly: preferredDiscoveredOnly
+    }),
     lastSeen: Math.max(existing.lastSeen || 0, normalized.lastSeen || 0),
     lastIP: normalized.lastIP || existing.lastIP || '',
     routeMetric: normalized.routeMetric || existing.routeMetric || 0,
@@ -315,37 +323,42 @@ function isPhoneNode(node) {
 }
 
 function sortTopologyNodes(a, b) {
-  return getTopologyStatusSortRank(b.status) - getTopologyStatusSortRank(a.status) ||
+  return getTopologyStatusSortRank(b) - getTopologyStatusSortRank(a) ||
     String(a.name || '').localeCompare(String(b.name || ''), 'zh-CN')
 }
 
-function getTopologyStatusSortRank(status) {
+function getTopologyStatusSortRank(nodeOrStatus) {
+  const status = typeof nodeOrStatus === 'string' ? nodeOrStatus : nodeOrStatus?.status
+  const discoveredOnly = typeof nodeOrStatus === 'object' && nodeOrStatus?.discoveredOnly === true
   return ({
     online: 5,
     reachable: 4,
-    known: 3,
+    known: discoveredOnly ? 2 : 3,
     synced: 2,
-    discovered: 2,
     offline: 1,
     disabled: 0,
     revoked: -1
   }[status] || 0)
 }
 
-function getTopologyStatusRank(status) {
+function getTopologyStatusRank(nodeOrStatus) {
+  const status = typeof nodeOrStatus === 'string' ? nodeOrStatus : nodeOrStatus?.status
+  const discoveredOnly = typeof nodeOrStatus === 'object' && nodeOrStatus?.discoveredOnly === true
   return ({
     revoked: 7,
     disabled: 6,
     online: 5,
     reachable: 4,
-    known: 3,
+    known: discoveredOnly ? 2 : 3,
     synced: 2,
-    discovered: 2,
     offline: 1
   }[status] || 0)
 }
 
-function getTopologyStatusLabel(status) {
+function getTopologyStatusLabel(nodeOrStatus) {
+  const status = typeof nodeOrStatus === 'string' ? nodeOrStatus : nodeOrStatus?.status
+  const discoveredOnly = typeof nodeOrStatus === 'object' && nodeOrStatus?.discoveredOnly === true
+  if (status === 'known' && discoveredOnly) return '仅发现'
   return {
     online: '在线',
     reachable: '近期可达',
@@ -353,7 +366,6 @@ function getTopologyStatusLabel(status) {
     offline: '离线',
     disabled: '已禁用',
     revoked: '已撤销',
-    discovered: '已发现',
     synced: '已同步'
   }[status] || '未知'
 }
@@ -362,10 +374,10 @@ function getTopologyNodeStatusLabel(node) {
   if (!node) return '未知'
   if (node.status === 'online') return '在线'
   if (node.status === 'reachable') return node.lastSeen ? `近期可达 · 上次同步 ${formatRelativeTime(node.lastSeen)}` : '近期可达'
+  if (node.status === 'known' && node.discoveredOnly === true) return '已发现 · 未配对'
   if (node.status === 'known') return node.lastSeen ? `已知节点 · 上次同步 ${formatRelativeTime(node.lastSeen)}` : '已知节点 · 当前未验证'
   if (node.status === 'disabled') return '已禁用'
   if (node.status === 'revoked') return '已撤销'
-  if (node.status === 'discovered') return '已发现 · 未配对'
   if (node.status === 'synced') return node.lastSeen ? `已同步 ${formatRelativeTime(node.lastSeen)}` : '已同步'
   if (node.lastSeen) return `上次同步 ${formatRelativeTime(node.lastSeen)}`
   return '等待首次同步'

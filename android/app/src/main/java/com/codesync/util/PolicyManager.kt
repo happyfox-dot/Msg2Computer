@@ -9,7 +9,7 @@ object PolicyManager {
             "sms" -> device.allowSmsCodes
             "sms_message" -> device.allowSmsMessages
             "app_notification" -> device.allowNotifications
-            "totp", "totp_seed", "totp_revoke" -> device.allowTotp
+            "totp", "totp_seed", "totp_revoke", "totp_resync_request" -> device.allowTotp
             "clipboard", "clipboard_text" ->
                 SettingsStore.isSyncClipboardEnabled(context)
             "clipboard_image" ->
@@ -45,6 +45,7 @@ object PolicyManager {
         isUserMessageType(type) ||
             normalizeType(type) == "totp_seed" ||
             normalizeType(type) == "totp_revoke" ||
+            normalizeType(type) == "totp_resync_request" ||
             isTopologyType(type)
 
     fun isUserMessageType(type: String): Boolean {
@@ -73,7 +74,7 @@ object PolicyManager {
             "sms" -> device.allowSmsCodes
             "sms_message" -> device.allowSmsMessages
             "app_notification" -> device.allowNotifications
-            "totp", "totp_seed", "totp_revoke" -> device.allowTotp
+            "totp", "totp_seed", "totp_revoke", "totp_resync_request" -> device.allowTotp
             "clipboard", "clipboard_text" -> device.allowClipboard
             "clipboard_image" -> device.allowClipboardImage || device.allowClipboard
             "clipboard_file" -> device.allowClipboardFile || device.allowFileTransfer

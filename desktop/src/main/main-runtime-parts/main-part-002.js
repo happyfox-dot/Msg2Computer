@@ -1433,26 +1433,23 @@ function resolveExternalEventTargetIds(event) {
   const identity = getDesktopIdentity()
   const explicitIds = event.target.deviceIds.filter(id => id && id !== identity.id)
   if (event.target.mode === 'devices' || explicitIds.length > 0) {
-    return Array.from(new Set(explicitIds)).filter(id => {
-      const target = resolveForwardTarget(id)
-      return target && canPushExternalEventToNode(target.node, event.channel)
+    const allowedTargets = getTargetSelectionsForType(CODE_TYPES.APP_NOTIFICATION, {
+      requestedIds: explicitIds,
+      permissionLabel: '通知推送权限未开启',
+      allowNode: node => canPushExternalEventToNode(node, event.channel)
     })
+      .filter(target => target.selected)
+      .map(target => target.id)
+    return Array.from(new Set(allowedTargets))
   }
   if (event.target.mode === 'local') return []
 
-  const ids = []
-  for (const phone of authorizedPhones.values()) {
-    if (phone.id === identity.id) continue
-    if (phone.enabled === false || phone.revoked === true) continue
-    if (!phone.pairingKey || !(phone.lastIP || phone.host)) continue
-    if (canPushExternalEventToNode(phone, event.channel)) ids.push(phone.id)
-  }
-  for (const peer of pairedDesktopPeers.values()) {
-    if (peer.id === identity.id) continue
-    if (peer.enabled === false || !peer.pairingKey) continue
-    if (canPushExternalEventToNode(peer, event.channel)) ids.push(peer.id)
-  }
-  return Array.from(new Set(ids))
+  return getTargetSelectionsForType(CODE_TYPES.APP_NOTIFICATION, {
+    permissionLabel: '通知推送权限未开启',
+    allowNode: node => canPushExternalEventToNode(node, event.channel)
+  })
+    .filter(target => target.id !== identity.id && target.selected)
+    .map(target => target.id)
 }
 
 function showExternalEventLocally(event, bodyText) {

@@ -56,99 +56,120 @@ object TopologyStore {
             .filter { it.isNotBlank() }
             .distinct()
         var networkChanged = false
+        var pendingNetworkAdoptionTarget = ""
+        var pendingNetworkAdoptionMergeFrom: List<String> = emptyList()
         if (networkId.isNotBlank() && networkId != currentNetworkId) {
             val targetNetworkId = mergeToNetworkId.trim().ifBlank { networkId }
             val canImportForeign = allowNetworkMerge && targetNetworkId == currentNetworkId
             val canMigrate = delta.optBoolean("networkMerge", false) && requestedMergeFrom.contains(currentNetworkId)
             if (!canImportForeign && !canMigrate) return false
             if (canMigrate && targetNetworkId != currentNetworkId) {
-                LanTrustStore.adoptNetworkId(
-                    context = context,
-                    networkId = targetNetworkId,
-                    allowMerge = true,
-                    mergeFromNetworkIds = requestedMergeFrom
-                )
+                pendingNetworkAdoptionTarget = targetNetworkId
+                pendingNetworkAdoptionMergeFrom = requestedMergeFrom
                 networkChanged = true
             }
             delta = rewriteDeltaNetwork(delta, targetNetworkId, requestedMergeFrom)
         } else if (networkId.isNotBlank() && delta.optBoolean("networkMerge", false) && requestedMergeFrom.isNotEmpty()) {
-            LanTrustStore.adoptNetworkId(
-                context = context,
-                networkId = networkId,
-                allowMerge = true,
-                mergeFromNetworkIds = requestedMergeFrom
-            )
+            pendingNetworkAdoptionTarget = networkId
+            pendingNetworkAdoptionMergeFrom = requestedMergeFrom
             delta = rewriteDeltaNetwork(delta, networkId, requestedMergeFrom)
             networkChanged = true
         }
         val seq = delta.optLong("seq", 0L)
         val shouldTrackSeq = sourceId.isNotBlank() && sourceId != identity.id && seq > 0L
+        val seen = if (shouldTrackSeq) loadSeenSeq(context) else null
         if (sourceId.isNotBlank() && sourceId != identity.id && seq > 0L) {
-            val seen = loadSeenSeq(context)
-            val lastSeq = seen.optLong(sourceId, 0L)
+            val lastSeq = seen?.optLong(sourceId, 0L) ?: 0L
             if (seq <= lastSeq) return false
-            seen.put(sourceId, seq)
-            saveSeenSeq(context, seen)
         }
 
-        var storageChanged = networkChanged
-        var semanticChanged = networkChanged
-        val nodes = loadArray(context, KEY_NODES)
-        val links = loadArray(context, KEY_LINKS)
-        val nodesById = toObjectMap(nodes, "id")
-        val linksById = toObjectMap(links, "id")
+        return try {
+            var storageChanged = networkChanged
+            var semanticChanged = networkChanged
+            val nodes = loadArray(context, KEY_NODES)
+            val links = loadArray(context, KEY_LINKS)
+            val nodesById = toObjectMap(nodes, "id")
+            val linksById = toObjectMap(links, "id")
 
-        val incomingNodes = delta.optJSONArray("nodes") ?: JSONArray()
-        for (i in 0 until incomingNodes.length()) {
-            val node = normalizeNode(incomingNodes.optJSONObject(i) ?: continue) ?: continue
-            if (node.optString("id") == identity.id) continue
-            val nodeId = node.optString("id")
-            val existing = nodesById[nodeId]
-            val candidate = mergeTopologyObject(existing, node)
-            val missingTrustedDevice = DeviceStore.findDevice(context, nodeId) == null &&
-                candidate.optString("pairingKey").isNotBlank() &&
-                candidate.optBoolean("routable", true) &&
-                candidate.optBoolean("enabled", true) &&
-                !candidate.optBoolean("revoked", false)
-            if (isSemanticUpdate(candidate, existing)) {
-                nodesById[nodeId] = candidate
-                upsertDeviceFromNode(context, candidate)
-                storageChanged = true
-                semanticChanged = true
-            } else if (missingTrustedDevice) {
-                nodesById[nodeId] = candidate
-                upsertDeviceFromNode(context, candidate)
-                storageChanged = true
-                semanticChanged = true
-            } else if (isVolatileRefresh(candidate, existing)) {
-                nodesById[nodeId] = refreshVolatileFields(existing, candidate)
-                storageChanged = true
+            val incomingNodes = delta.optJSONArray("nodes") ?: JSONArray()
+            for (i in 0 until incomingNodes.length()) {
+                val node = normalizeNode(incomingNodes.optJSONObject(i) ?: continue) ?: continue
+                if (node.optString("id") == identity.id) continue
+                val nodeId = node.optString("id")
+                val existing = nodesById[nodeId]
+                val candidate = mergeTopologyObject(existing, node)
+                val missingTrustedDevice = DeviceStore.findDevice(context, nodeId) == null &&
+                    candidate.optString("pairingKey").isNotBlank() &&
+                    candidate.optBoolean("routable", true) &&
+                    candidate.optBoolean("enabled", true) &&
+                    !candidate.optBoolean("revoked", false)
+                if (isSemanticUpdate(candidate, existing)) {
+                    nodesById[nodeId] = candidate
+                    upsertDeviceFromNode(context, candidate)
+                    storageChanged = true
+                    semanticChanged = true
+                } else if (missingTrustedDevice) {
+                    nodesById[nodeId] = candidate
+                    upsertDeviceFromNode(context, candidate)
+                    storageChanged = true
+                    semanticChanged = true
+                } else if (isVolatileRefresh(candidate, existing)) {
+                    nodesById[nodeId] = refreshVolatileFields(existing, candidate)
+                    storageChanged = true
+                }
             }
-        }
 
-        val incomingLinks = delta.optJSONArray("links") ?: JSONArray()
-        for (i in 0 until incomingLinks.length()) {
-            val link = normalizeLink(incomingLinks.optJSONObject(i) ?: continue) ?: continue
-            val existing = linksById[link.optString("id")]
-            val candidate = mergeTopologyObject(existing, link)
-            if (isSemanticUpdate(candidate, existing)) {
-                linksById[link.optString("id")] = candidate
-                storageChanged = true
-                semanticChanged = true
-            } else if (isVolatileRefresh(candidate, existing)) {
-                linksById[link.optString("id")] = refreshVolatileFields(existing, candidate)
-                storageChanged = true
+            val incomingLinks = delta.optJSONArray("links") ?: JSONArray()
+            for (i in 0 until incomingLinks.length()) {
+                val link = normalizeLink(incomingLinks.optJSONObject(i) ?: continue) ?: continue
+                val existing = linksById[link.optString("id")]
+                val candidate = mergeTopologyObject(existing, link)
+                if (isSemanticUpdate(candidate, existing)) {
+                    linksById[link.optString("id")] = candidate
+                    storageChanged = true
+                    semanticChanged = true
+                } else if (isVolatileRefresh(candidate, existing)) {
+                    linksById[link.optString("id")] = refreshVolatileFields(existing, candidate)
+                    storageChanged = true
+                }
             }
-        }
 
-        if (storageChanged) {
-            saveArray(context, KEY_NODES, JSONArray(nodesById.values))
-            saveArray(context, KEY_LINKS, JSONArray(linksById.values))
+            if (storageChanged) {
+                saveArray(context, KEY_NODES, JSONArray(nodesById.values))
+                saveArray(context, KEY_LINKS, JSONArray(linksById.values))
+            }
+            if (networkChanged && pendingNetworkAdoptionTarget.isNotBlank()) {
+                LanTrustStore.adoptNetworkId(
+                    context = context,
+                    networkId = pendingNetworkAdoptionTarget,
+                    allowMerge = true,
+                    mergeFromNetworkIds = pendingNetworkAdoptionMergeFrom
+                )
+            }
+            if (shouldTrackSeq && seen != null) {
+                seen.put(sourceId, seq)
+                saveSeenSeq(context, seen)
+            }
+            if (shouldTrackSeq && semanticChanged) {
+                rememberDelta(context, delta)
+            }
+            semanticChanged
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to apply topology delta", e)
+            if (networkChanged &&
+                pendingNetworkAdoptionTarget.isNotBlank() &&
+                pendingNetworkAdoptionTarget != currentNetworkId
+            ) {
+                runCatching {
+                    LanTrustStore.rollbackNetworkIdAdoption(
+                        context = context,
+                        previousNetworkId = currentNetworkId,
+                        adoptedNetworkId = pendingNetworkAdoptionTarget
+                    )
+                }
+            }
+            false
         }
-        if (shouldTrackSeq && semanticChanged) {
-            rememberDelta(context, delta)
-        }
-        return semanticChanged
     }
 
     fun buildDelta(

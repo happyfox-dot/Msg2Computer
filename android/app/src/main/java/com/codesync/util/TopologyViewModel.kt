@@ -14,6 +14,7 @@ object TopologyViewModel {
         val name: String,
         val type: String,
         val status: String,
+        val discoveredOnly: Boolean = false,
         val local: Boolean = false,
         val meta: String = "",
         val detailLines: List<String> = emptyList(),
@@ -102,11 +103,16 @@ object TopologyViewModel {
             .filter { it.id.isNotBlank() && it.id != identity.id && it.id !in pairedIds }
             .distinctBy { it.id }
         discovered.forEach { peer ->
+            val discoverySnapshot = RouteManager.snapshotForDiscoveryNode(
+                hasAddress = peer.host.isNotBlank(),
+                now = now
+            )
             nodes[peer.id] = Node(
                 id = peer.id,
                 name = peer.name.ifBlank { peer.id },
                 type = peer.type.ifBlank { "UNKNOWN_DEVICE" },
-                status = "discovered",
+                status = discoverySnapshot.status,
+                discoveredOnly = true,
                 meta = "${peer.host}:${peer.port} · 未确认",
                 lastSeen = now,
                 detailLines = listOf(
@@ -234,16 +240,15 @@ object TopologyViewModel {
         val type = raw.optString("type", raw.optString("deviceType", "UNKNOWN_DEVICE"))
         val name = raw.optString("name", raw.optString("deviceName", id)).ifBlank { id }
         val local = id == localId
-        val status = when {
-            local -> "online"
-            device != null -> RouteManager.statusForDevice(device, route, connectedDeviceIds, now)
-            raw.optBoolean("revoked", false) -> "offline"
-            !raw.optBoolean("enabled", true) -> "disabled"
-            id in connectedDeviceIds || raw.optBoolean("connected", false) -> "online"
-            route != null && isRecent(route.updatedAt, now) -> "reachable"
-            hasRoutableAddress(raw) || raw.optBoolean("routable", false) -> "known"
-            else -> raw.optString("status").ifBlank { "offline" }
-        }
+        val snapshot = RouteManager.snapshotForNode(
+            raw = raw,
+            device = device,
+            route = route,
+            connectedDeviceIds = connectedDeviceIds,
+            now = now,
+            localNodeId = localId
+        )
+        val status = if (local) "online" else snapshot.status
         val networkId = raw.optString("networkId", device?.networkId.orEmpty())
         val trustSourceId = raw.optString("trustSourceId", device?.trustSourceId.orEmpty())
         val trustLevel = raw.optString("trustLevel", device?.trustLevel.orEmpty())
@@ -256,7 +261,7 @@ object TopologyViewModel {
         ).maxOrNull() ?: 0L
         val meta = buildList {
             add(deviceTypeLabel(type))
-            add(statusLabel(status))
+            add(statusLabel(status, snapshot.discoveredOnly))
             route?.let {
                 if (it.hopCount > 1) add("经 ${it.nextHopName.ifBlank { it.nextHopId }}")
                 if (it.metric > 0) add("m=${it.metric}")
@@ -270,6 +275,7 @@ object TopologyViewModel {
             name = name,
             type = type,
             status = status,
+            discoveredOnly = snapshot.discoveredOnly,
             local = local,
             meta = meta,
             networkId = networkId,
@@ -297,7 +303,7 @@ object TopologyViewModel {
         return buildList {
             add("设备：${raw.optString("name", device?.name.orEmpty()).ifBlank { device?.name ?: raw.optString("id") }}")
             add("类型：${raw.optString("type", device?.type ?: "UNKNOWN_DEVICE")}")
-            add("状态：${statusLabel(status)}")
+            add("状态：${statusLabel(status, false)}")
             if (host.isNotBlank()) add("地址：$host${if (port > 0) ":$port" else ""}")
             val altHosts = device?.altHosts?.takeIf { it.isNotEmpty() } ?: jsonArrayToList(raw.optJSONArray("altHosts"))
             if (altHosts.isNotEmpty()) add("备用地址：${altHosts.joinToString("、")}")
@@ -333,15 +339,6 @@ object TopologyViewModel {
         return (0 until array.length()).mapNotNull { array.optString(it).takeIf { value -> value.isNotBlank() } }
     }
 
-    private fun hasRoutableAddress(raw: JSONObject): Boolean =
-        raw.optString("host").isNotBlank() ||
-            raw.optString("tsHost").isNotBlank() ||
-            raw.optString("relayHost").isNotBlank() ||
-            jsonArrayToList(raw.optJSONArray("altHosts")).isNotEmpty()
-
-    private fun isRecent(timestamp: Long, now: Long): Boolean =
-        timestamp > 0L && now - timestamp <= RouteManager.RECENT_REACHABLE_MS
-
     private fun graphKind(type: String): String = when (type) {
         "relay_route" -> "relay"
         "spf_route", "routing_adjacency", "desktop_pair" -> "route"
@@ -362,25 +359,21 @@ object TopologyViewModel {
     private fun deviceTypeLabel(type: String): String =
         if (type.uppercase(Locale.ROOT).contains("PHONE")) "手机" else if (type.uppercase(Locale.ROOT).contains("DESKTOP")) "电脑" else "节点"
 
-    fun statusLabel(status: String): String = when (status) {
-        "online" -> "在线直连"
-        "reachable" -> "近期可达"
-        "known" -> "已知离线"
-        "enabled" -> "已启用"
-        "disabled" -> "已禁用"
-        "synced" -> "已同步"
-        "discovered" -> "仅发现"
-        else -> "离线"
-    }
+    fun statusLabel(status: String, discoveredOnly: Boolean = false): String =
+        when {
+            status == "known" && discoveredOnly -> "仅发现未授权"
+            status == "synced" -> "已同步"
+            else -> RouteManager.statusLabel(status)
+        }
 
     private fun nodeRank(node: Node): Int = when {
         node.local -> 0
         node.status == "online" -> 1
         node.status == "reachable" -> 2
+        node.status == "known" && node.discoveredOnly -> 4
         node.status == "known" -> 3
         node.status == "synced" -> 4
-        node.status == "discovered" -> 5
-        node.status == "disabled" -> 6
+        node.status == "disabled" || node.status == "revoked" -> 6
         else -> 7
     }
 

@@ -153,15 +153,16 @@ function applyTopologyDeltaPayload(rawPayload, options = {}) {
   const currentNetworkId = ensureTrustedNetworkId()
   const mergeFromNetworkIds = normalizeNetworkMergeIds(normalizedDelta.mergeFromNetworkIds || [])
   let networkMerged = false
+  let pendingNetworkMerge = null
   if (deltaNetworkId && deltaNetworkId !== currentNetworkId) {
     const canMerge = normalizedDelta.networkMerge === true && mergeFromNetworkIds.includes(currentNetworkId)
     if (!canMerge) return false
-    mergeTrustedNetworkId(deltaNetworkId, mergeFromNetworkIds)
+    pendingNetworkMerge = { targetNetworkId: deltaNetworkId, mergeFromNetworkIds }
     normalizedDelta = rewriteTopologyDeltaNetwork(normalizedDelta, deltaNetworkId, mergeFromNetworkIds)
     networkMerged = true
   } else if (deltaNetworkId) {
     if (normalizedDelta.networkMerge === true && mergeFromNetworkIds.length > 0) {
-      mergeTrustedNetworkId(deltaNetworkId, mergeFromNetworkIds)
+      pendingNetworkMerge = { targetNetworkId: deltaNetworkId, mergeFromNetworkIds }
       networkMerged = true
     }
     normalizedDelta = rewriteTopologyDeltaNetwork(normalizedDelta, deltaNetworkId, mergeFromNetworkIds)
@@ -171,7 +172,6 @@ function applyTopologyDeltaPayload(rawPayload, options = {}) {
   if (sourceId && sourceId !== identity.id && seq > 0) {
     const lastSeq = topologyLsdb.seenSeq.get(sourceId) || 0
     if (seq <= lastSeq) return false
-    topologyLsdb.seenSeq.set(sourceId, seq)
     acceptedNewSeq = true
   }
 
@@ -237,6 +237,12 @@ function applyTopologyDeltaPayload(rawPayload, options = {}) {
   }
 
   if (changed || acceptedNewSeq) {
+    if (pendingNetworkMerge) {
+      mergeTrustedNetworkId(pendingNetworkMerge.targetNetworkId, pendingNetworkMerge.mergeFromNetworkIds)
+    }
+    if (acceptedNewSeq) {
+      topologyLsdb.seenSeq.set(sourceId, seq)
+    }
     if (changed && acceptedNewSeq) {
       rememberTopologyDelta(normalizedDelta)
     }
@@ -1291,10 +1297,10 @@ function markDesktopPeerTotpSeedSynced(peerId, timestamp = Date.now()) {
   savePairingKey()
 }
 
-function sendLocalTotpSeedsToPhone(ws, sessionKey, phoneId) {
+function sendLocalTotpSeedsToPhone(ws, sessionKey, phoneId, options = {}) {
   const phone = authorizedPhones.get(phoneId)
   if (!canPushContentToNode(phone, 'totp')) return
-  const cutoff = getTotpSyncCutoff(phone)
+  const cutoff = options.force === true ? 0 : getTotpSyncCutoff(phone)
   const localSeeds = Array.from(totpSeeds.values())
     .filter(seed => seed.phoneId === LOCAL_TOTP_SOURCE_ID && seed.secret)
     .filter(seed => (Number(seed.updatedAt || seed.createdAt || 0) || 0) > cutoff)
@@ -1340,8 +1346,11 @@ function sendTotpDeleteTombstonesToPhone(ws, sessionKey, phoneId, cutoff = 0) {
 /** 向允许接收 TOTP 的手机节点发布一条 TOTP 同步消息（用于本机即时新增/删除）。 */
 function broadcastTotpSyncToPhones(seed, action = 'add') {
   if (!seed) return
-  const targets = Array.from(authorizedPhones.values())
-    .filter(phone => canPushContentToNode(phone, 'totp'))
+  const targets = getTargetSelectionsForType(CODE_TYPES.TOTP, {
+    permissionLabel: 'TOTP 同步权限未开启'
+  })
+    .filter(target => target.kind === 'phone' && target.selected)
+    .map(target => target.node)
   if (targets.length === 0) return
   publishTotpChangeToTargets(seed, action, targets).then(result => {
     const timestamp = Number(seed.updatedAt || seed.deletedAt || Date.now()) || Date.now()
@@ -1355,8 +1364,11 @@ function broadcastTotpSyncToPhones(seed, action = 'add') {
 
 function broadcastTotpSyncToDesktopPeers(seed, action = 'add') {
   if (!seed) return
-  const targets = Array.from(pairedDesktopPeers.values())
-    .filter(peer => canPushContentToNode(peer, 'totp'))
+  const targets = getTargetSelectionsForType(CODE_TYPES.TOTP, {
+    permissionLabel: 'TOTP 同步权限未开启'
+  })
+    .filter(target => target.kind === 'desktop' && target.selected)
+    .map(target => target.node)
   if (targets.length === 0) return
   publishTotpChangeToTargets(seed, action, targets).then(result => {
     const timestamp = Number(seed.updatedAt || seed.deletedAt || Date.now()) || Date.now()
@@ -1602,31 +1614,24 @@ function pollClipboardImageForSync() {
 }
 
 function getDefaultClipboardImageTargetIds() {
-  const ids = []
-  for (const phone of getAuthorizedPhones()) {
-    if (phone.enabled === false || phone.revoked === true) continue
-    if (!hasKnownDeliveryPath(phone)) continue
-    if (canPushContentToNode(phone, CODE_TYPES.CLIPBOARD_IMAGE)) ids.push(phone.id)
-  }
-  for (const peer of getPairedDesktopPeers()) {
-    if (peer.enabled === false || !hasKnownDeliveryPath(peer)) continue
-    if (canPushContentToNode(peer, CODE_TYPES.CLIPBOARD_IMAGE)) ids.push(peer.id)
-  }
-  return Array.from(new Set(ids))
+  return getTargetSelectionsForType(CODE_TYPES.CLIPBOARD_IMAGE, {
+    permissionLabel: '剪贴板图片权限未开启'
+  })
+    .filter(target => target.selected)
+    .map(target => target.id)
 }
 
 function getDefaultClipboardTextTargetIds() {
-  const ids = []
-  for (const phone of getAuthorizedPhones()) {
-    if (phone.enabled === false || phone.revoked === true) continue
-    if (!hasKnownDeliveryPath(phone)) continue
-    if (canPushContentToNode(phone, CODE_TYPES.CLIPBOARD_TEXT)) ids.push(phone.id)
-  }
-  for (const peer of getPairedDesktopPeers()) {
-    if (peer.enabled === false || !hasKnownDeliveryPath(peer)) continue
-    ids.push(peer.id)
-  }
-  return Array.from(new Set(ids))
+  return getTargetSelectionsForType(CODE_TYPES.CLIPBOARD_TEXT, {
+    allowNode: node => {
+      const type = String(node.deviceType || node.type || '').toUpperCase()
+      if (type.includes('DESKTOP')) return true
+      return canPushContentToNode(node, CODE_TYPES.CLIPBOARD_TEXT)
+    },
+    permissionLabel: '剪贴板文本权限未开启'
+  })
+    .filter(target => target.selected)
+    .map(target => target.id)
 }
 
 async function offerClipboardTextAsFile(text, clipTs, shortHash, options = {}) {

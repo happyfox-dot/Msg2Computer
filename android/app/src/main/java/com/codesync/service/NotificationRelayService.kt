@@ -129,10 +129,10 @@ class NotificationRelayService : NotificationListenerService() {
 
     override fun onNotificationRemoved(sbn: StatusBarNotification?) {
         sbn ?: return
-        if (!SettingsStore.isSendNotificationsEnabled(this)) return
         if (sbn.packageName == packageName) return
         if (!sbn.isOngoing) return
-        if (!SettingsStore.isNotificationPackageAllowed(this, sbn.packageName, ongoing = true)) return
+        // 移除事件也要同步出去：若通知展示后用户才关闭了总开关或 ongoing 规则，
+        // 这里再按策略拦截会导致桌面端状态卡和 ongoing 气泡去重键永远残留。
 
         val notification = sbn.notification
         val title = notification?.let {
