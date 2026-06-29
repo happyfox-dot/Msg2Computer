@@ -301,7 +301,12 @@ class MainActivity : AppCompatActivity() {
 
     private fun maybeAutoSyncClipboard() {
         if (!SettingsStore.isSyncClipboardEnabled(this)) return
-        if (RouteManager.targetsForType(this, "clipboard_text").isEmpty()) return
+        if (RouteManager.targetsForType(
+                context = this,
+                type = "clipboard_text",
+                reachableOnly = WebSocketService.requiresLiveDeliveryTarget("clipboard_text")
+            ).isEmpty()
+        ) return
         val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
         val text = clipboard.primaryClip?.takeIf { it.itemCount > 0 }
             ?.getItemAt(0)?.coerceToText(this)?.toString()?.trim().orEmpty()
@@ -813,7 +818,12 @@ class MainActivity : AppCompatActivity() {
             sendClipboardFiles(fileUris)
             return
         }
-        if (RouteManager.targetsForType(this, "clipboard_text").isEmpty()) {
+        if (RouteManager.targetsForType(
+                context = this,
+                type = "clipboard_text",
+                reachableOnly = WebSocketService.requiresLiveDeliveryTarget("clipboard_text")
+            ).isEmpty()
+        ) {
             Toast.makeText(this, R.string.clipboard_no_target, Toast.LENGTH_SHORT).show()
             return
         }
@@ -844,7 +854,12 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, "图片剪贴板同步未开启", Toast.LENGTH_SHORT).show()
             return
         }
-        if (RouteManager.targetsForType(this, "clipboard_image").isEmpty()) {
+        if (RouteManager.targetsForType(
+                context = this,
+                type = "clipboard_image",
+                reachableOnly = WebSocketService.requiresLiveDeliveryTarget("clipboard_image")
+            ).isEmpty()
+        ) {
             Toast.makeText(this, "没有启用图片剪贴板的推送目标", Toast.LENGTH_SHORT).show()
             return
         }
@@ -891,7 +906,12 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, R.string.file_transfer_disabled, Toast.LENGTH_SHORT).show()
             return
         }
-        if (RouteManager.targetsForType(this, "clipboard_file").isEmpty()) {
+        if (RouteManager.targetsForType(
+                context = this,
+                type = "clipboard_file",
+                reachableOnly = WebSocketService.requiresLiveDeliveryTarget("clipboard_file")
+            ).isEmpty()
+        ) {
             Toast.makeText(this, R.string.file_no_target, Toast.LENGTH_SHORT).show()
             return
         }
@@ -1012,7 +1032,11 @@ class MainActivity : AppCompatActivity() {
      * 用于配对后验证整条推送链路是否通畅。
      */
     private fun showTestPushDialog() {
-        val targets = RouteManager.targetsForType(this, "sms").map { it.device }
+        val targets = RouteManager.targetsForType(
+            context = this,
+            type = "sms",
+            reachableOnly = WebSocketService.requiresLiveDeliveryTarget("sms")
+        ).map { it.device }
         val targetCount = targets.size
         if (targetCount == 0) {
             Toast.makeText(this, getString(R.string.test_push_no_target), Toast.LENGTH_SHORT).show()

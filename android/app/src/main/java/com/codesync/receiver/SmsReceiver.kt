@@ -44,7 +44,11 @@ class SmsReceiver : BroadcastReceiver() {
         val enabledDevices = if (contentType.isBlank()) {
             emptyList()
         } else {
-            RouteManager.targetsForType(context, contentType).map { it.device }
+            RouteManager.targetsForType(
+                context = context,
+                type = contentType,
+                reachableOnly = WebSocketService.requiresLiveDeliveryTarget(contentType)
+            ).map { it.device }
         }
         // 只记录决策结果与目标数量，不记录设备名/IP/端口（拓扑信息也属敏感面）
         Log.d(

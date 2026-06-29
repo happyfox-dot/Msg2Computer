@@ -63,7 +63,11 @@ class NotificationRelayService : NotificationListenerService() {
             return
         }
 
-        val targets = RouteManager.targetsForType(this, "app_notification").map { it.device }
+        val targets = RouteManager.targetsForType(
+            context = this,
+            type = "app_notification",
+            reachableOnly = WebSocketService.requiresLiveDeliveryTarget("app_notification")
+        ).map { it.device }
         if (targets.isEmpty()) {
             Log.d(TAG, "notification received but no app_notification targets, package=${sbn.packageName}")
             WebSocketService.reportExternalStatus(this, "收到 App 通知，但没有启用 App 通知的推送目标")

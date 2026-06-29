@@ -129,6 +129,8 @@ class WebSocketService : Service() {
         private const val SMS_RELAY_TTL = 4
         private const val NOTIFICATION_UPDATE_MIN_INTERVAL_MS = 1_000L
         private const val TOPOLOGY_GOSSIP_MIN_INTERVAL_MS = 5_000L
+        fun requiresLiveDeliveryTarget(type: String): Boolean =
+            type == "file_transfer" || type == "clipboard_file"
         // 各来源桌面已接受的最大 LSDB 序列号（key=桌面设备 ID），用于丢弃乱序旧路由表
         private const val LSDB_SEQ_PREFS = "topology_lsdb_seq"
         private val lastTopologyGossipBroadcastAt = AtomicLong(0L)
@@ -477,12 +479,19 @@ class WebSocketService : Service() {
             ?.filter { it.isNotBlank() }
             ?.toSet()
             .orEmpty()
-        val targetDevices = RouteManager.targetsForType(
+        val requiresLiveTarget = requiresLiveDeliveryTarget(payloadType)
+        val targetOptions = RouteManager.targetsForType(
             context = this,
             type = payloadType,
             connectedDeviceIds = connectedDeviceIds,
-            requestedTargetIds = requestedTargetIds
-        ).filter { it.reachable }.map { it.device }
+            requestedTargetIds = requestedTargetIds,
+            reachableOnly = requiresLiveTarget
+        )
+        val targetDevices = (if (requiresLiveTarget) {
+            targetOptions.filter { it.reachable }
+        } else {
+            targetOptions
+        }).map { it.device }
         if (targetDevices.isEmpty()) {
             stopIfNothingPending("没有允许接收文件的推送目标")
             return
@@ -1676,21 +1685,20 @@ class WebSocketService : Service() {
     }
 
     private fun targetDevicesForType(type: String, requestedTargetIds: Set<String> = emptySet()): List<DesktopDevice> {
+        val requiresLiveTarget = requiresLiveDeliveryTarget(type)
         val options = RouteManager.targetsForType(
             context = this,
             type = type,
             connectedDeviceIds = connectedDeviceIds,
-            requestedTargetIds = requestedTargetIds
+            requestedTargetIds = requestedTargetIds,
+            reachableOnly = requiresLiveTarget
         )
-        return if (requiresLiveDeliveryTarget(type)) {
+        return if (requiresLiveTarget) {
             options.filter { it.reachable }.map { it.device }
         } else {
             options.map { it.device }
         }
     }
-
-    private fun requiresLiveDeliveryTarget(type: String): Boolean =
-        type == "file_transfer" || type == "clipboard_file"
 
     private fun selectRelayNextTargets(
         payloadType: String,

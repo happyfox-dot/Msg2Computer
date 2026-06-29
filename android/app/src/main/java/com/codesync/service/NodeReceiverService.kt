@@ -1878,7 +1878,8 @@ class NodeReceiverService : Service() {
         val targets = RouteManager.targetsForType(
             context = this,
             type = "clipboard_text",
-            respectLocalSendSettings = false
+            respectLocalSendSettings = false,
+            reachableOnly = WebSocketService.requiresLiveDeliveryTarget("clipboard_text")
         )
             .map { it.device.id }
         if (targets.isEmpty()) return
@@ -1889,7 +1890,8 @@ class NodeReceiverService : Service() {
         val targets = RouteManager.targetsForType(
             context = this,
             type = "clipboard_image",
-            respectLocalSendSettings = false
+            respectLocalSendSettings = false,
+            reachableOnly = WebSocketService.requiresLiveDeliveryTarget("clipboard_image")
         )
             .map { it.device.id }
         if (targets.isEmpty()) return
@@ -1900,7 +1902,8 @@ class NodeReceiverService : Service() {
         val targets = RouteManager.targetsForType(
             context = this,
             type = "clipboard_file",
-            respectLocalSendSettings = false
+            respectLocalSendSettings = false,
+            reachableOnly = WebSocketService.requiresLiveDeliveryTarget("clipboard_file")
         )
             .map { it.device.id }
         if (targets.isEmpty()) return

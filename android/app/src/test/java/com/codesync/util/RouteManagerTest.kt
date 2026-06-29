@@ -1,6 +1,7 @@
 package com.codesync.util
 
 import android.content.Context
+import com.codesync.service.WebSocketService
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
@@ -159,6 +160,112 @@ class RouteManagerTest {
         assertEquals(listOf("desktop-b"), senderTargets.map { it.device.id })
         assertTrue(uiTargets.any { it.device.id == "desktop-b" && it.status == "reachable" && it.allowed })
         assertTrue(uiTargets.any { it.device.id == "desktop-c" && it.status == "disabled" && !it.allowed })
+    }
+
+    @Test
+    fun deferredMessagesCanTargetKnownTrustedNodes() {
+        DeviceStore.upsertDevice(
+            context = context,
+            host = "192.0.2.50",
+            port = 19529,
+            pairingKey = "desktop-key",
+            name = "Desktop Known",
+            deviceId = "desktop-known",
+            deviceType = "WINDOWS_DESKTOP",
+            networkId = "net-1",
+            policyAllowSmsCodes = true
+        )
+
+        val targets = RouteManager.targetsForType(
+            context = context,
+            type = "sms",
+            connectedDeviceIds = emptySet(),
+            reachableOnly = false
+        )
+
+        assertEquals(listOf("desktop-known"), targets.map { it.device.id })
+        assertEquals("known", targets.single().status)
+        assertTrue(targets.single().allowed)
+    }
+
+    @Test
+    fun phoneToDesktopSyncSimulationAllowsDeferredInfoButKeepsFilesLiveOnly() {
+        SettingsStore.setSyncClipboardEnabled(context, true)
+        SettingsStore.setSyncClipboardImageEnabled(context, true)
+        SettingsStore.setSyncClipboardFileEnabled(context, true)
+
+        DeviceStore.upsertDevice(
+            context = context,
+            host = "192.0.2.60",
+            port = 19529,
+            pairingKey = "desktop-key",
+            name = "Desktop Sync Target",
+            deviceId = "desktop-sync",
+            deviceType = "WINDOWS_DESKTOP",
+            networkId = "net-1",
+            policyAllowSmsCodes = true,
+            policyAllowSmsMessages = true,
+            policyAllowNotifications = true,
+            policyAllowTotp = true,
+            policyAllowClipboard = true,
+            policyAllowClipboardImage = true,
+            policyAllowClipboardFile = true,
+            policyAllowFileTransfer = true
+        )
+        DeviceStore.markDeviceSynced(
+            context = context,
+            id = "desktop-sync",
+            timestamp = System.currentTimeMillis() - RouteManager.RECENT_REACHABLE_MS - 10_000L
+        )
+
+        val deferredTypes = listOf(
+            "sms",
+            "sms_message",
+            "app_notification",
+            "clipboard_text",
+            "clipboard_image",
+            "totp_seed"
+        )
+        deferredTypes.forEach { type ->
+            val targets = RouteManager.targetsForType(
+                context = context,
+                type = type,
+                connectedDeviceIds = emptySet(),
+                reachableOnly = WebSocketService.requiresLiveDeliveryTarget(type)
+            )
+
+            assertEquals(
+                "$type should still target known trusted desktop nodes",
+                listOf("desktop-sync"),
+                targets.map { it.device.id }
+            )
+            assertEquals("known", targets.single().status)
+            assertFalse(targets.single().reachable)
+            assertTrue(targets.single().allowed)
+        }
+
+        val liveOnlyTypes = listOf("file_transfer", "clipboard_file")
+        liveOnlyTypes.forEach { type ->
+            val offlineTargets = RouteManager.targetsForType(
+                context = context,
+                type = type,
+                connectedDeviceIds = emptySet(),
+                reachableOnly = WebSocketService.requiresLiveDeliveryTarget(type)
+            )
+
+            assertTrue("$type should wait until the desktop node is reachable", offlineTargets.isEmpty())
+
+            val onlineTargets = RouteManager.targetsForType(
+                context = context,
+                type = type,
+                connectedDeviceIds = setOf("desktop-sync"),
+                reachableOnly = WebSocketService.requiresLiveDeliveryTarget(type)
+            )
+
+            assertEquals(listOf("desktop-sync"), onlineTargets.map { it.device.id })
+            assertEquals("online", onlineTargets.single().status)
+            assertTrue(onlineTargets.single().reachable)
+        }
     }
 
     @Test

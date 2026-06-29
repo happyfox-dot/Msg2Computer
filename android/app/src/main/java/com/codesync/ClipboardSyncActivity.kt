@@ -39,7 +39,12 @@ class ClipboardSyncActivity : AppCompatActivity() {
             Toast.makeText(this, R.string.clipboard_sync_disabled, Toast.LENGTH_SHORT).show()
             return
         }
-        if (RouteManager.targetsForType(this, "clipboard_text").isEmpty()) {
+        if (RouteManager.targetsForType(
+                context = this,
+                type = "clipboard_text",
+                reachableOnly = WebSocketService.requiresLiveDeliveryTarget("clipboard_text")
+            ).isEmpty()
+        ) {
             Toast.makeText(this, R.string.clipboard_no_target, Toast.LENGTH_SHORT).show()
             return
         }
