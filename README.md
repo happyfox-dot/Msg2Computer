@@ -4,7 +4,7 @@ CodeBridge 是一个**去中心化的跨设备验证码与消息同步工具**�
 
 核心理念：**不依赖任何云端服务器**，让多台手机、多台电脑之间安全、可控地共享临时验证码和 2FA 信息。设备之间通过局域网、可选的 Tailscale 地址和受信节点中继建立同步拓扑，所有业务消息仅在用户授权的节点之间流转，并全程加密。
 
-> 当前版本：`1.0.46`
+> 当前版本：`1.0.48`
 
 ## 快速了解
 
@@ -125,7 +125,7 @@ CodeBridge 是一个**去中心化的跨设备验证码与消息同步工具**�
 - 旧版 `verify_code`、`codebridge_relay`、`topology_delta` 协议仍保留，作为旧节点兼容和直连失败时的兜底。
 - 首版不提供公网 DHT、STUN/TURN 或 NAT hole punching；跨网段建议使用 Tailscale。
 
-## 1.0.46 更新重点
+## 1.0.48 更新重点
 
 - 修复 SoftBus P2P 直连的密钥兼容解析，减少直连失败后只能走旧 relay 的情况。
 - 修复 `/bus/message` ACK 判定：`accepted=false` 不再被当作投递成功。
@@ -140,7 +140,7 @@ CodeBridge 是一个**去中心化的跨设备验证码与消息同步工具**�
 ### Windows 端
 
 1. 从 [Release 页面](https://github.com/happyfox-dot/Msg2Computer/releases) 下载最新安装包。
-   - Windows: `Msg2Computer-Setup-1.0.46.exe`
+   - Windows: `Msg2Computer-Setup-1.0.48.exe`
 2. 双击运行安装程序。
 3. 启动后进入「配对」页面。
 4. 确认 Windows 防火墙允许本应用在局域网监听。
@@ -149,7 +149,7 @@ CodeBridge 是一个**去中心化的跨设备验证码与消息同步工具**�
 ### Android 端
 
 1. 从 [Release 页面](https://github.com/happyfox-dot/Msg2Computer/releases) 下载最新 APK。
-   - 当前 APK 文件名：`Msg2Computer-Android-1.0.46.apk`
+   - 当前 APK 文件名：`Msg2Computer-Android-1.0.48.apk`
 2. 授权短信、通知、相机、前台服务等权限。
 3. 如需推送 App 通知，进入系统「通知使用权」页面授权 CodeBridge。
 4. 扫描 Windows 端二维码，或在局域网发现设备列表中加入节点。
