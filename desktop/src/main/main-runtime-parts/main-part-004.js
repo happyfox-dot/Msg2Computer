@@ -767,6 +767,7 @@ function normalizeTotpPushTargets(targets) {
 function buildTotpSeedPushData(seed, targets = []) {
   const identity = getDesktopIdentity()
   const targetDevices = normalizeTotpPushTargets(targets)
+  const source = getTotpSeedPushSource(seed)
   return {
     type: 'totp_seed',
     id: seed.id,
@@ -777,17 +778,20 @@ function buildTotpSeedPushData(seed, targets = []) {
     algorithm: seed.algorithm,
     digits: seed.digits,
     period: seed.period,
-    phoneId: identity.id,
-    phoneName: identity.name,
-    sourceDeviceId: identity.id,
-    sourceDeviceName: identity.name,
-    sourceDeviceType: identity.type,
+    phoneId: source.phoneId,
+    phoneName: source.phoneName,
+    sourceDeviceId: source.sourceDeviceId,
+    sourceDeviceName: source.sourceDeviceName,
+    sourceDeviceType: source.sourceDeviceType,
     targetDevices,
     targetDeviceIds: targetDevices.map(target => target.id),
-    pushAuthority: 'local_desktop',
+    pushAuthority: source.pushAuthority,
     pushAuthorityDeviceId: identity.id,
     originDeviceId: identity.id,
     originDeviceName: identity.name,
+    relaySourceDeviceId: identity.id,
+    relaySourceDeviceName: identity.name,
+    relaySourceDeviceType: identity.type,
     relayPath: [identity.id],
     relayTtl: USER_MESSAGE_RELAY_TTL,
     relayPolicy: 'source_selected_targets',
@@ -849,7 +853,7 @@ function sendLocalTotpSeedsToDesktopPeer(ws, sessionKey, peer, options = {}) {
   if (!peer) return
   if (!canPushContentToNode(peer, 'totp')) return
   const cutoff = options.force === true ? 0 : getTotpSyncCutoff(peer)
-  const localSeeds = getLocalTotpSeeds()
+  const localSeeds = getTotpSeedsForSync(options)
     .filter(seed => (Number(seed.updatedAt || seed.createdAt || 0) || 0) > cutoff)
   const deliveries = localSeeds.map(seed =>
     publishTotpChangeToTargets(seed, 'add', [peer]).catch(error => {
@@ -969,6 +973,10 @@ function connectDesktopPeer(peer, options = {}) {
   ws.on('message', (data) => {
     try {
       const message = JSON.parse(data.toString())
+      if (message.type === 'code_ack') {
+        resolveWsCodeAck(peer.id, message.msgId)
+        return
+      }
       if (message.type === 'auth_ok') {
         const sessionKey = message.keyMode === 'derived'
           ? deriveSessionKeyWithPairingKey(peer.pairingKey, phoneNonce, message.serverNonce)
@@ -1074,6 +1082,7 @@ function connectDesktopPeer(peer, options = {}) {
   })
 
   ws.on('close', () => {
+    failPendingWsAcksForPeer(peer.id)
     activeDesktopPeerConnections.delete(peer.id)
     const latest = pairedDesktopPeers.get(peer.id)
     if (latest) {
@@ -1838,6 +1847,10 @@ function startWebSocketServer() {
     ws.on('message', (data) => {
       try {
         const message = JSON.parse(data.toString())
+        if (message.type === 'code_ack') {
+          resolveWsCodeAck(connectionPhoneId, message.msgId)
+          return
+        }
 
         if (message.type === 'auth') {
           const phoneId = normalizePhoneId(message.phoneId, clientIP)

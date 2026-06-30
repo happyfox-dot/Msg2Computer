@@ -555,6 +555,107 @@ async function sendBusEnvelopeDirect(target, envelope, route = {}) {
   return false
 }
 
+function wsAckKey(peerId, msgId) {
+  const id = String(peerId || '').trim()
+  const messageId = String(msgId || '').trim()
+  return id && messageId ? `${id}|${messageId}` : ''
+}
+
+function settleWsAck(peerId, msgId, ok) {
+  const key = wsAckKey(peerId, msgId)
+  if (!key) return false
+  const pending = pendingWsAcks.get(key)
+  if (!pending) return false
+  clearTimeout(pending.timer)
+  pendingWsAcks.delete(key)
+  pending.resolve(ok === true)
+  return true
+}
+
+function waitForWsAck(peerId, msgId, timeoutMs = WS_BUS_ACK_TIMEOUT_MS) {
+  const key = wsAckKey(peerId, msgId)
+  if (!key) return Promise.resolve(false)
+  settleWsAck(peerId, msgId, false)
+  return new Promise(resolve => {
+    const timer = setTimeout(() => {
+      pendingWsAcks.delete(key)
+      resolve(false)
+    }, timeoutMs)
+    timer.unref?.()
+    pendingWsAcks.set(key, { timer, resolve })
+  })
+}
+
+function resolveWsCodeAck(peerId, msgId) {
+  return settleWsAck(peerId, msgId, true)
+}
+
+function failPendingWsAcksForPeer(peerId) {
+  const prefix = `${String(peerId || '').trim()}|`
+  if (!prefix.trim()) return
+  for (const [key, pending] of Array.from(pendingWsAcks.entries())) {
+    if (!key.startsWith(prefix)) continue
+    clearTimeout(pending.timer)
+    pendingWsAcks.delete(key)
+    pending.resolve(false)
+  }
+}
+
+function sendWsJson(ws, payload) {
+  return new Promise(resolve => {
+    try {
+      ws.send(payload, error => resolve(!error))
+    } catch (_) {
+      resolve(false)
+    }
+  })
+}
+
+async function sendWsMessageAndWaitAck(ws, peerId, message) {
+  const msgId = String(message?.msgId || '').trim()
+  if (!ws || ws.readyState !== WebSocket.OPEN || !msgId) return false
+  const ackPromise = waitForWsAck(peerId, msgId)
+  const sent = await sendWsJson(ws, JSON.stringify(message))
+  if (!sent) {
+    settleWsAck(peerId, msgId, false)
+    return false
+  }
+  return ackPromise
+}
+
+async function sendBusEnvelopeWsReliable(target, envelope) {
+  const targetId = String(target?.id || target?.phoneId || '').trim()
+  if (!targetId) return false
+  const outbound = activeDesktopPeerConnections.get(targetId)
+  if (outbound && outbound.readyState === WebSocket.OPEN && outbound.__codebridgeSessionKey) {
+    const encrypted = encryptMessage(JSON.stringify(envelope), outbound.__codebridgeSessionKey)
+    if (encrypted) {
+      const ok = await sendWsMessageAndWaitAck(outbound, targetId, {
+        type: 'bus_message',
+        msgId: envelope.messageId,
+        payload: encrypted
+      })
+      if (ok) return true
+    }
+  }
+  const inboundConnections = activePhoneConnections.get(targetId)
+  if (inboundConnections) {
+    for (const ws of inboundConnections) {
+      const sessionKey = phoneSessionKeys.get(ws)
+      if (!sessionKey || ws.readyState !== WebSocket.OPEN) continue
+      const encrypted = encryptMessage(JSON.stringify(envelope), sessionKey)
+      if (!encrypted) continue
+      const ok = await sendWsMessageAndWaitAck(ws, targetId, {
+        type: 'bus_message',
+        msgId: envelope.messageId,
+        payload: encrypted
+      })
+      if (ok) return true
+    }
+  }
+  return false
+}
+
 function sendBusEnvelopeWs(target, envelope) {
   const targetId = String(target?.id || target?.phoneId || '').trim()
   if (!targetId) return false
@@ -601,7 +702,8 @@ async function sendBusEnvelopeLegacyRelay(target, envelope, route = {}) {
   }
   const directOk = await sendBusEnvelopeDirect(deliveryTarget, envelope).catch(() => false)
   if (directOk) return true
-  return sendVerifyCodeToDesktopNode(deliveryTargetId, JSON.stringify(payload), envelope.messageId)
+  sendVerifyCodeToDesktopNode(deliveryTargetId, JSON.stringify(payload), envelope.messageId)
+  return false
 }
 
 function dispatchInboundBusEnvelope(envelope, lastHopDeviceId = '') {
@@ -825,7 +927,7 @@ function restorePhone(phoneId) {
 }
 
 function getStoredTotpSeeds() {
-  return Array.from(totpSeeds.values()).map(seed => ({
+  const readableSeeds = Array.from(totpSeeds.values()).map(seed => ({
     id: seed.id,
     label: seed.label,
     issuer: seed.issuer,
@@ -847,11 +949,17 @@ function getStoredTotpSeeds() {
     pinnedAt: seed.pinnedAt || 0,
     secret: protectSecret(seed.secret)
   }))
+  const readableIds = new Set(readableSeeds.map(seed => String(seed.id || '').trim()).filter(Boolean))
+  const preservedSeeds = unreadableTotpSeeds.filter(seed => {
+    const id = String(seed?.id || '').trim()
+    return seed && (!id || !readableIds.has(id))
+  })
+  return [...readableSeeds, ...preservedSeeds]
 }
 
 function getStoredTotpDeleteTombstones() {
   pruneTotpDeleteTombstones()
-  return totpDeleteTombstones.map(item => ({
+  const readableTombstones = totpDeleteTombstones.map(item => ({
     id: item.id,
     label: item.label,
     issuer: item.issuer,
@@ -870,6 +978,12 @@ function getStoredTotpDeleteTombstones() {
     updatedAt: item.updatedAt,
     secret: protectSecret(item.secret)
   }))
+  const readableIds = new Set(readableTombstones.map(item => String(item.id || '').trim()).filter(Boolean))
+  const preservedTombstones = unreadableTotpDeleteTombstones.filter(item => {
+    const id = String(item?.id || '').trim()
+    return item && (!id || !readableIds.has(id))
+  })
+  return [...readableTombstones, ...preservedTombstones]
 }
 
 function normalizeTotpDeleteTombstone(data) {
@@ -1277,6 +1391,54 @@ function buildTotpSyncPayload(seed, action = 'add') {
 }
 
 /** 节点可达时，把本机来源（desktop-local）的新增 TOTP 种子补推给该目标。 */
+// Explicit full sync can use trusted recovery sources; automatic incremental sync stays local-only.
+function isLocalDesktopTotpSeed(seed) {
+  return !!seed && (
+    seed.phoneId === LOCAL_TOTP_SOURCE_ID ||
+    seed.sourceDeviceId === LOCAL_TOTP_SOURCE_ID
+  )
+}
+
+function getTotpSeedsForSync(options = {}) {
+  const includeRecoverySources = options.force === true ||
+    options.includeRecoverySources === true ||
+    options.includeRemote === true
+  return Array.from(totpSeeds.values())
+    .filter(seed => seed && seed.secret)
+    .filter(seed => includeRecoverySources || isLocalDesktopTotpSeed(seed))
+}
+
+function getTotpSeedPushSource(seed) {
+  const identity = getDesktopIdentity()
+  const local = isLocalDesktopTotpSeed(seed)
+  const sourceDeviceId = local
+    ? identity.id
+    : String(seed?.sourceDeviceId || seed?.phoneId || '').trim() || identity.id
+  const sourceDeviceName = local
+    ? identity.name
+    : String(seed?.sourceDeviceName || seed?.phoneName || '').trim() || identity.name
+  const sourceDeviceType = local
+    ? identity.type
+    : String(seed?.sourceDeviceType || '').trim() || 'ANDROID_PHONE'
+  const seedPhoneId = String(seed?.phoneId || '').trim()
+  const phoneId = local
+    ? identity.id
+    : (seedPhoneId && seedPhoneId !== LOCAL_TOTP_SOURCE_ID ? seedPhoneId : sourceDeviceId)
+  const phoneName = local
+    ? identity.name
+    : String(seed?.phoneName || '').trim() || sourceDeviceName
+  return {
+    local,
+    phoneId,
+    phoneName,
+    sourceDeviceId,
+    sourceDeviceName,
+    sourceDeviceType,
+    pushAuthority: local ? 'local_desktop' : 'trusted_recovery_source'
+  }
+}
+
+// Automatic catch-up uses this cutoff for local-source changes.
 function getTotpSyncCutoff(node) {
   return Number(node?.lastTotpSeedSyncAt || 0) || 0
 }
@@ -1301,8 +1463,7 @@ function sendLocalTotpSeedsToPhone(ws, sessionKey, phoneId, options = {}) {
   const phone = authorizedPhones.get(phoneId)
   if (!canPushContentToNode(phone, 'totp')) return
   const cutoff = options.force === true ? 0 : getTotpSyncCutoff(phone)
-  const localSeeds = Array.from(totpSeeds.values())
-    .filter(seed => seed.phoneId === LOCAL_TOTP_SOURCE_ID && seed.secret)
+  const localSeeds = getTotpSeedsForSync(options)
     .filter(seed => (Number(seed.updatedAt || seed.createdAt || 0) || 0) > cutoff)
   if (localSeeds.length > 0) {
     console.log(`已向手机 ${phoneId} 下发 ${localSeeds.length} 个本机 TOTP 种子`)

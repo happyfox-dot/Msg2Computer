@@ -31,12 +31,15 @@ let topologyDeltaBacklog = []
 let contentBus = null
 let busReliabilityStore = null
 let busOutboxFlushTimer = null
+let pendingWsAcks = new Map()
 let routeHealthTracker = createRouteHealthTracker()
 let topologyBroadcastSuppressionDepth = 0
 // 每条活跃连接对应的会话密钥（ws -> sessionKey base64），用于反向加密下发 TOTP 种子同步
 let phoneSessionKeys = new WeakMap()
 let totpSeeds = new Map()
 let totpDeleteTombstones = []
+let unreadableTotpSeeds = []
+let unreadableTotpDeleteTombstones = []
 let fileTransferHistory = []
 let fileTransferDownloadDir = ''
 let desktopMessageSettings = {
@@ -115,6 +118,7 @@ const WS_HEARTBEAT_INTERVAL_MS = 30 * 1000
 // 桌面对端断线后的自动重连扫描周期：出站 WS 连接 close 后不会自行恢复，
 // 周期性补连已配对且未连接的对端（失败时按 desktopPeerHostAttempts 轮换候选地址）
 const DESKTOP_PEER_RECONNECT_INTERVAL_MS = 45 * 1000
+const WS_BUS_ACK_TIMEOUT_MS = 5 * 1000
 // LSDB 序列号（OSPF LSA seq 的简化版）：每次下发路由表自增，手机端按
 // 来源设备记录已接受的最大序列号，旧序列号的 topology_sync 直接丢弃。
 // 用 Date.now() 做初值保证进程重启后序列号仍然单调递增，无需落盘。
@@ -1781,7 +1785,7 @@ function getContentBus() {
     canPush: canPushTopicToNode,
     canReceive: topic => canReceiveBusTopic(topic),
     sendDirect: (target, envelope, route) => sendBusEnvelopeDirect(target, envelope, route),
-    sendWs: (target, envelope) => sendBusEnvelopeWs(target, envelope),
+    sendWs: (target, envelope) => sendBusEnvelopeWsReliable(target, envelope),
     sendRelay: (target, envelope, route) => sendBusEnvelopeLegacyRelay(target, envelope, route),
     onReceive: (envelope, context) => dispatchInboundBusEnvelope(envelope, context.lastHopDeviceId || ''),
     log: message => console.log(message),
@@ -1865,17 +1869,43 @@ function loadOrCreatePairingKey() {
           connected: false
         }
       ]).filter(([id, peer]) => !!id && !!peer.host && !!peer.pairingKey))
+      unreadableTotpSeeds = []
+      unreadableTotpDeleteTombstones = []
       totpSeeds = new Map((saved.totpSeeds || []).map(seed => {
+        const decryptedSecret = unprotectSecret(seed.secret)
         const normalized = normalizeTotpSeed({
           ...seed,
-          secret: unprotectSecret(seed.secret)
+          secret: decryptedSecret
         })
+        if (!normalized && seed && seed.secret) {
+          unreadableTotpSeeds.push(seed)
+        }
         return normalized ? [normalized.id, normalized] : null
       }).filter(Boolean))
-      totpDeleteTombstones = (saved.totpDeleteTombstones || []).map(item => normalizeTotpDeleteTombstone({
-        ...item,
-        secret: unprotectSecret(item.secret)
-      })).filter(Boolean)
+      totpDeleteTombstones = (saved.totpDeleteTombstones || []).map(item => {
+        const decryptedSecret = unprotectSecret(item.secret)
+        const normalized = normalizeTotpDeleteTombstone({
+          ...item,
+          secret: decryptedSecret
+        })
+        if (!normalized && item && item.secret) {
+          unreadableTotpDeleteTombstones.push(item)
+        }
+        return normalized
+      }).filter(Boolean)
+      if (unreadableTotpSeeds.length > 0 || unreadableTotpDeleteTombstones.length > 0) {
+        console.error(
+          'Some stored TOTP records could not be decrypted; preserving raw records to avoid data loss.',
+          {
+            seeds: unreadableTotpSeeds.length,
+            tombstones: unreadableTotpDeleteTombstones.length
+          }
+        )
+        showNotification(
+          'TOTP 数据暂时无法解密',
+          '已保留原始记录，避免更新时覆盖。请不要删除 pairing.json 备份。'
+        )
+      }
       const savedMessageSettings = { ...(saved.messageSettings || {}) }
       if (savedPolicyVersion < 4) {
         savedMessageSettings.syncClipboardImage = true
@@ -1910,6 +1940,7 @@ function loadOrCreatePairingKey() {
           }
           return
         }
+        throw new Error('pairing key could not be decrypted')
       }
     }
   } catch (e) {
@@ -1958,7 +1989,9 @@ function flushPairingConfigToDisk(options = {}) {
   if (options.sync === true) {
     pairingSaveDirty = false
     try {
-      writeJsonAtomicSync(getPairingConfigPath(), buildPairingConfigState())
+      const nextState = buildPairingConfigState()
+      backupPairingConfigBeforeTotpShrink(nextState)
+      writeJsonAtomicSync(getPairingConfigPath(), nextState)
     } catch (error) {
       console.error('Failed to save pairing config:', error)
     }
@@ -1979,10 +2012,29 @@ async function drainPairingConfigSaveQueue() {
   while (pairingSaveDirty) {
     pairingSaveDirty = false
     try {
-      await writeJsonAtomic(getPairingConfigPath(), buildPairingConfigState())
+      const nextState = buildPairingConfigState()
+      backupPairingConfigBeforeTotpShrink(nextState)
+      await writeJsonAtomic(getPairingConfigPath(), nextState)
     } catch (error) {
       console.error('Failed to save pairing config:', error)
     }
+  }
+}
+
+function backupPairingConfigBeforeTotpShrink(nextState) {
+  try {
+    const configPath = getPairingConfigPath()
+    if (!fs.existsSync(configPath)) return
+    const current = JSON.parse(fs.readFileSync(configPath, 'utf8'))
+    const currentCount = Array.isArray(current.totpSeeds) ? current.totpSeeds.length : 0
+    const nextCount = Array.isArray(nextState?.totpSeeds) ? nextState.totpSeeds.length : 0
+    if (currentCount > 0 && nextCount < currentCount) {
+      const backupPath = `${configPath}.backup-before-totp-shrink-${Date.now()}`
+      fs.copyFileSync(configPath, backupPath)
+      console.warn(`Backed up pairing config before TOTP shrink: ${backupPath}`)
+    }
+  } catch (error) {
+    console.error('Failed to create pairing TOTP shrink backup:', error)
   }
 }
 

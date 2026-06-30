@@ -58,12 +58,14 @@ import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.ServerSocket
 import java.net.Socket
+import java.net.SocketTimeoutException
 import java.net.URL
 import java.net.URLDecoder
 import java.net.URLEncoder
 import java.security.MessageDigest
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Semaphore
 import java.util.concurrent.atomic.AtomicInteger
 
 class NodeReceiverService : Service() {
@@ -77,6 +79,9 @@ class NodeReceiverService : Service() {
         private const val FILE_TRANSFER_TIMEOUT_MS = 20_000
         private const val FILE_TRANSFER_PARALLEL_PULLS = 4
         private const val FILE_TRANSFER_BLOCK_RETRIES = 3
+        private const val ACCEPT_TIMEOUT_MS = 1_000
+        private const val CLIENT_READ_TIMEOUT_MS = 10_000
+        private const val MAX_CONCURRENT_CLIENTS = 16
         private const val CLIPBOARD_TEMP_PREFS = "clipboard_temp_state"
         private const val CLIPBOARD_FILE_TEMP_DIR = "CodeBridgeClipboardFiles"
         private const val CLIPBOARD_IMAGE_TEMP_DIR = "clipboard_images"
@@ -99,6 +104,7 @@ class NodeReceiverService : Service() {
     @Volatile
     private var running = false
     private var serverSocket: ServerSocket? = null
+    private val clientSlots = Semaphore(MAX_CONCURRENT_CLIENTS)
     private var lanResponderJob: Job? = null
     private val incomingFileTransfers = ConcurrentHashMap.newKeySet<String>()
 
@@ -169,15 +175,32 @@ class NodeReceiverService : Service() {
     private fun listenLoop() {
         try {
             serverSocket = ServerSocket(LanDiscovery.NODE_RELAY_PORT)
+            serverSocket?.soTimeout = ACCEPT_TIMEOUT_MS
             Log.d(TAG, "Node receiver listening on ${LanDiscovery.NODE_RELAY_PORT}")
             while (running) {
-                val socket = serverSocket?.accept() ?: break
+                val socket = try {
+                    serverSocket?.accept() ?: break
+                } catch (_: SocketTimeoutException) {
+                    continue
+                }
+                if (!clientSlots.tryAcquire()) {
+                    socket.use { writeHttpResponse(it, 503) }
+                    continue
+                }
                 serviceScope.launch {
-                    handleClient(socket)
+                    try {
+                        handleClient(socket)
+                    } finally {
+                        clientSlots.release()
+                    }
                 }
             }
         } catch (e: Exception) {
             if (running) Log.e(TAG, "Node receiver failed", e)
+        } finally {
+            runCatching { serverSocket?.close() }
+            serverSocket = null
+            running = false
         }
     }
 
@@ -195,6 +218,7 @@ class NodeReceiverService : Service() {
     private suspend fun handleClient(socket: Socket) {
         socket.use {
             try {
+                socket.soTimeout = CLIENT_READ_TIMEOUT_MS
                 val request = readHttpRequest(socket)
                 if (request == null) {
                     writeHttpResponse(socket, 400)

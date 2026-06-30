@@ -47,6 +47,7 @@
     ws.on('close', () => {
       phoneSessionKeys.delete(ws)
       if (connectionPhoneId) {
+        failPendingWsAcksForPeer(connectionPhoneId)
         removeActivePhoneConnection(connectionPhoneId, ws)
       }
       if (mainWindow) {

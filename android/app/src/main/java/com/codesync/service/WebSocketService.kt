@@ -127,6 +127,7 @@ class WebSocketService : Service() {
         // 配对测试连接（无负载）鉴权成功后保持这么久再断开，给目标节点登记时间。
         private const val REGISTER_HOLD_MS = 1_500L
         private const val SMS_RELAY_TTL = 4
+        private const val MAX_PENDING_PAYLOADS = 300
         private const val NOTIFICATION_UPDATE_MIN_INTERVAL_MS = 1_000L
         private const val TOPOLOGY_GOSSIP_MIN_INTERVAL_MS = 5_000L
         fun requiresLiveDeliveryTarget(type: String): Boolean =
@@ -790,7 +791,7 @@ class WebSocketService : Service() {
             ?.toSet()
             .orEmpty()
         holdForwardLocks()
-        enqueueAllLocalTotpSeeds(requestedIds)
+        enqueueAllStoredTotpSeeds(requestedIds)
     }
 
     private fun handleRequestTotpResync(intent: Intent) {
@@ -1125,6 +1126,10 @@ class WebSocketService : Service() {
         algorithm: String,
         digits: Int,
         period: Int,
+        sourceDeviceId: String = "",
+        sourceDeviceName: String = "",
+        sourceDeviceType: String = "ANDROID_PHONE",
+        pushAuthority: String = "source_device",
         targetDeviceIds: Set<String> = emptySet(),
         suppressNoTargetStop: Boolean = false
     ): Int {
@@ -1138,6 +1143,15 @@ class WebSocketService : Service() {
         }
 
         val phoneIdentity = PhoneIdentityStore.get(this)
+        val effectiveSourceDeviceId = sourceDeviceId.ifBlank { phoneIdentity.id }
+        val effectiveSourceDeviceName = sourceDeviceName.ifBlank { phoneIdentity.name }
+        val effectiveSourceDeviceType = sourceDeviceType.ifBlank { "ANDROID_PHONE" }
+        val effectivePushAuthority = pushAuthority.ifBlank { "source_device" }
+        val effectivePushAuthorityDeviceId = if (effectivePushAuthority == "source_device") {
+            effectiveSourceDeviceId
+        } else {
+            phoneIdentity.id
+        }
         val targetTopology = buildTargetTopology(enabledDevices)
         val msgId = "m-${System.currentTimeMillis()}-${msgIdSeq.incrementAndGet()}"
         val relayMessageId = "relay-${phoneIdentity.id}-${System.currentTimeMillis()}-${msgIdSeq.incrementAndGet()}"
@@ -1151,17 +1165,20 @@ class WebSocketService : Service() {
             .put("digits", digits)
             .put("period", period)
             .put("timestamp", System.currentTimeMillis())
-            .put("phoneId", phoneIdentity.id)
-            .put("phoneName", phoneIdentity.name)
-            .put("sourceDeviceId", phoneIdentity.id)
-            .put("sourceDeviceName", phoneIdentity.name)
-            .put("sourceDeviceType", "ANDROID_PHONE")
+            .put("phoneId", effectiveSourceDeviceId)
+            .put("phoneName", effectiveSourceDeviceName)
+            .put("sourceDeviceId", effectiveSourceDeviceId)
+            .put("sourceDeviceName", effectiveSourceDeviceName)
+            .put("sourceDeviceType", effectiveSourceDeviceType)
             .put("targetDevices", targetTopology)
             .put("targetDeviceIds", JSONArray(enabledDevices.map { it.id }))
-            .put("pushAuthority", "source_device")
-            .put("pushAuthorityDeviceId", phoneIdentity.id)
+            .put("pushAuthority", effectivePushAuthority)
+            .put("pushAuthorityDeviceId", effectivePushAuthorityDeviceId)
             .put("originDeviceId", phoneIdentity.id)
             .put("originDeviceName", phoneIdentity.name)
+            .put("relaySourceDeviceId", phoneIdentity.id)
+            .put("relaySourceDeviceName", phoneIdentity.name)
+            .put("relaySourceDeviceType", "ANDROID_PHONE")
             .put("relayMessageId", relayMessageId)
             .put("relayPath", JSONArray().put(phoneIdentity.id))
             .put("relayTtl", SMS_RELAY_TTL)
@@ -1178,16 +1195,32 @@ class WebSocketService : Service() {
         return enabledDevices.size
     }
 
-    internal fun enqueueAllLocalTotpSeeds(targetDeviceIds: Set<String> = emptySet()) {
-        val entries = TotpStore.loadAll(this).filter { it.isLocal && it.secret.isNotBlank() }
+    internal fun enqueueAllStoredTotpSeeds(targetDeviceIds: Set<String> = emptySet()) {
+        val entries = TotpStore.loadAll(this).filter { it.secret.isNotBlank() }
         if (entries.isEmpty()) {
             releaseForwardLocks()
-            stopIfNothingPending("没有本机 TOTP 可同步")
+            stopIfNothingPending("没有可同步 TOTP")
             return
         }
 
+        val phoneIdentity = PhoneIdentityStore.get(this)
         var queuedTargets = 0
         entries.forEach { entry ->
+            val sourceDeviceId = if (entry.isLocal || entry.sourceDeviceId.isBlank()) {
+                phoneIdentity.id
+            } else {
+                entry.sourceDeviceId
+            }
+            val sourceDeviceName = if (entry.isLocal || entry.sourceDeviceName.isBlank()) {
+                phoneIdentity.name
+            } else {
+                entry.sourceDeviceName
+            }
+            val sourceDeviceType = if (entry.isLocal || entry.sourceDeviceType.isBlank()) {
+                "ANDROID_PHONE"
+            } else {
+                entry.sourceDeviceType
+            }
             queuedTargets += enqueueTotpSeed(
                 label = entry.label,
                 secret = entry.secret,
@@ -1196,6 +1229,10 @@ class WebSocketService : Service() {
                 algorithm = entry.algorithm,
                 digits = entry.digits,
                 period = entry.period,
+                sourceDeviceId = sourceDeviceId,
+                sourceDeviceName = sourceDeviceName,
+                sourceDeviceType = sourceDeviceType,
+                pushAuthority = if (entry.isLocal) "source_device" else "trusted_recovery_source",
                 targetDeviceIds = targetDeviceIds,
                 suppressNoTargetStop = true
             )
@@ -1205,7 +1242,9 @@ class WebSocketService : Service() {
             releaseForwardLocks()
             stopIfNothingPending("没有允许接收 TOTP 的目标节点")
         } else {
-            updateConnectionState("正在全量同步 ${entries.size} 个 TOTP")
+            val localCount = entries.count { it.isLocal }
+            val recoveryCount = entries.size - localCount
+            updateConnectionState("正在全量同步 ${entries.size} 个 TOTP（本机 $localCount，历史 $recoveryCount）")
         }
     }
 
@@ -1303,12 +1342,7 @@ class WebSocketService : Service() {
                     .toString()
                 pendingPayloads.add(PendingPayload(msgId, payload, targetIds.toMutableSet(), "totp_revoke"))
             }
-            while (pendingPayloads.size > 20) {
-                val lowPriorityIndex = pendingPayloads.indexOfFirst {
-                    it.type == "totp" || it.type == "totp_seed" || it.type == "totp_revoke"
-                }
-                pendingPayloads.removeAt(if (lowPriorityIndex >= 0) lowPriorityIndex else 0)
-            }
+            trimPendingPayloads()
         }
     }
 
@@ -1439,7 +1473,7 @@ class WebSocketService : Service() {
         val busEnvelope = buildBusinessBusEnvelope(payload, type)
         if (busEnvelope != null && deviceSupportsSoftBus(device)) {
             serviceScope.launch {
-                val deliveredByBus = deliverBusEnvelopeHttp(device, busEnvelope, rememberOutbound = false)
+                val deliveredByBus = deliverBusEnvelopeHttp(device, busEnvelope)
                 if (deliveredByBus) {
                     DeviceStore.markDeviceSynced(this@WebSocketService, device.id)
                     ackDelivery(device.id, msgId)
@@ -1476,9 +1510,9 @@ class WebSocketService : Service() {
     }
 
     private fun trimPendingPayloads() {
-        while (pendingPayloads.size > 20) {
+        while (pendingPayloads.size > MAX_PENDING_PAYLOADS) {
             val lowPriorityIndex = pendingPayloads.indexOfFirst {
-                it.type == "totp" || it.type == "totp_seed" || it.type == "totp_revoke"
+                it.type != "totp" && it.type != "totp_seed" && it.type != "totp_revoke"
             }
             pendingPayloads.removeAt(if (lowPriorityIndex >= 0) lowPriorityIndex else 0)
         }
@@ -1888,7 +1922,7 @@ class WebSocketService : Service() {
             if (requesterId.isBlank()) return
             holdForwardLocks()
             updateConnectionState("收到全量 TOTP 同步请求：${connection.device.name}")
-            enqueueAllLocalTotpSeeds(setOf(requesterId))
+            enqueueAllStoredTotpSeeds(setOf(requesterId))
         } catch (e: Exception) {
             Log.e(TAG, "totp_resync_request 解析失败", e)
         }
@@ -1960,16 +1994,30 @@ class WebSocketService : Service() {
 
     /** 收到 ACK：把该 msgId 对应负载里这台设备移除；负载无目标时整条删除。 */
     internal fun ackDelivery(deviceId: String, msgId: String) {
+        if (msgId.isNotBlank()) {
+            BusReliabilityStore.markDelivered(this, msgId, deviceId)
+        }
         synchronized(pendingPayloads) {
             val iterator = pendingPayloads.iterator()
             while (iterator.hasNext()) {
                 val pending = iterator.next()
                 if (pending.msgId == msgId || msgId.isBlank()) {
+                    markPendingBusDelivered(deviceId, pending)
                     pending.targetIds.remove(deviceId)
                     if (pending.targetIds.isEmpty()) iterator.remove()
                     if (msgId.isNotBlank()) break
                 }
             }
+        }
+    }
+
+    private fun markPendingBusDelivered(deviceId: String, pending: PendingPayload) {
+        if (isTopologyPayloadType(pending.type) || pending.type == "totp_resync_request") return
+        val busMessageId = runCatching {
+            ContentBus.envelopeFromLegacyPayload(this, JSONObject(pending.payload)).optString("messageId")
+        }.getOrDefault("")
+        if (busMessageId.isNotBlank() && busMessageId != pending.msgId) {
+            BusReliabilityStore.markDelivered(this, busMessageId, deviceId)
         }
     }
 

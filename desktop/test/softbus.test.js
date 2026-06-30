@@ -17,6 +17,7 @@ const {
 const {
   createBusReliabilityStore
 } = require('../src/main/bus-reliability')
+const { createContentBus } = require('../src/main/content-bus')
 
 test('legacy payload converts to bus envelope and back without losing routing fields', () => {
   const legacy = {
@@ -206,6 +207,44 @@ test('bus reliability store deduplicates inbound messages and retries pending ou
   assert.equal(store.size().outbox, 0)
   store.flushSave()
   assert.equal(saved.version, 1)
+})
+
+test('content bus waits for async websocket ack before marking delivered', async () => {
+  const delivered = []
+  const failed = []
+  let resolveWs
+  const bus = createContentBus({
+    getIdentity: () => ({ id: 'A', name: 'Node A', type: 'WINDOWS_DESKTOP' }),
+    getNetworkId: () => 'net-1',
+    getTargetNode: targetId => ({ id: targetId, name: 'Node B', pairingKey: 'key' }),
+    getTopologyRoutes: () => [],
+    hasActiveWs: () => true,
+    canPush: () => true,
+    canReceive: () => true,
+    sendWs: () => new Promise(resolve => { resolveWs = resolve }),
+    reliabilityStore: {
+      rememberInbound: () => true,
+      rememberOutbound: () => {},
+      markDelivered: (messageId, targetNodeId) => delivered.push({ messageId, targetNodeId }),
+      markFailed: (messageId, targetNodeId, reason) => failed.push({ messageId, targetNodeId, reason }),
+      dueRecords: () => []
+    }
+  })
+
+  const publish = bus.publish(busEnvelope.TOPICS.CLIPBOARD_TEXT, {
+    type: 'clipboard_text',
+    text: 'hello'
+  }, { targetNodeIds: ['B'] })
+  await new Promise(resolve => setImmediate(resolve))
+
+  assert.equal(delivered.length, 0)
+  assert.equal(failed.length, 0)
+  resolveWs(true)
+
+  const result = await publish
+  assert.equal(result.delivered, 1)
+  assert.equal(delivered.length, 1)
+  assert.equal(delivered[0].targetNodeId, 'B')
 })
 
 test('relay HTTP client treats rejected bus ack as delivery failure', async () => {

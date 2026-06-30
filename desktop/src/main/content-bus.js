@@ -56,7 +56,7 @@ function createContentBus(deps = {}) {
       if (route.transportType === 'lan_direct' || route.transportType === 'tailscale_direct') {
         ok = await sendDirect(target, envelope, route)
       } else if (route.transportType === 'legacy_ws') {
-        ok = sendWs(target, envelope, route)
+        ok = await Promise.resolve(sendWs(target, envelope, route))
       } else {
         ok = await sendRelay(target, envelope, route)
       }
