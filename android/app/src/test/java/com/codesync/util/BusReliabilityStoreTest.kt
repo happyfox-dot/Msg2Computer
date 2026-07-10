@@ -48,4 +48,39 @@ class BusReliabilityStoreTest {
             pool.shutdownNow()
         }
     }
+
+    @Test
+    fun maintenanceScanPrunesExpiredVerificationCodeOutboxRecords() {
+        val context = InMemoryContext()
+        val preferences = context.getSharedPreferences("bus_reliability", 0)
+        SecurePrefs.setTestProviderForTests { _, _ -> preferences }
+        try {
+            val envelope = JSONObject()
+                .put("busVersion", 1)
+                .put("messageId", "expired-code")
+                .put("networkId", "net-a")
+                .put("topic", ContentBus.Topic.SMS_CODE)
+                .put("expiresAt", 1L)
+                .put("payload", JSONObject().put("type", "sms").put("expiresAt", 1L))
+            val record = JSONObject()
+                .put("messageId", "expired-code")
+                .put("targetNodeId", "desktop-a")
+                .put("status", "pending")
+                .put("createdAt", 1L)
+                .put("updatedAt", 1L)
+                .put("nextAttemptAt", 0L)
+                .put("envelope", envelope)
+            preferences.edit()
+                .putString("outbox", JSONObject().put("expired-code|desktop-a", record).toString())
+                .commit()
+
+            assertTrue(BusReliabilityStore.dueOutbound(context).isEmpty())
+            assertEquals(0, JSONObject(preferences.getString("outbox", "{}")!!).length())
+
+            BusReliabilityStore.rememberOutbound(context, envelope, "desktop-a")
+            assertTrue(BusReliabilityStore.dueOutbound(context).isEmpty())
+        } finally {
+            SecurePrefs.setTestProviderForTests(null)
+        }
+    }
 }

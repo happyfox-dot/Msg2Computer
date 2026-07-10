@@ -2,16 +2,18 @@ package com.codesync.ui
 
 import android.content.Context
 import android.graphics.Canvas
-import android.graphics.Color
 import android.graphics.DashPathEffect
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.PathMeasure
 import android.graphics.RectF
 import android.util.AttributeSet
+import android.util.TypedValue
 import android.view.MotionEvent
 import android.view.ViewConfiguration
 import android.view.View
+import androidx.core.content.ContextCompat
+import com.codesync.R
 import kotlin.math.max
 import kotlin.math.min
 
@@ -48,18 +50,18 @@ class TopologyGraphView @JvmOverloads constructor(
         val metric: Int = 0
     )
 
-    private companion object {
-        val COLOR_ACTIVE = Color.rgb(92, 219, 139)
-        val COLOR_RELAY = Color.rgb(192, 132, 252)
-        val COLOR_TOTP = Color.rgb(251, 191, 36)
-        val COLOR_IDLE = Color.rgb(110, 110, 122)
-        val COLOR_TEXT = Color.rgb(236, 236, 242)
-        val COLOR_META = Color.rgb(154, 154, 164)
-        val COLOR_NODE_BG = Color.rgb(42, 42, 56)
-        val COLOR_LOCAL_BG = Color.rgb(44, 50, 112)
-        val COLOR_NODE_STROKE = Color.rgb(58, 58, 72)
-        val COLOR_LABEL_BG = Color.argb(225, 26, 27, 38)
-    }
+    private val colorActive = color(R.color.accent_green)
+    private val colorRelay = color(R.color.primary)
+    private val colorRoute = color(R.color.accent_cyan)
+    private val colorTotp = color(R.color.warning)
+    private val colorDanger = color(R.color.danger)
+    private val colorIdle = color(R.color.status_offline)
+    private val colorText = color(R.color.text_primary)
+    private val colorMeta = color(R.color.text_secondary)
+    private val colorNodeBg = color(R.color.bg_surface_elevated)
+    private val colorLocalBg = color(R.color.primary_container)
+    private val colorNodeStroke = color(R.color.outline_strong)
+    private val colorLabelBg = color(R.color.graph_label_bg)
 
     private val nodes = mutableListOf<Node>()
     private val edges = mutableListOf<Edge>()
@@ -81,12 +83,12 @@ class TopologyGraphView @JvmOverloads constructor(
         strokeWidth = dp(1.2f)
     }
     private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = COLOR_TEXT
+        color = colorText
         textSize = sp(12f)
         isFakeBoldText = true
     }
     private val metaPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = COLOR_META
+        color = colorMeta
         textSize = sp(10f)
     }
     private val edgeLabelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -95,7 +97,7 @@ class TopologyGraphView @JvmOverloads constructor(
     }
     private val edgeLabelBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
-        color = COLOR_LABEL_BG
+        color = colorLabelBg
     }
     private val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
 
@@ -224,12 +226,12 @@ class TopologyGraphView @JvmOverloads constructor(
     }
 
     private fun edgeColor(edge: Edge): Int = when {
-        edge.kind == "discovery" -> COLOR_IDLE
-        edge.kind == "totp" -> COLOR_TOTP
-        edge.kind == "route" -> Color.rgb(96, 165, 250)
-        !edge.active -> COLOR_IDLE
-        edge.kind == "relay" -> COLOR_RELAY
-        else -> COLOR_ACTIVE
+        edge.kind == "discovery" -> colorIdle
+        edge.kind == "totp" -> colorTotp
+        edge.kind == "route" -> colorRoute
+        !edge.active -> colorIdle
+        edge.kind == "relay" -> colorRelay
+        else -> colorActive
     }
 
     private fun drawEdges(canvas: Canvas) {
@@ -287,12 +289,12 @@ class TopologyGraphView @JvmOverloads constructor(
     }
 
     private fun statusColor(node: Node): Int = when (node.status) {
-        "online" -> COLOR_ACTIVE
-        "reachable" -> Color.rgb(96, 165, 250)
-        "known" -> if (node.discoveredOnly) COLOR_META else Color.rgb(224, 176, 96)
-        "revoked" -> Color.rgb(180, 84, 84)
-        "synced" -> COLOR_TOTP
-        else -> COLOR_IDLE
+        "online" -> colorActive
+        "reachable" -> colorRoute
+        "known" -> if (node.discoveredOnly) colorMeta else colorTotp
+        "revoked" -> colorDanger
+        "synced" -> colorTotp
+        else -> colorIdle
     }
 
     private fun statusText(node: Node): String = when {
@@ -321,11 +323,11 @@ class TopologyGraphView @JvmOverloads constructor(
         nodes.forEach { node ->
             val rect = nodeRects[node.id] ?: return@forEach
             val accent = statusColor(node)
-            nodePaint.color = if (node.local) COLOR_LOCAL_BG else COLOR_NODE_BG
+            nodePaint.color = if (node.local) colorLocalBg else colorNodeBg
             strokePaint.color = if (node.status == "online" || node.status == "reachable" || node.local) {
                 accent
             } else {
-                COLOR_NODE_STROKE
+                colorNodeStroke
             }
             canvas.drawRoundRect(rect, dp(12f), dp(12f), nodePaint)
             canvas.drawRoundRect(rect, dp(12f), dp(12f), strokePaint)
@@ -336,13 +338,13 @@ class TopologyGraphView @JvmOverloads constructor(
 
             val icon = if (node.type.uppercase().contains("PHONE")) "📱" else "💻"
             val title = (if (node.local) "$icon ${node.name} · 本机" else "$icon ${node.name}")
-            textPaint.color = COLOR_TEXT
+            textPaint.color = colorText
             canvas.drawText(ellipsize(title, 13), rect.left + dp(10f), rect.top + dp(21f), textPaint)
 
             val meta = node.meta.ifBlank {
                 "${if (node.type.uppercase().contains("PHONE")) "手机" else "电脑"} · ${statusText(node)}"
             }
-            metaPaint.color = if (node.status == "online" || node.status == "reachable") accent else COLOR_META
+            metaPaint.color = if (node.status == "online" || node.status == "reachable") accent else colorMeta
             canvas.drawText(ellipsize(meta, 18), rect.left + dp(10f), rect.top + dp(40f), metaPaint)
         }
     }
@@ -375,11 +377,17 @@ class TopologyGraphView @JvmOverloads constructor(
         return true
     }
 
+    private fun color(resourceId: Int): Int = ContextCompat.getColor(context, resourceId)
+
     private fun ellipsize(value: String, maxChars: Int): String {
         val clean = value.ifBlank { "Device" }
         return if (clean.length <= maxChars) clean else clean.take(maxChars - 1) + "…"
     }
 
     private fun dp(value: Float): Float = value * resources.displayMetrics.density
-    private fun sp(value: Float): Float = value * resources.displayMetrics.scaledDensity
+    private fun sp(value: Float): Float = TypedValue.applyDimension(
+        TypedValue.COMPLEX_UNIT_SP,
+        value,
+        resources.displayMetrics
+    )
 }

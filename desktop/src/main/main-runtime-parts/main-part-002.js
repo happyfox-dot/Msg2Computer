@@ -465,80 +465,11 @@ function normalizeDiscoveredLanDevice(payload, remoteAddress) {
   }
 }
 
-function refreshTrustedLanDeviceAddress(device) {
-  if (!device || !device.id) return false
-  const id = String(device.id).trim()
-  const host = normalizeNetworkHost(device.host || '')
-  if (!id || !host) return false
-  const deviceType = normalizeDeviceType(device.deviceType || device.type, 'UNKNOWN_DEVICE')
-  const capabilities = device.capabilities && typeof device.capabilities === 'object'
-    ? device.capabilities
-    : {}
-  const hasCapabilities = Object.keys(capabilities).length > 0
-  const tsHost = normalizeNetworkHost(device.tsHost || '')
-
-  if (authorizedPhones.has(id)) {
-    const previous = authorizedPhones.get(id)
-    const relayPort = Number(device.relayPort || device.joinPort || previous.relayPort || JOIN_PORT) || JOIN_PORT
-    const next = {
-      ...previous,
-      name: String(device.name || previous.name || '').trim() || previous.name,
-      deviceType: deviceType.includes('PHONE') ? deviceType : previous.deviceType,
-      lastIP: host,
-      relayHost: host,
-      relayPort,
-      tsHost: tsHost || previous.tsHost || '',
-      capabilities: hasCapabilities ? capabilities : (previous.capabilities || {})
-    }
-    const changed =
-      String(previous.name || '') !== String(next.name || '') ||
-      String(previous.deviceType || '') !== String(next.deviceType || '') ||
-      String(previous.lastIP || '') !== String(next.lastIP || '') ||
-      String(previous.relayHost || '') !== String(next.relayHost || '') ||
-      Number(previous.relayPort || JOIN_PORT) !== Number(next.relayPort || JOIN_PORT) ||
-      String(previous.tsHost || '') !== String(next.tsHost || '') ||
-      JSON.stringify(previous.capabilities || {}) !== JSON.stringify(next.capabilities || {})
-    if (!changed) return false
-    authorizedPhones.set(id, next)
-    savePairingKey()
-    notifyPhonesChanged()
-    return true
-  }
-
-  if (pairedDesktopPeers.has(id)) {
-    const previous = pairedDesktopPeers.get(id)
-    const port = normalizeTopologyPort(deviceType, device.port || previous.port || WS_PORT)
-    const next = {
-      ...previous,
-      name: String(device.name || previous.name || '').trim() || previous.name,
-      deviceType: deviceType.includes('DESKTOP') ? deviceType : previous.deviceType,
-      host,
-      port,
-      lastIP: host,
-      tsHost: tsHost || previous.tsHost || '',
-      capabilities: hasCapabilities ? capabilities : (previous.capabilities || {})
-    }
-    const changed =
-      String(previous.name || '') !== String(next.name || '') ||
-      String(previous.deviceType || '') !== String(next.deviceType || '') ||
-      String(previous.host || '') !== String(next.host || '') ||
-      String(previous.lastIP || '') !== String(next.lastIP || '') ||
-      Number(previous.port || WS_PORT) !== Number(next.port || WS_PORT) ||
-      String(previous.tsHost || '') !== String(next.tsHost || '') ||
-      JSON.stringify(previous.capabilities || {}) !== JSON.stringify(next.capabilities || {})
-    if (!changed) return false
-    pairedDesktopPeers.set(id, next)
-    savePairingKey()
-    notifyDesktopPeersChanged()
-    return true
-  }
-
-  return false
-}
-
 function rememberDiscoveredLanDevice(device) {
   if (!device || !device.id) return
-  refreshTrustedLanDeviceAddress(device)
+  // UDP discovery is unauthenticated. Keep its source address only as an
+  // ephemeral connection candidate; connectDesktopPeer commits it after the
+  // derived-key handshake proves possession of the paired secret.
   discoveredLanDevices.set(device.id, decorateDiscoveredLanDevice(device))
   if (mainWindow) {
     mainWindow.webContents.send('lan-devices-changed', getDiscoveredLanDevices())
@@ -1167,13 +1098,29 @@ function handleBusMessageRequest(body, remoteAddress = '') {
   if (!parsed) {
     return { status: 403, body: { type: 'bus_ack', accepted: false, reason: 'invalid_bus_envelope' } }
   }
-  const { senderId, envelope } = parsed
+  const { senderId, nonce, envelope, peerKey } = parsed
+  const signedAck = (accepted, extras = {}) => busAck.buildBusAck(peerKey, {
+    nonce,
+    messageId: envelope.messageId,
+    accepted
+  }, extras)
+  if (!isKnownTrustedNode(senderId)) {
+    return {
+      status: 403,
+      body: signedAck(false, { reason: 'untrusted_sender' }) || {
+        type: 'bus_ack',
+        accepted: false,
+        messageId: envelope.messageId,
+        reason: 'untrusted_sender'
+      }
+    }
+  }
   const routePath = Array.isArray(envelope.routePath) ? envelope.routePath : []
   if (routePath.includes(getDesktopIdentity().id)) {
-    return { status: 202, body: { type: 'bus_ack', accepted: true, duplicate: true } }
-  }
-  if (!isKnownTrustedNode(senderId)) {
-    return { status: 403, body: { type: 'bus_ack', accepted: false, reason: 'untrusted_sender' } }
+    return {
+      status: 202,
+      body: signedAck(true, { duplicate: true })
+    }
   }
   const accepted = getContentBus().receiveEnvelope(envelope, {
     lastHopDeviceId: senderId,
@@ -1181,7 +1128,7 @@ function handleBusMessageRequest(body, remoteAddress = '') {
   })
   return {
     status: accepted ? 200 : 202,
-    body: { type: 'bus_ack', accepted, messageId: envelope.messageId }
+    body: signedAck(accepted)
   }
 }
 
@@ -1569,6 +1516,7 @@ function handleLocalNotifyPayload(payload = {}) {
 function startLocalNotifyServer() {
   if (localNotifyServer) return
   localNotifyServer = http.createServer(async (req, res) => {
+    try {
     const requestUrl = new URL(req.url || '/', 'http://127.0.0.1')
     if (req.headers.origin) {
       sendJsonResponse(res, 403, { ok: false, error: 'browser_origin_not_allowed' })
@@ -1637,6 +1585,14 @@ function startLocalNotifyServer() {
     } catch (error) {
       console.error('Local notify request failed:', error)
       sendJsonResponse(res, 400, { ok: false, error: error.message || 'notify_failed' })
+    }
+    } catch (error) {
+      console.error('Unhandled local notify request error:', error)
+      if (!res.headersSent) {
+        sendJsonResponse(res, 500, { ok: false, error: 'internal_error' })
+      } else {
+        try { res.destroy() } catch (_) {}
+      }
     }
   })
   localNotifyServer.on('error', error => {

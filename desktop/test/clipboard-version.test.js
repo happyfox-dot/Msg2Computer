@@ -46,3 +46,14 @@ test('bestClipboardVersion returns newest state across content types', () => {
 
   assert.deepEqual(best, { ts: 300, origin: 'b', hash: 'image', kind: 'image' })
 })
+
+test('local clipboard timestamp remains monotonic when the wall clock is behind', () => {
+  assert.equal(
+    clipboardVersion.nextLocalClipboardTimestamp({ ts: 5000, origin: 'remote' }, 1000),
+    5001
+  )
+  assert.equal(
+    clipboardVersion.nextLocalClipboardTimestamp({ ts: 5000, origin: 'remote' }, 6000),
+    6000
+  )
+})

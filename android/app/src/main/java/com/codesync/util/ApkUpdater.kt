@@ -11,6 +11,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.util.concurrent.TimeUnit
@@ -64,20 +65,9 @@ object ApkUpdater {
                 val versionName = tag.removePrefix("v").removePrefix("V")
                 val notes = json.optString("body").trim()
 
-                // 在 assets 里找 .apk（约定名 Msg2Computer-Android-<ver>.apk，
-                // 但只要后缀是 .apk 就接受，避免改名后匹配不到）
-                var apkUrl: String? = null
-                val assets = json.optJSONArray("assets")
-                if (assets != null) {
-                    for (i in 0 until assets.length()) {
-                        val asset = assets.optJSONObject(i) ?: continue
-                        val name = asset.optString("name")
-                        if (name.endsWith(".apk", ignoreCase = true)) {
-                            apkUrl = asset.optString("browser_download_url")
-                            break
-                        }
-                    }
-                }
+                // Never accept an arbitrary APK from a release. A debug or unsigned APK may be
+                // attached for diagnostics, but it must not become an in-app upgrade candidate.
+                val apkUrl = findReleaseApkUrl(versionName, json.optJSONArray("assets"))
 
                 UpdateInfo(
                     versionName = versionName,
@@ -90,6 +80,18 @@ object ApkUpdater {
         } catch (_: Exception) {
             null
         }
+    }
+
+    internal fun findReleaseApkUrl(versionName: String, assets: JSONArray?): String? {
+        val expectedName = "Msg2Computer-Android-$versionName.apk"
+        if (assets == null) return null
+
+        for (i in 0 until assets.length()) {
+            val asset = assets.optJSONObject(i) ?: continue
+            if (asset.optString("name") != expectedName) continue
+            return asset.optString("browser_download_url").trim().ifEmpty { null }
+        }
+        return null
     }
 
     /** 把 1.0.27 形式的版本号折算成可比较的整数：major*1_000_000 + minor*1_000 + patch。

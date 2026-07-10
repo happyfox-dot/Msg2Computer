@@ -3,7 +3,7 @@
     xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:background="@color/bg_window"
+    android:background="@drawable/bg_app_window"
     android:fillViewport="true"
     android:scrollbars="none">
 
@@ -11,47 +11,120 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:orientation="vertical"
-        android:padding="16dp">
+        android:paddingStart="16dp"
+        android:paddingTop="16dp"
+        android:paddingEnd="16dp"
+        android:paddingBottom="28dp">
 
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:gravity="center_vertical"
-            android:orientation="horizontal"
-            android:paddingHorizontal="4dp"
-            android:paddingBottom="10dp">
+            android:background="@drawable/bg_header"
+            android:orientation="vertical"
+            android:padding="18dp">
 
-            <TextView
-                android:layout_width="0dp"
+            <LinearLayout
+                android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:text="@string/app_name"
-                android:textColor="@color/text_primary"
-                android:textSize="22sp"
-                android:textStyle="bold" />
+                android:baselineAligned="false"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
 
-            <View
-                android:id="@+id/statusDot"
-                android:layout_width="9dp"
-                android:layout_height="9dp"
-                android:layout_marginEnd="7dp"
-                android:background="@drawable/dot_status" />
+                <FrameLayout
+                    android:layout_width="48dp"
+                    android:layout_height="48dp"
+                    android:layout_marginEnd="14dp"
+                    android:background="@drawable/bg_brand_badge"
+                    android:elevation="2dp">
 
-            <TextView
-                android:id="@+id/tvConnectionStatus"
-                android:layout_width="wrap_content"
+                    <ImageView
+                        android:layout_width="28dp"
+                        android:layout_height="28dp"
+                        android:layout_gravity="center"
+                        android:contentDescription="@null"
+                        android:src="@drawable/ic_bridge_mark" />
+
+                </FrameLayout>
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:orientation="vertical">
+
+                    <TextView
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:fontFamily="sans-serif-medium"
+                        android:text="@string/app_name"
+                        android:textColor="@color/text_primary"
+                        android:textSize="24sp"
+                        android:textStyle="bold" />
+
+                    <TextView
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="2dp"
+                        android:text="@string/app_tagline"
+                        android:textColor="@color/on_secondary_container"
+                        android:textSize="12sp" />
+
+                </LinearLayout>
+
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:text="@string/disconnected"
-                android:textColor="@color/danger"
-                android:textSize="14sp" />
+                android:layout_marginTop="16dp"
+                android:background="@drawable/bg_status_chip"
+                android:gravity="center_vertical"
+                android:minHeight="44dp"
+                android:orientation="horizontal"
+                android:paddingStart="13dp"
+                android:paddingEnd="13dp">
+
+                <View
+                    android:id="@+id/statusDot"
+                    android:layout_width="9dp"
+                    android:layout_height="9dp"
+                    android:layout_marginEnd="9dp"
+                    android:background="@drawable/dot_status" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/connection_status"
+                    android:textColor="@color/text_tertiary"
+                    android:textSize="12sp" />
+
+                <TextView
+                    android:id="@+id/tvConnectionStatus"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="12dp"
+                    android:layout_weight="1"
+                    android:ellipsize="end"
+                    android:fontFamily="sans-serif-medium"
+                    android:gravity="end"
+                    android:maxLines="1"
+                    android:text="@string/disconnected"
+                    android:textColor="@color/text_secondary"
+                    android:textSize="13sp" />
+
+            </LinearLayout>
 
         </LinearLayout>
 
         <HorizontalScrollView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginBottom="12dp"
+            android:layout_marginTop="14dp"
+            android:layout_marginBottom="14dp"
+            android:background="@drawable/bg_nav_bar"
+            android:clipToPadding="false"
             android:overScrollMode="never"
+            android:padding="4dp"
             android:scrollbars="none">
 
             <LinearLayout
@@ -62,56 +135,50 @@
 
                 <com.google.android.material.button.MaterialButton
                     android:id="@+id/btnPageHome"
-                    style="@style/Widget.Material3.Button.TonalButton"
+                    style="@style/Widget.CodeSync.NavButton"
                     android:layout_width="wrap_content"
-                    android:layout_height="42dp"
-                    android:layout_marginEnd="8dp"
-                    android:text="@string/page_home"
-                    app:cornerRadius="14dp" />
+                    android:layout_height="48dp"
+                    android:layout_marginEnd="2dp"
+                    android:text="@string/page_home" />
 
                 <com.google.android.material.button.MaterialButton
                     android:id="@+id/btnPageMessages"
-                    style="@style/Widget.Material3.Button.TextButton"
+                    style="@style/Widget.CodeSync.NavButton"
                     android:layout_width="wrap_content"
-                    android:layout_height="42dp"
-                    android:layout_marginEnd="8dp"
-                    android:text="@string/page_messages"
-                    app:cornerRadius="14dp" />
+                    android:layout_height="48dp"
+                    android:layout_marginEnd="2dp"
+                    android:text="@string/page_messages" />
 
                 <com.google.android.material.button.MaterialButton
                     android:id="@+id/btnPageClipboard"
-                    style="@style/Widget.Material3.Button.TextButton"
+                    style="@style/Widget.CodeSync.NavButton"
                     android:layout_width="wrap_content"
-                    android:layout_height="42dp"
-                    android:layout_marginEnd="8dp"
-                    android:text="@string/page_clipboard"
-                    app:cornerRadius="14dp" />
+                    android:layout_height="48dp"
+                    android:layout_marginEnd="2dp"
+                    android:text="@string/page_clipboard" />
 
                 <com.google.android.material.button.MaterialButton
                     android:id="@+id/btnPageDevices"
-                    style="@style/Widget.Material3.Button.TextButton"
+                    style="@style/Widget.CodeSync.NavButton"
                     android:layout_width="wrap_content"
-                    android:layout_height="42dp"
-                    android:layout_marginEnd="8dp"
-                    android:text="@string/page_devices"
-                    app:cornerRadius="14dp" />
+                    android:layout_height="48dp"
+                    android:layout_marginEnd="2dp"
+                    android:text="@string/page_devices" />
 
                 <com.google.android.material.button.MaterialButton
                     android:id="@+id/btnPageTopology"
-                    style="@style/Widget.Material3.Button.TextButton"
+                    style="@style/Widget.CodeSync.NavButton"
                     android:layout_width="wrap_content"
-                    android:layout_height="42dp"
-                    android:layout_marginEnd="8dp"
-                    android:text="@string/page_topology"
-                    app:cornerRadius="14dp" />
+                    android:layout_height="48dp"
+                    android:layout_marginEnd="2dp"
+                    android:text="@string/page_topology" />
 
                 <com.google.android.material.button.MaterialButton
                     android:id="@+id/btnPageTotp"
-                    style="@style/Widget.Material3.Button.TextButton"
+                    style="@style/Widget.CodeSync.NavButton"
                     android:layout_width="wrap_content"
-                    android:layout_height="42dp"
-                    android:text="@string/page_totp"
-                    app:cornerRadius="14dp" />
+                    android:layout_height="48dp"
+                    android:text="@string/page_totp" />
 
             </LinearLayout>
         </HorizontalScrollView>
@@ -133,7 +200,7 @@
 
                     <TextView
                         style="@style/SectionTitle"
-                        android:text="@string/page_home" />
+                        android:text="@string/sync_overview" />
 
                     <LinearLayout
                         android:layout_width="match_parent"
@@ -149,20 +216,17 @@
                             android:orientation="vertical">
 
                             <TextView
+                                style="@style/SettingTitle"
                                 android:layout_width="wrap_content"
                                 android:layout_height="wrap_content"
-                                android:text="@string/auto_sync"
-                                android:textColor="@color/text_primary"
-                                android:textSize="16sp"
-                                android:textStyle="bold" />
+                                android:text="@string/auto_sync" />
 
                             <TextView
+                                style="@style/SettingDescription"
                                 android:layout_width="match_parent"
                                 android:layout_height="wrap_content"
                                 android:layout_marginTop="2dp"
-                                android:text="@string/auto_sync_desc"
-                                android:textColor="@color/text_secondary"
-                                android:textSize="12sp" />
+                                android:text="@string/auto_sync_desc" />
 
                         </LinearLayout>
 
@@ -178,6 +242,8 @@
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
                         android:layout_marginTop="12dp"
+                        android:background="@drawable/bg_inner_panel"
+                        android:padding="12dp"
                         android:textColor="@color/text_secondary"
                         android:textSize="12sp"
                         android:visibility="gone" />
@@ -208,21 +274,28 @@
                         <com.google.android.material.button.MaterialButton
                             android:id="@+id/btnScanQR"
                             android:layout_width="0dp"
-                            android:layout_height="52dp"
+                            android:layout_height="wrap_content"
                             android:layout_marginEnd="6dp"
                             android:layout_weight="1"
+                            android:minHeight="52dp"
+                            android:paddingStart="6dp"
+                            android:paddingEnd="6dp"
                             android:text="@string/scan_qr"
+                            android:textSize="12sp"
                             app:icon="@drawable/ic_qr_code"
                             app:iconGravity="textStart"
+                            app:iconPadding="4dp"
+                            app:iconSize="18dp"
                             app:cornerRadius="14dp" />
 
                         <com.google.android.material.button.MaterialButton
                             android:id="@+id/btnHomeSyncClipboard"
                             style="@style/Widget.Material3.Button.TonalButton"
                             android:layout_width="0dp"
-                            android:layout_height="52dp"
+                            android:layout_height="wrap_content"
                             android:layout_marginStart="6dp"
                             android:layout_weight="1"
+                            android:minHeight="52dp"
                             android:text="@string/sync_current_clipboard"
                             app:cornerRadius="14dp" />
 
@@ -232,14 +305,15 @@
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
                         android:layout_marginTop="12dp"
-                        android:orientation="vertical">
+                        android:background="@drawable/bg_inner_panel"
+                        android:orientation="vertical"
+                        android:padding="14dp">
 
                         <TextView
+                            style="@style/SettingTitle"
                             android:layout_width="wrap_content"
                             android:layout_height="wrap_content"
-                            android:text="@string/file_receive_dir"
-                            android:textColor="@color/text_primary"
-                            android:textSize="14sp" />
+                            android:text="@string/file_receive_dir" />
 
                         <TextView
                             android:id="@+id/txtFileReceiveDir"
@@ -268,18 +342,20 @@
                                 android:id="@+id/btnSetFileReceiveDir"
                                 style="@style/Widget.Material3.Button.TextButton"
                                 android:layout_width="0dp"
-                                android:layout_height="40dp"
+                                android:layout_height="wrap_content"
                                 android:layout_marginEnd="6dp"
                                 android:layout_weight="1"
+                                android:minHeight="48dp"
                                 android:text="@string/file_receive_dir_change" />
 
                             <com.google.android.material.button.MaterialButton
                                 android:id="@+id/btnResetFileReceiveDir"
                                 style="@style/Widget.Material3.Button.TextButton"
                                 android:layout_width="0dp"
-                                android:layout_height="40dp"
+                                android:layout_height="wrap_content"
                                 android:layout_marginStart="6dp"
                                 android:layout_weight="1"
+                                android:minHeight="48dp"
                                 android:text="@string/file_receive_dir_reset" />
 
                         </LinearLayout>
@@ -295,9 +371,10 @@
                             android:id="@+id/btnDiscoverLan"
                             style="@style/Widget.Material3.Button.TonalButton"
                             android:layout_width="0dp"
-                            android:layout_height="48dp"
+                            android:layout_height="wrap_content"
                             android:layout_marginEnd="6dp"
                             android:layout_weight="1"
+                            android:minHeight="48dp"
                             android:text="@string/discover_lan"
                             app:cornerRadius="14dp" />
 
@@ -305,9 +382,10 @@
                             android:id="@+id/btnTestPush"
                             style="@style/Widget.Material3.Button.TonalButton"
                             android:layout_width="0dp"
-                            android:layout_height="48dp"
+                            android:layout_height="wrap_content"
                             android:layout_marginStart="6dp"
                             android:layout_weight="1"
+                            android:minHeight="48dp"
                             android:text="@string/test_push"
                             app:cornerRadius="14dp" />
 
@@ -395,8 +473,9 @@
                         android:id="@+id/btnNotificationAccess"
                         style="@style/Widget.Material3.Button.TonalButton"
                         android:layout_width="match_parent"
-                        android:layout_height="48dp"
+                        android:layout_height="wrap_content"
                         android:layout_marginTop="8dp"
+                        android:minHeight="48dp"
                         android:text="@string/open_notification_access"
                         app:cornerRadius="14dp" />
 
@@ -404,8 +483,9 @@
                         android:id="@+id/btnNotificationAppPolicy"
                         style="@style/Widget.Material3.Button.TonalButton"
                         android:layout_width="match_parent"
-                        android:layout_height="48dp"
+                        android:layout_height="wrap_content"
                         android:layout_marginTop="8dp"
+                        android:minHeight="48dp"
                         android:text="@string/manage_notification_apps"
                         app:cornerRadius="14dp" />
 
@@ -521,8 +601,9 @@
                         android:id="@+id/btnCheckUpdate"
                         style="@style/Widget.Material3.Button.TonalButton"
                         android:layout_width="match_parent"
-                        android:layout_height="48dp"
+                        android:layout_height="wrap_content"
                         android:layout_marginTop="8dp"
+                        android:minHeight="48dp"
                         android:text="@string/check_update"
                         app:cornerRadius="14dp" />
 
@@ -565,19 +646,17 @@
                             android:orientation="vertical">
 
                             <TextView
+                                style="@style/SettingTitle"
                                 android:layout_width="wrap_content"
                                 android:layout_height="wrap_content"
-                                android:text="@string/sync_clipboard"
-                                android:textColor="@color/text_primary"
-                                android:textSize="14sp" />
+                                android:text="@string/sync_clipboard" />
 
                             <TextView
+                                style="@style/SettingDescription"
                                 android:layout_width="match_parent"
                                 android:layout_height="wrap_content"
                                 android:layout_marginTop="2dp"
-                                android:text="@string/sync_clipboard_desc"
-                                android:textColor="@color/text_secondary"
-                                android:textSize="11sp" />
+                                android:text="@string/sync_clipboard_desc" />
 
                         </LinearLayout>
 
@@ -592,8 +671,9 @@
                         android:id="@+id/btnSyncClipboard"
                         style="@style/Widget.Material3.Button.TonalButton"
                         android:layout_width="match_parent"
-                        android:layout_height="48dp"
+                        android:layout_height="wrap_content"
                         android:layout_marginTop="8dp"
+                        android:minHeight="48dp"
                         android:text="@string/sync_current_clipboard"
                         app:cornerRadius="14dp" />
 
@@ -611,19 +691,17 @@
                             android:orientation="vertical">
 
                             <TextView
+                                style="@style/SettingTitle"
                                 android:layout_width="wrap_content"
                                 android:layout_height="wrap_content"
-                                android:text="@string/sync_file_transfer"
-                                android:textColor="@color/text_primary"
-                                android:textSize="14sp" />
+                                android:text="@string/sync_file_transfer" />
 
                             <TextView
+                                style="@style/SettingDescription"
                                 android:layout_width="match_parent"
                                 android:layout_height="wrap_content"
                                 android:layout_marginTop="2dp"
-                                android:text="@string/sync_file_transfer_desc"
-                                android:textColor="@color/text_secondary"
-                                android:textSize="11sp" />
+                                android:text="@string/sync_file_transfer_desc" />
 
                         </LinearLayout>
 
@@ -648,19 +726,17 @@
                             android:orientation="vertical">
 
                             <TextView
+                                style="@style/SettingTitle"
                                 android:layout_width="wrap_content"
                                 android:layout_height="wrap_content"
-                                android:text="@string/receive_file_transfer"
-                                android:textColor="@color/text_primary"
-                                android:textSize="14sp" />
+                                android:text="@string/receive_file_transfer" />
 
                             <TextView
+                                style="@style/SettingDescription"
                                 android:layout_width="match_parent"
                                 android:layout_height="wrap_content"
                                 android:layout_marginTop="2dp"
-                                android:text="@string/receive_file_transfer_desc"
-                                android:textColor="@color/text_secondary"
-                                android:textSize="11sp" />
+                                android:text="@string/receive_file_transfer_desc" />
 
                         </LinearLayout>
 
@@ -681,9 +757,10 @@
                             android:id="@+id/btnSendFile"
                             style="@style/Widget.Material3.Button.TonalButton"
                             android:layout_width="0dp"
-                            android:layout_height="48dp"
+                            android:layout_height="wrap_content"
                             android:layout_marginEnd="6dp"
                             android:layout_weight="1"
+                            android:minHeight="48dp"
                             android:text="@string/send_file"
                             app:cornerRadius="14dp" />
 
@@ -691,9 +768,10 @@
                             android:id="@+id/btnSendFolder"
                             style="@style/Widget.Material3.Button.TonalButton"
                             android:layout_width="0dp"
-                            android:layout_height="48dp"
+                            android:layout_height="wrap_content"
                             android:layout_marginStart="6dp"
                             android:layout_weight="1"
+                            android:minHeight="48dp"
                             android:text="@string/send_folder"
                             app:cornerRadius="14dp" />
 
@@ -703,8 +781,9 @@
                         android:id="@+id/btnFileHistory"
                         style="@style/Widget.Material3.Button.TextButton"
                         android:layout_width="match_parent"
-                        android:layout_height="48dp"
+                        android:layout_height="wrap_content"
                         android:layout_marginTop="8dp"
+                        android:minHeight="48dp"
                         android:text="@string/file_receive_history"
                         app:cornerRadius="14dp" />
 
@@ -737,7 +816,8 @@
                             android:id="@+id/btnRefreshClipboardHistory"
                             style="@style/Widget.Material3.Button.TextButton"
                             android:layout_width="wrap_content"
-                            android:layout_height="40dp"
+                            android:layout_height="wrap_content"
+                            android:minHeight="48dp"
                             android:text="@string/refresh" />
 
                     </LinearLayout>
@@ -785,8 +865,9 @@
                         android:id="@+id/btnDisconnect"
                         style="@style/Widget.Material3.Button.TonalButton"
                         android:layout_width="match_parent"
-                        android:layout_height="48dp"
+                        android:layout_height="wrap_content"
                         android:layout_marginTop="8dp"
+                        android:minHeight="48dp"
                         android:text="@string/disconnect"
                         app:cornerRadius="14dp" />
 
@@ -818,8 +899,9 @@
                         android:id="@+id/btnRevokeTotpAccess"
                         style="@style/Widget.Material3.Button.OutlinedButton"
                         android:layout_width="match_parent"
-                        android:layout_height="48dp"
+                        android:layout_height="wrap_content"
                         android:layout_marginTop="8dp"
+                        android:minHeight="48dp"
                         android:text="@string/totp_access"
                         app:cornerRadius="14dp" />
 
@@ -872,8 +954,9 @@
                         android:id="@+id/btnAddTotp"
                         style="@style/Widget.Material3.Button.OutlinedButton"
                         android:layout_width="match_parent"
-                        android:layout_height="48dp"
+                        android:layout_height="wrap_content"
                         android:layout_marginTop="4dp"
+                        android:minHeight="48dp"
                         android:text="@string/add_totp"
                         app:cornerRadius="14dp" />
 
@@ -881,8 +964,9 @@
                         android:id="@+id/btnTotpAccess"
                         style="@style/Widget.Material3.Button.TonalButton"
                         android:layout_width="match_parent"
-                        android:layout_height="48dp"
+                        android:layout_height="wrap_content"
                         android:layout_marginTop="8dp"
+                        android:minHeight="48dp"
                         android:text="@string/totp_manage_access"
                         app:cornerRadius="14dp" />
 
@@ -890,8 +974,9 @@
                         android:id="@+id/btnTotpFullSync"
                         style="@style/Widget.Material3.Button.TonalButton"
                         android:layout_width="match_parent"
-                        android:layout_height="48dp"
+                        android:layout_height="wrap_content"
                         android:layout_marginTop="8dp"
+                        android:minHeight="48dp"
                         android:text="@string/totp_full_sync"
                         app:cornerRadius="14dp" />
 

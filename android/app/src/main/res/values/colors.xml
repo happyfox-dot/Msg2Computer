@@ -1,25 +1,36 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- 背景层次：window 最暗，surface 比背景明显提亮一档，卡片才能从背景里浮出来 -->
-    <color name="bg_window">#12121A</color>
-    <color name="bg_surface">#21212E</color>
-    <color name="bg_surface_variant">#2C2C3C</color>
-    <color name="outline">#3D3D4D</color>
+    <!-- Deep navy canvas with progressively lighter, blue-tinted surfaces. -->
+    <color name="bg_window">#070B16</color>
+    <color name="bg_window_end">#0B1325</color>
+    <color name="bg_surface">#10192B</color>
+    <color name="bg_surface_elevated">#142039</color>
+    <color name="bg_surface_variant">#182844</color>
+    <color name="outline">#2A3B5A</color>
+    <color name="outline_strong">#405779</color>
 
-    <!-- 主题色 -->
-    <color name="primary">#7C8AFF</color>
-    <color name="on_primary">#FFFFFF</color>
-    <color name="primary_container">#2C3270</color>
-    <color name="accent_green">#5CDB8B</color>
-    <color name="danger">#E06060</color>
-    <color name="warning">#E0B060</color>
+    <!-- Indigo + cyan identity shared with the desktop client. -->
+    <color name="primary">#929CFF</color>
+    <color name="on_primary">#071025</color>
+    <color name="primary_container">#27356E</color>
+    <color name="on_primary_container">#E1E5FF</color>
+    <color name="accent_cyan">#36D5F5</color>
+    <color name="on_accent_cyan">#03151B</color>
+    <color name="secondary_container">#123B49</color>
+    <color name="on_secondary_container">#C2F4FF</color>
 
-    <!-- 文字层次 -->
-    <color name="text_primary">#ECECF2</color>
-    <color name="text_secondary">#9A9AA4</color>
-    <color name="text_tertiary">#6E6E7A</color>
+    <!-- Semantic colors stay bright enough to read on the navy surfaces. -->
+    <color name="accent_green">#4BE2A2</color>
+    <color name="danger">#FF7482</color>
+    <color name="warning">#FFC85C</color>
 
-    <!-- 状态点 -->
-    <color name="status_online">#5CDB8B</color>
-    <color name="status_offline">#6E6E7A</color>
+    <!-- Text hierarchy. All three meet accessible contrast on card surfaces. -->
+    <color name="text_primary">#F5F7FF</color>
+    <color name="text_secondary">#B6C2D9</color>
+    <color name="text_tertiary">#8393AE</color>
+
+    <color name="status_online">#4BE2A2</color>
+    <color name="status_offline">#7D8BA2</color>
+    <color name="ripple">#3349CFEF</color>
+    <color name="graph_label_bg">#E610192B</color>
 </resources>

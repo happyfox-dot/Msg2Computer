@@ -6,7 +6,7 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:orientation="vertical"
-        android:padding="16dp">
+        android:padding="18dp">
 
         <LinearLayout
             android:layout_width="match_parent"
@@ -14,32 +14,55 @@
             android:gravity="center_vertical"
             android:orientation="horizontal">
 
-            <TextView
-                style="@style/SectionTitle"
+            <LinearLayout
                 android:layout_width="0dp"
+                android:layout_height="wrap_content"
                 android:layout_weight="1"
-                android:text="@string/topology_section" />
+                android:orientation="vertical">
+
+                <TextView
+                    style="@style/SectionTitle"
+                    android:text="@string/topology_section" />
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
+                    android:text="@string/topology_section_desc"
+                    android:textColor="@color/text_secondary"
+                    android:textSize="12sp" />
+
+            </LinearLayout>
 
             <com.google.android.material.button.MaterialButton
                 android:id="@+id/btnRefreshTopology"
                 style="@style/Widget.Material3.Button.TextButton"
                 android:layout_width="wrap_content"
-                android:layout_height="40dp"
+                android:layout_height="48dp"
+                android:layout_marginStart="8dp"
                 android:text="@string/refresh" />
 
         </LinearLayout>
 
-        <com.codesync.ui.TopologyGraphView
-            android:id="@+id/topologyGraph"
+        <FrameLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="12dp" />
+            android:layout_marginTop="16dp"
+            android:background="@drawable/bg_inner_panel"
+            android:padding="6dp">
+
+            <com.codesync.ui.TopologyGraphView
+                android:id="@+id/topologyGraph"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content" />
+
+        </FrameLayout>
 
         <LinearLayout
             android:id="@+id/topologyList"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="12dp"
+            android:layout_marginTop="14dp"
             android:orientation="vertical" />
 
     </LinearLayout>

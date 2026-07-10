@@ -457,7 +457,8 @@ function postJsonToNode(host, port, body, optionsOrTimeout = 3500) {
   return relayClient.postJsonToNode(host, port, body, {
     timeoutMs: options.timeoutMs || 3500,
     path: options.path || '/relay',
-    normalizeHost: normalizeNetworkHost
+    normalizeHost: normalizeNetworkHost,
+    validateResponse: options.validateResponse
   })
 }
 
@@ -529,7 +530,9 @@ function parseBusTransportEnvelope(body, peerKeyOrLookup) {
     const plain = decryptMessage(payload, peerKey)
     if (!plain) return null
     const envelope = runCatchingJson(plain)
-    return busEnvelope.isEnvelope(envelope) ? { senderId, envelope } : null
+    return busEnvelope.isEnvelope(envelope) && String(envelope.messageId || '').trim()
+      ? { senderId, nonce, envelope, peerKey }
+      : null
   }
   return null
 }
@@ -540,17 +543,77 @@ function timingSafeEqual(a, b) {
   return left.length === right.length && crypto.timingSafeEqual(left, right)
 }
 
+function discoveredNodeForDelivery(node = {}) {
+  const nodeId = String(node.id || node.phoneId || '').trim()
+  if (!nodeId) return {}
+  const discovered = discoveredLanDevices.get(nodeId)
+  return discovered && String(discovered.id || '').trim() === nodeId ? discovered : {}
+}
+
+function httpDeliveryCandidateHosts(node = {}, preferredHost = '') {
+  return trustedNode.deliveryCandidateHosts(
+    node,
+    discoveredNodeForDelivery(node),
+    preferredHost
+  )
+}
+
+// Discovery packets identify a candidate address but do not prove ownership of
+// the pairing key. Promote only the exact same-id discovery host after the HTTP
+// peer has returned a valid, accepted bus ACK signed with that key.
+function rememberAuthenticatedHttpDeliveryHost(node = {}, deliveredHost = '') {
+  const nodeId = String(node.id || node.phoneId || '').trim()
+  const nodeKey = String(node.pairingKey || '').trim()
+  const host = normalizeNetworkHost(deliveredHost)
+  const discoveredHost = normalizeNetworkHost(discoveredNodeForDelivery(node).host)
+  if (!nodeId || !nodeKey || !host || host !== discoveredHost) return false
+
+  const phone = authorizedPhones.get(nodeId)
+  if (phone && String(phone.pairingKey || '').trim() === nodeKey) {
+    const previousHost = normalizeNetworkHost(phone.lastIP || phone.host)
+    if (previousHost === host) return false
+    Object.assign(phone, trustedNode.withAuthenticatedHost(phone, host))
+    authorizedPhones.set(nodeId, phone)
+    savePairingKey()
+    notifyPhonesChanged()
+    return true
+  }
+
+  const peer = pairedDesktopPeers.get(nodeId)
+  if (peer && String(peer.pairingKey || '').trim() === nodeKey) {
+    const previousHost = normalizeNetworkHost(peer.host || peer.lastIP)
+    if (previousHost === host) return false
+    Object.assign(peer, trustedNode.withAuthenticatedHost(peer, host))
+    pairedDesktopPeers.set(nodeId, peer)
+    savePairingKey()
+    notifyDesktopPeersChanged()
+    return true
+  }
+  return false
+}
+
 async function sendBusEnvelopeDirect(target, envelope, route = {}) {
   if (!target || !target.pairingKey) return false
   const transportEnvelope = buildBusTransportEnvelope(envelope, target.pairingKey)
   if (!transportEnvelope) return false
-  const hosts = route.host
-    ? [route.host]
-    : collectNetworkHosts(target.lastIP, target.host, target.relayHost, target.tsHost, target.altHosts)
+  // UDP discovery is only an ephemeral fallback until the response below proves
+  // possession of the pairing key and binds the ACK to this request nonce.
+  const hosts = httpDeliveryCandidateHosts(target, route.host)
   const port = Number(route.port || target.relayPort || target.port) || JOIN_PORT
   for (const host of hosts) {
-    const ok = await postJsonToNode(host, port, transportEnvelope, { path: '/bus/message', timeoutMs: 3500 })
-    if (ok) return true
+    const ok = await postJsonToNode(host, port, transportEnvelope, {
+      path: '/bus/message',
+      timeoutMs: 3500,
+      validateResponse: ack => busAck.verifyBusAck(ack, target.pairingKey, {
+        nonce: transportEnvelope.nonce,
+        messageId: envelope.messageId,
+        accepted: true
+      })
+    })
+    if (ok) {
+      rememberAuthenticatedHttpDeliveryHost(target, host)
+      return true
+    }
   }
   return false
 }
@@ -738,7 +801,7 @@ async function sendTopologyDeltaRelayToPhone(phone, delta) {
     payload: encryptedPayload,
     authToken
   }
-  const hosts = collectNetworkHosts(phone.lastIP, phone.host, phone.relayHost, phone.tsHost, phone.altHosts)
+  const hosts = httpDeliveryCandidateHosts(phone)
   for (const host of hosts) {
     const ok = await postJsonToNode(host, Number(phone.relayPort || phone.port) || 19529, envelope)
     if (ok) return true
@@ -1559,6 +1622,14 @@ let clipboardWatchTimer = null
 let lastClipboardText = ''
 let lastClipboardImageHash = ''
 let lastClipboardFileSignature = ''
+let cachedNativeClipboardFilePaths = []
+let cachedNativeClipboardSequence = 0
+let nativeClipboardFileSnapshotReady = false
+let nativeClipboardFileSnapshotPromise = null
+let nativeClipboardFileSnapshotStartedAt = 0
+let lastClipboardFileReadReady = true
+let clipboardFileWatcherPrimed = false
+let lastUnreadableClipboardFileWarningAt = 0
 let suppressClipboardImagePollUntil = 0
 let pendingClipboardFileBatch = null
 let incomingClipboardFileSession = { key: '', paths: new Set(), fileIds: new Set(), expectedCount: 0, timer: null, version: null }
@@ -1654,6 +1725,10 @@ function rememberGlobalClipVersion(ts, origin, hash, kind) {
   })
 }
 
+function nextLocalClipboardTimestamp() {
+  return clipboardVersion.nextLocalClipboardTimestamp(clipboardGlobalSyncState)
+}
+
 function rememberClipVersion(ts, origin, text) {
   const hash = hashClipText(text)
   clipboardSyncState = { ts, origin: String(origin || ''), hash, kind: 'text' }
@@ -1676,11 +1751,26 @@ function startClipboardSyncWatcher() {
   try {
     lastClipboardText = clipboard.readText() || ''
     lastClipboardImageHash = readClipboardImageSyncHash()
-    lastClipboardFileSignature = getClipboardFileSignature(readClipboardFilePaths())
+    if (desktopMessageSettings.syncClipboardFile === true) {
+      nativeClipboardFileSnapshotReady = false
+      nativeClipboardFileSnapshotStartedAt = 0
+      const filePaths = readClipboardFilePaths()
+      if (lastClipboardFileReadReady) {
+        lastClipboardFileSignature = getClipboardFileSignature(filePaths)
+        clipboardFileWatcherPrimed = true
+      } else {
+        lastClipboardFileSignature = ''
+        clipboardFileWatcherPrimed = false
+      }
+    } else {
+      lastClipboardFileSignature = ''
+      clipboardFileWatcherPrimed = false
+    }
   } catch (_) {
     lastClipboardText = ''
     lastClipboardImageHash = ''
     lastClipboardFileSignature = ''
+    clipboardFileWatcherPrimed = false
   }
   pendingClipboardFileBatch = null
   clipboardWatchTimer = setInterval(pollClipboardForSync, CLIPBOARD_POLL_INTERVAL_MS)
@@ -1712,7 +1802,7 @@ function pollClipboardForSync() {
       if (text && hashClipText(text) !== clipboardSyncState.hash) {
         // 本机新复制：产生新版本并广播。小文本 inline 走消息通道；
         // 超长文本保持"剪贴板文本"业务语义，但底层转 manifest + 分片拉取。
-        const clipTs = Date.now()
+        const clipTs = nextLocalClipboardTimestamp()
         clearIncomingClipboardFiles()
         rememberClipVersion(clipTs, getDesktopIdentity().id, text)
         if (clipboardTextByteLength(text) <= CLIPBOARD_MAX_LENGTH) {
@@ -1763,14 +1853,14 @@ function pollClipboardImageForSync() {
     // 大图回退：不整包 inline 进 relay 消息，转 manifest + 分片拉取
     //（与文件传输同通道），接收端拉完写剪贴板。版本先行登记，
     // 避免轮询期间把同一张图重复 offer。
-    const clipTs = Date.now()
+    const clipTs = nextLocalClipboardTimestamp()
     rememberClipImageVersion(clipTs, getDesktopIdentity().id, shortHash)
     offerClipboardImageAsFile(imageBuffer, clipTs, shortHash, encodedImage).catch(error => {
       console.error('剪贴板大图 manifest 同步失败:', error.message)
     })
     return
   }
-  rememberClipImageVersion(Date.now(), getDesktopIdentity().id, shortHash)
+  rememberClipImageVersion(nextLocalClipboardTimestamp(), getDesktopIdentity().id, shortHash)
   broadcastClipboardImageToNodes(imageBuffer, hash, encodedImage)
 }
 
@@ -1890,31 +1980,55 @@ async function offerClipboardImageAsFile(imageBuffer, clipTs, shortHash, imageIn
 
 function readClipboardFilePaths() {
   if (process.platform !== 'win32') return []
-  const decodeUtf16Paths = buffer => {
-    if (!buffer || buffer.length < 4) return []
-    return buffer.toString('utf16le')
-      .split('\u0000')
-      .map(item => item.trim())
-      .filter(Boolean)
-  }
-  const decodeAnsiPaths = buffer => {
-    if (!buffer || buffer.length < 2) return []
-    return buffer.toString('utf8')
-      .split('\u0000')
-      .map(item => item.trim())
-      .filter(Boolean)
-  }
+  let usedNativeFallback = false
+  let nativeRefreshPending = false
+  const paths = readClipboardFilePathsFromClipboard(clipboard, {
+    readNativeFileDropList: () => {
+      usedNativeFallback = true
+      nativeRefreshPending = scheduleNativeClipboardFileSnapshot()
+      return cachedNativeClipboardFilePaths
+    }
+  })
+  lastClipboardFileReadReady = !usedNativeFallback || (
+    nativeClipboardFileSnapshotReady && !nativeRefreshPending
+  )
+  return paths
+}
 
-  try {
-    const paths = decodeUtf16Paths(clipboard.readBuffer('FileNameW'))
-    if (paths.length > 0) return paths
-  } catch (_) {}
+function warnUnreadableNativeClipboard(error) {
+  const now = Date.now()
+  if (now - lastUnreadableClipboardFileWarningAt < 30_000) return
+  lastUnreadableClipboardFileWarningAt = now
+  console.warn('Windows file clipboard could not be read:', error?.message || error || 'empty file-drop list')
+}
 
-  try {
-    return decodeAnsiPaths(clipboard.readBuffer('FileName'))
-  } catch (_) {
-    return []
-  }
+function scheduleNativeClipboardFileSnapshot() {
+  const now = Date.now()
+  if (nativeClipboardFileSnapshotPromise) return true
+  if (now - nativeClipboardFileSnapshotStartedAt < 1500) return false
+  nativeClipboardFileSnapshotStartedAt = now
+  nativeClipboardFileSnapshotPromise = readWindowsFileDropSnapshot({ timeoutMs: 1200 })
+    .then(snapshot => {
+      const sequence = Math.max(0, Number(snapshot?.sequence || 0) || 0)
+      if (!nativeClipboardFileSnapshotReady || sequence === 0 || sequence !== cachedNativeClipboardSequence) {
+        cachedNativeClipboardSequence = sequence
+        cachedNativeClipboardFilePaths = Array.isArray(snapshot?.paths)
+          ? Array.from(snapshot.paths)
+          : []
+      }
+      nativeClipboardFileSnapshotReady = true
+      if (cachedNativeClipboardFilePaths.length === 0) {
+        warnUnreadableNativeClipboard('empty file-drop list')
+      }
+    })
+    .catch(error => {
+      nativeClipboardFileSnapshotReady = false
+      warnUnreadableNativeClipboard(error)
+    })
+    .finally(() => {
+      nativeClipboardFileSnapshotPromise = null
+    })
+  return true
 }
 
 function getClipboardFileSignature(filePaths) {

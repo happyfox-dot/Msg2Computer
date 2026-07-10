@@ -8,6 +8,7 @@ const {
   normalizePushContentPolicy,
   canPushContentToNode,
   canReceiveContentType,
+  isExpiredContentPayload,
   createRecentDeliveryTracker
 } = require('../src/main/message-router')
 
@@ -72,6 +73,14 @@ test('per-node policy can block individual content types', () => {
 test('notification removal events follow notification receive policy', () => {
   assert.equal(canReceiveContentType('app_notification_removed', { receiveNotifications: true }), true)
   assert.equal(canReceiveContentType('app_notification_removed', { receiveNotifications: false }), false)
+})
+
+test('expired SMS code payloads are rejected while other content is unaffected', () => {
+  const now = 1_000_000
+  assert.equal(isExpiredContentPayload({ type: 'sms', expiresAt: now - 1 }, now), true)
+  assert.equal(isExpiredContentPayload({ type: 'sms', expiresAt: now + 1 }, now), false)
+  assert.equal(isExpiredContentPayload({ type: 'sms', timestamp: now - 120_001 }, now), true)
+  assert.equal(isExpiredContentPayload({ type: 'sms_message', expiresAt: now - 1 }, now), false)
 })
 
 test('recent delivery tracker deduplicates and evicts old keys', () => {

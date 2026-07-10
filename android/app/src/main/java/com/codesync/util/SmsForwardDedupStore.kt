@@ -3,26 +3,51 @@ package com.codesync.util
 import android.content.Context
 import java.security.MessageDigest
 
+/**
+ * Process-local SMS broadcast de-duplication.
+ *
+ * This intentionally is not persisted: [shouldForward] is called before Android confirms that
+ * the foreground service could be started. Persisting at that point can suppress a later retry
+ * even though no message was ever queued. A small bounded LRU still absorbs duplicate receiver
+ * deliveries in the same process without leaving a durable false-positive marker.
+ */
 object SmsForwardDedupStore {
-    private const val PREFS = "sms_forward_dedup"
-    private const val KEY_LAST_HASH = "last_hash"
-    private const val KEY_LAST_AT = "last_at"
     private const val DUPLICATE_WINDOW_MS = 2 * 60 * 1000L
+    private const val MAX_RECENT_MESSAGES = 64
+    private val lock = Any()
+    private val recent = LinkedHashMap<String, Long>(MAX_RECENT_MESSAGES, 0.75f, true)
 
-    fun shouldForward(context: Context, sender: String, body: String, contentType: String): Boolean {
+    @Suppress("UNUSED_PARAMETER")
+    fun shouldForward(context: Context, sender: String, body: String, contentType: String): Boolean =
+        shouldForwardAt(sender, body, contentType, System.currentTimeMillis())
+
+    internal fun shouldForwardAt(
+        sender: String,
+        body: String,
+        contentType: String,
+        now: Long
+    ): Boolean {
         val key = hash("${contentType.trim()}|${sender.trim()}|${body.trim()}")
-        val now = System.currentTimeMillis()
-        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val lastKey = prefs.getString(KEY_LAST_HASH, "").orEmpty()
-        val lastAt = prefs.getLong(KEY_LAST_AT, 0L)
-        if (key == lastKey && now - lastAt in 0 until DUPLICATE_WINDOW_MS) {
-            return false
+        synchronized(lock) {
+            val iterator = recent.entries.iterator()
+            while (iterator.hasNext()) {
+                val age = now - iterator.next().value
+                if (age < 0L || age >= DUPLICATE_WINDOW_MS) iterator.remove()
+            }
+            if (recent.containsKey(key)) return false
+            recent[key] = now
+            while (recent.size > MAX_RECENT_MESSAGES) {
+                val oldest = recent.entries.iterator()
+                if (!oldest.hasNext()) break
+                oldest.next()
+                oldest.remove()
+            }
+            return true
         }
-        prefs.edit()
-            .putString(KEY_LAST_HASH, key)
-            .putLong(KEY_LAST_AT, now)
-            .apply()
-        return true
+    }
+
+    internal fun clearForTests() {
+        synchronized(lock) { recent.clear() }
     }
 
     private fun hash(value: String): String {

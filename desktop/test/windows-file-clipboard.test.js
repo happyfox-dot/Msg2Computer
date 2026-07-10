@@ -12,7 +12,8 @@ const {
   readClipboardFilePathsFromClipboard,
   powershellEncodedCommand,
   writeWindowsFileDropList,
-  readWindowsFileDropList
+  readWindowsFileDropList,
+  readWindowsFileDropSnapshot
 } = require('../src/main/windows-file-clipboard')
 
 test('windows file clipboard normalizes existing files only', () => {
@@ -88,6 +89,35 @@ test('windows file clipboard reads PowerShell file drop list output', () => {
 
   assert.equal(called, true)
   assert.deepEqual(paths, [path.resolve(filePath)])
+})
+
+test('async native clipboard snapshot returns sequence and paths without a synchronous wait', async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'codebridge-clip-snapshot-'))
+  const filePath = path.join(tmpRoot, 'payload.py')
+  fs.writeFileSync(filePath, 'print("ok")')
+  let callerReturned = false
+  let callbackObservedReturn = false
+
+  const pending = readWindowsFileDropSnapshot({
+    force: true,
+    execFile: (exe, args, options, callback) => {
+      assert.equal(exe, 'powershell.exe')
+      assert.ok(args.includes('-STA'))
+      assert.equal(options.encoding, 'utf8')
+      setImmediate(() => {
+        callbackObservedReturn = callerReturned
+        callback(null, JSON.stringify({ sequence: 42, paths: [filePath] }))
+      })
+      return { kill() {} }
+    }
+  })
+  callerReturned = true
+
+  assert.deepEqual(await pending, {
+    sequence: 42,
+    paths: [path.resolve(filePath)]
+  })
+  assert.equal(callbackObservedReturn, true)
 })
 
 test('clipboard file reader accepts legacy FileNameW buffer paths', () => {

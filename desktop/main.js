@@ -15,6 +15,7 @@ const topologyManager = require('./src/main/topology-manager')
 const totpStore = require('./src/main/totp-store')
 const relayClient = require('./src/main/relay-client')
 const busEnvelope = require('./src/main/bus-envelope')
+const busAck = require('./src/main/bus-ack')
 const { createContentBus } = require('./src/main/content-bus')
 const { createBusReliabilityStore } = require('./src/main/bus-reliability')
 const {
@@ -26,8 +27,26 @@ const updater = require('./src/main/updater')
 const { createFileTransfer } = require('./src/main/file-transfer')
 const clipboardVersion = require('./src/main/clipboard-version')
 const trustedNode = require('./src/main/trusted-node')
-const { writeWindowsFileDropList } = require('./src/main/windows-file-clipboard')
+const {
+  readClipboardFilePathsFromClipboard,
+  readWindowsFileDropSnapshot,
+  writeWindowsFileDropList
+} = require('./src/main/windows-file-clipboard')
+const clipboardFileSession = require('./src/main/clipboard-file-session')
+const {
+  serializeSecureJsonState,
+  parseSecureJsonState
+} = require('./src/main/secure-json-state')
+const {
+  resolveDerivedSessionKey,
+  guardUnauthenticatedWebSocket
+} = require('./src/main/websocket-security')
 const { readJsonSync, writeJsonAtomic, writeJsonAtomicSync } = require('./src/main/async-json-file')
+const { createPersistenceReadiness } = require('./src/main/persistence-readiness')
+
+// A process may be started only to ask an older instance to quit for an update.
+// Do not let that short-lived process persist the empty in-memory defaults.
+const persistenceReadiness = createPersistenceReadiness()
 
 let mainWindow = null
 let bubbleWindow = null

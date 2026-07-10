@@ -3,6 +3,9 @@ const http = require('http')
 function postJsonToNode(host, port, body, options = {}) {
   const timeoutMs = Number(options.timeoutMs) || 3500
   const normalizeHost = typeof options.normalizeHost === 'function' ? options.normalizeHost : value => value
+  const validateResponse = typeof options.validateResponse === 'function'
+    ? options.validateResponse
+    : null
 
   return new Promise(resolve => {
     const data = Buffer.from(JSON.stringify(body), 'utf8')
@@ -31,16 +34,28 @@ function postJsonToNode(host, port, body, options = {}) {
         }
         const text = Buffer.concat(chunks).toString('utf8').trim()
         if (!text) {
-          resolve(true)
+          resolve(validateResponse ? false : true)
           return
         }
+        let parsed
         try {
-          const parsed = JSON.parse(text)
-          if (parsed && parsed.type === 'bus_ack' && parsed.accepted === false) {
+          parsed = JSON.parse(text)
+        } catch (_) {
+          resolve(validateResponse ? false : true)
+          return
+        }
+        if (validateResponse) {
+          try {
+            resolve(validateResponse(parsed, { statusCode: res.statusCode }) === true)
+          } catch (_) {
             resolve(false)
-            return
           }
-        } catch (_) {}
+          return
+        }
+        if (parsed && parsed.type === 'bus_ack' && parsed.accepted === false) {
+          resolve(false)
+          return
+        }
         resolve(true)
       })
     })

@@ -37,11 +37,17 @@ function hasSameClipboardHash(current = {}, hash = '') {
   return !!value && value === normalizeClipboardVersion(current).hash
 }
 
+function nextLocalClipboardTimestamp(current = {}, now = Date.now()) {
+  const currentTs = normalizeClipboardVersion(current).ts
+  return Math.max(Number(now) || 0, currentTs + 1)
+}
+
 module.exports = {
   normalizeClipboardVersion,
   compareClipboardVersion,
   isNewerClipboardVersion,
   rememberClipboardVersion,
   bestClipboardVersion,
-  hasSameClipboardHash
+  hasSameClipboardHash,
+  nextLocalClipboardTimestamp
 }

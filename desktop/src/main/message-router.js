@@ -85,6 +85,15 @@ function canReceiveContentType(type, settings = {}, codeTypes = {}) {
   return true
 }
 
+function isExpiredContentPayload(payload = {}, now = Date.now(), codeTypes = {}) {
+  const type = String(payload.contentType || payload.type || '').trim()
+  if (type !== String(codeTypes.SMS || 'sms')) return false
+  const expiresAt = Number(payload.expiresAt || 0) || 0
+  if (expiresAt > 0) return expiresAt <= now
+  const timestamp = Number(payload.timestamp || 0) || 0
+  return timestamp > 0 && timestamp + 2 * 60 * 1000 <= now
+}
+
 function createRecentDeliveryTracker(limit = 300) {
   const seen = new Set()
   const order = []
@@ -110,5 +119,6 @@ module.exports = {
   normalizePushContentPolicy,
   canPushContentToNode,
   canReceiveContentType,
+  isExpiredContentPayload,
   createRecentDeliveryTracker
 }

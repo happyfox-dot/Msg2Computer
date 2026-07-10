@@ -2,7 +2,8 @@
 
 const {
   normalizeNetworkHost,
-  collectNetworkHosts
+  collectNetworkHosts,
+  isTailscaleAddress
 } = require('./network-utils')
 
 function primaryTrustedNodeHost(node = {}) {
@@ -61,6 +62,52 @@ function withPrimaryTrustedHost(node = {}) {
   }
 }
 
+function connectionCandidateHosts(node = {}, discovered = {}) {
+  const trustedHosts = collectNetworkHosts(
+    node.host,
+    node.lastIP,
+    node.relayHost,
+    node.tsHost,
+    node.altHosts
+  )
+  const discoveredHost = String(discovered.id || '') === String(node.id || '')
+    ? normalizeNetworkHost(discovered.host)
+    : ''
+  return collectNetworkHosts(trustedHosts, discoveredHost)
+}
+
+// HTTP delivery may try an unauthenticated discovery address, but this helper
+// only returns candidates and never mutates trust state. Callers may promote a
+// candidate with withAuthenticatedHost only after a cryptographically bound
+// handshake (for example, a signed bus ACK); legacy HTTP status alone is not
+// proof that the peer at that address owns the pairing key.
+function deliveryCandidateHosts(node = {}, discovered = {}, preferredHost = '') {
+  return collectNetworkHosts(
+    preferredHost,
+    connectionCandidateHosts(node, discovered)
+  )
+}
+
+function withAuthenticatedHost(node = {}, authenticatedHost = '') {
+  const host = normalizeNetworkHost(authenticatedHost)
+  if (!host) return { ...node }
+  const previousHosts = collectNetworkHosts(
+    node.host,
+    node.lastIP,
+    node.relayHost,
+    node.tsHost,
+    node.altHosts
+  )
+  const tsHost = isTailscaleAddress(host) ? host : normalizeNetworkHost(node.tsHost)
+  return {
+    ...node,
+    host,
+    lastIP: host,
+    tsHost,
+    altHosts: previousHosts.filter(value => value !== host && value !== tsHost)
+  }
+}
+
 module.exports = {
   normalizeNetworkHost,
   collectNetworkHosts,
@@ -69,5 +116,8 @@ module.exports = {
   hasTrustedNodeAddressOrRoute,
   shouldImportTrustedTopologyNode,
   shouldRouteTrustedTopologyNode,
-  withPrimaryTrustedHost
+  withPrimaryTrustedHost,
+  connectionCandidateHosts,
+  deliveryCandidateHosts,
+  withAuthenticatedHost
 }

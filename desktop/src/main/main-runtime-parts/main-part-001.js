@@ -3,6 +3,8 @@ let bubbleQueue = []
 let tray = null
 let wss = null
 let wsHeartbeatTimer = null
+let wsServerRestartTimer = null
+let wsServerRestartAttempts = 0
 let pairingKey = null
 let pairingQRData = null
 let authorizedPhones = new Map()
@@ -50,7 +52,7 @@ let desktopMessageSettings = {
   // 开启后桌面自动把本机剪贴板变化推送给已配对节点，并接受其它节点同步过来的剪贴板。
   syncClipboard: false,
   syncClipboardText: false,
-  syncClipboardImage: true,
+  syncClipboardImage: false,
   syncClipboardFile: false,
   receiveFileTransfer: false,
   autoAcceptFiles: false,
@@ -82,7 +84,7 @@ const DEFAULT_MESSAGE_SETTINGS = {
   // 剪贴板同步默认关闭：剪贴板常含密码等敏感内容，需用户显式启用
   syncClipboard: false,
   syncClipboardText: false,
-  syncClipboardImage: true,
+  syncClipboardImage: false,
   syncClipboardFile: false,
   receiveFileTransfer: false,
   autoAcceptFiles: false,
@@ -115,6 +117,8 @@ const TOPOLOGY_ENTRY_TTL_MS = 24 * 60 * 60 * 1000
 // BFD 式存活检测周期：一个周期未回 pong 即判定链路死亡并 terminate，
 // 触发 close → 拓扑重收敛，不再依赖 TCP 自身超时（静默断链可能挂数分钟）
 const WS_HEARTBEAT_INTERVAL_MS = 30 * 1000
+const WS_AUTH_TIMEOUT_MS = 10 * 1000
+const WS_MAX_PAYLOAD_BYTES = 2 * 1024 * 1024
 // 桌面对端断线后的自动重连扫描周期：出站 WS 连接 close 后不会自行恢复，
 // 周期性补连已配对且未连接的对端（失败时按 desktopPeerHostAttempts 轮换候选地址）
 const DESKTOP_PEER_RECONNECT_INTERVAL_MS = 45 * 1000
@@ -1414,6 +1418,7 @@ let topologyBacklogSaveDirty = false
 let topologyBacklogSaveInFlight = null
 
 function saveTopologyDeltaBacklog() {
+  if (!persistenceReadiness.canPersistUserState()) return
   if (topologyBacklogSaveTimer) return
   topologyBacklogSaveTimer = setTimeout(() => {
     topologyBacklogSaveTimer = null
@@ -1427,10 +1432,18 @@ function flushPendingTopologyBacklogSave(options = {}) {
     clearTimeout(topologyBacklogSaveTimer)
     topologyBacklogSaveTimer = null
   }
+  if (!persistenceReadiness.canPersistUserState()) {
+    topologyBacklogSaveDirty = false
+    return Promise.resolve(false)
+  }
   return flushTopologyDeltaBacklogToDisk(options)
 }
 
 function flushTopologyDeltaBacklogToDisk(options = {}) {
+  if (!persistenceReadiness.canPersistUserState()) {
+    topologyBacklogSaveDirty = false
+    return Promise.resolve(false)
+  }
   if (options.sync === true) {
     topologyBacklogSaveDirty = false
     try {
@@ -1454,6 +1467,7 @@ function flushTopologyDeltaBacklogToDisk(options = {}) {
 async function drainTopologyBacklogSaveQueue() {
   while (topologyBacklogSaveDirty) {
     topologyBacklogSaveDirty = false
+    if (!persistenceReadiness.canPersistUserState()) continue
     try {
       await writeJsonAtomic(getTopologyDeltaBacklogPath(), buildTopologyDeltaBacklogState())
     } catch (error) {
@@ -1537,12 +1551,26 @@ function getBusReliabilityPath() {
   return path.join(app.getPath('userData'), BUS_RELIABILITY_FILE)
 }
 
+let busReliabilityStateUnreadable = false
+let warnedBusReliabilityEncryptionUnavailable = false
+
 function loadBusReliabilityState() {
   try {
     const filePath = getBusReliabilityPath()
     if (!fs.existsSync(filePath)) return {}
-    return JSON.parse(fs.readFileSync(filePath, 'utf8'))
+    const decoded = parseSecureJsonState(fs.readFileSync(filePath, 'utf8'), { safeStorage })
+    busReliabilityStateUnreadable = false
+    if (decoded.legacyPlaintext) {
+      // v1 stored the complete envelope (including SMS/clipboard text) as JSON.
+      // Rewrite it immediately so a successful migration does not wait for the
+      // next message or for a clean application shutdown.
+      saveBusReliabilityState(decoded.state)
+    }
+    return decoded.state
   } catch (error) {
+    // Preserve any unreadable/corrupt file for recovery instead of replacing
+    // it with an empty state during the next debounced save.
+    busReliabilityStateUnreadable = true
     console.warn('Failed to load bus reliability state:', error.message)
     return {}
   }
@@ -1552,11 +1580,33 @@ function saveBusReliabilityState(state) {
   const filePath = getBusReliabilityPath()
   const tmpPath = `${filePath}.tmp`
   try {
+    // Never destroy an encrypted outbox merely because the OS keyring is
+    // temporarily unavailable. New records remain memory-only for this run.
+    if (busReliabilityStateUnreadable) return
     fs.mkdirSync(path.dirname(filePath), { recursive: true })
-    fs.writeFileSync(tmpPath, JSON.stringify(state || {}, null, 2), 'utf8')
+    const serialized = serializeSecureJsonState(state || {}, {
+      safeStorage,
+      // Without a keyring, retain only non-content deduplication metadata.
+      // Persisting envelope payloads in plaintext would expose verification
+      // codes, notification bodies and clipboard text.
+      fallbackState: value => ({
+        version: Number(value?.version || 1),
+        seen: Array.isArray(value?.seen) ? value.seen : [],
+        outbox: []
+      })
+    })
+    if (!safeStorage?.isEncryptionAvailable?.() && !warnedBusReliabilityEncryptionUnavailable) {
+      warnedBusReliabilityEncryptionUnavailable = true
+      console.warn('safeStorage unavailable; bus outbox content will not be persisted')
+    }
+    fs.writeFileSync(tmpPath, serialized, 'utf8')
     fs.renameSync(tmpPath, filePath)
   } catch (error) {
     console.warn('Failed to save bus reliability state:', error.message)
+  } finally {
+    try {
+      if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath)
+    } catch (_) {}
   }
 }
 
@@ -1797,6 +1847,7 @@ function getContentBus() {
 
 function loadOrCreatePairingKey() {
   const configPath = getPairingConfigPath()
+  let shouldPersistTopologyBacklog = false
   try {
     if (fs.existsSync(configPath)) {
       const saved = JSON.parse(fs.readFileSync(configPath, 'utf8'))
@@ -1907,10 +1958,8 @@ function loadOrCreatePairingKey() {
         )
       }
       const savedMessageSettings = { ...(saved.messageSettings || {}) }
-      if (savedPolicyVersion < 4) {
-        savedMessageSettings.syncClipboardImage = true
-      }
       desktopMessageSettings = normalizeMessageSettings(savedMessageSettings)
+      if (process.platform !== 'win32') desktopMessageSettings.syncClipboardFile = false
       fileTransferDownloadDir = normalizeFileTransferDownloadDir(saved.fileTransferDownloadDir || '')
       clipboardSyncState = normalizeClipboardSyncState(saved.clipboardSyncState || {})
       clipboardImageSyncState = normalizeClipboardSyncState(saved.clipboardImageSyncState || {})
@@ -1924,7 +1973,7 @@ function loadOrCreatePairingKey() {
       importSavedTopologyLsdb(saved.topologyLsdb || {})
       importTopologyDeltaBacklog(loadTopologyDeltaBacklogState(saved.topologyDeltaBacklog || []))
       if (Array.isArray(saved.topologyDeltaBacklog) && saved.topologyDeltaBacklog.length > 0) {
-        saveTopologyDeltaBacklog()
+        shouldPersistTopologyBacklog = true
       }
       pruneTotpDeleteTombstones()
       if (saved.pairingKey) {
@@ -1934,10 +1983,14 @@ function loadOrCreatePairingKey() {
         if (restoredKey) {
           pairingKey = restoredKey
           ensureTrustedNetworkId()
+          let shouldPersistPairingConfig = false
           if (!localEventToken) {
             ensureLocalEventToken()
-            savePairingKey()
+            shouldPersistPairingConfig = true
           }
+          persistenceReadiness.markPairingStateLoaded()
+          if (shouldPersistTopologyBacklog) saveTopologyDeltaBacklog()
+          if (shouldPersistPairingConfig) savePairingKey()
           return
         }
         throw new Error('pairing key could not be decrypted')
@@ -1958,6 +2011,8 @@ function loadOrCreatePairingKey() {
   pairingKey = crypto.randomBytes(32).toString('base64')
   ensureTrustedNetworkId()
   ensureLocalEventToken()
+  persistenceReadiness.markPairingStateLoaded()
+  if (shouldPersistTopologyBacklog) saveTopologyDeltaBacklog()
   savePairingKey()
 }
 
@@ -1967,6 +2022,7 @@ let pairingSaveInFlight = null
 
 // 调用极频繁（每次设备上线、每条消息落库都会触发），防抖合并 500ms 内的写盘
 function savePairingKey() {
+  if (!persistenceReadiness.canPersistUserState()) return
   if (pairingSaveTimer) return
   pairingSaveTimer = setTimeout(() => {
     pairingSaveTimer = null
@@ -1980,12 +2036,21 @@ function flushPendingPairingSave(options = {}) {
     clearTimeout(pairingSaveTimer)
     pairingSaveTimer = null
   }
+  if (!persistenceReadiness.canPersistUserState()) {
+    pairingSaveDirty = false
+    flushPendingTopologyBacklogSave(options)
+    return Promise.resolve(false)
+  }
   const sync = options.sync === true || app.isQuitting === true
   flushPendingTopologyBacklogSave({ sync })
   return flushPairingConfigToDisk({ sync })
 }
 
 function flushPairingConfigToDisk(options = {}) {
+  if (!persistenceReadiness.canPersistUserState()) {
+    pairingSaveDirty = false
+    return Promise.resolve(false)
+  }
   if (options.sync === true) {
     pairingSaveDirty = false
     try {
@@ -2011,6 +2076,7 @@ function flushPairingConfigToDisk(options = {}) {
 async function drainPairingConfigSaveQueue() {
   while (pairingSaveDirty) {
     pairingSaveDirty = false
+    if (!persistenceReadiness.canPersistUserState()) continue
     try {
       const nextState = buildPairingConfigState()
       backupPairingConfigBeforeTotpShrink(nextState)
@@ -2041,7 +2107,7 @@ function backupPairingConfigBeforeTotpShrink(nextState) {
 function buildPairingConfigState() {
   return {
     // 内容策略格式版本：v2 起 allowClipboard 默认 true（见 loadOrCreatePairingKey 迁移）
-    policyVersion: 4,
+    policyVersion: 5,
     networkId: ensureTrustedNetworkId(),
     allowLanJoinRequests,
     localEventToken: protectSecret(ensureLocalEventToken()),
