@@ -115,20 +115,29 @@ jobs:
             throw "Required APK verification tools not found in $($buildTools.FullName)"
           }
 
-          $signatureLines = & $apksigner verify --verbose --print-certs $apk 2>&1
+          $signatureLines = & $apksigner verify --verbose --print-certs-pem $apk 2>&1
           $signatureText = $signatureLines -join "`n"
-          $certMatch = [regex]::Match(
+          $certificateMatches = [regex]::Matches(
             $signatureText,
-            'Signer #1 certificate SHA-256 digest:\s*([0-9a-fA-F]+)'
+            '-----BEGIN CERTIFICATE-----\s*(?<base64>[A-Za-z0-9+/=\s]+?)\s*-----END CERTIFICATE-----',
+            [System.Text.RegularExpressions.RegexOptions]::Singleline
           )
-          if (-not $certMatch.Success) { throw 'Unable to read APK signer certificate SHA-256' }
-          $actualCert = $certMatch.Groups[1].Value.ToLowerInvariant()
+          if ($certificateMatches.Count -ne 1) {
+            throw "APK must expose exactly one signing certificate; found $($certificateMatches.Count)"
+          }
+          $certificateBase64 = $certificateMatches[0].Groups['base64'].Value -replace '\s', ''
+          $certificateBytes = [Convert]::FromBase64String($certificateBase64)
+          $sha256 = [Security.Cryptography.SHA256]::Create()
+          try {
+            $actualCert = ([BitConverter]::ToString($sha256.ComputeHash($certificateBytes)) -replace '-', '').ToLowerInvariant()
+          } finally {
+            $sha256.Dispose()
+          }
           if ($actualCert -ne $env:EXPECTED_ANDROID_CERT_SHA256) {
             throw "Unexpected Android signing certificate: $actualCert"
           }
-          if ($signatureText -notmatch 'Number of signers:\s*1' -or
-              $signatureText -notmatch 'Verified using v2 scheme \(APK Signature Scheme v2\): true') {
-            throw 'APK must have exactly one signer and a valid v2 signature'
+          if ($signatureText -notmatch 'Verified using v2 scheme \(APK Signature Scheme v2\): true') {
+            throw 'APK must have a valid v2 signature'
           }
 
           $badgingLines = & $aapt dump badging $apk 2>&1
