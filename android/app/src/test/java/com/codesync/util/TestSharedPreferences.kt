@@ -15,7 +15,7 @@ class InMemoryContext : ContextWrapper(null) {
     }
 }
 
-private class InMemorySharedPreferences : SharedPreferences {
+class InMemorySharedPreferences : SharedPreferences {
     private val lock = Any()
     private val values = mutableMapOf<String, Any?>()
     private val listeners = mutableSetOf<SharedPreferences.OnSharedPreferenceChangeListener>()

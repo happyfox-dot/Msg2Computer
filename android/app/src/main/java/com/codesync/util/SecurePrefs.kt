@@ -7,18 +7,18 @@ import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import java.util.concurrent.ConcurrentHashMap
 
-/**
- * 含敏感数据（配对密钥、设备凭证）的 SharedPreferences 统一从这里获取：
- * Android Keystore 主密钥 + EncryptedSharedPreferences 落盘加密，
- * 首次访问时自动把同名明文 prefs 的旧数据迁移进来并清空原文件。
- *
- * 配对密钥是整个信任体系的根（可伪造鉴权、解密中继负载），
- * 明文存在 /data/data 下会被备份提取、root 设备直读。
- * 极少数 ROM 的 Keystore 不可用时回退明文，保证功能不被锁死。
- */
+/** Central encrypted-preference factory for credentials and private state. */
 object SecurePrefs {
     private const val TAG = "SecurePrefs"
-    private val cache = ConcurrentHashMap<String, SharedPreferences>()
+    private const val RETRY_AFTER_FAILURE_MS = 5_000L
+
+    private data class CachedPrefs(
+        val prefs: SharedPreferences,
+        val encryptedAvailable: Boolean,
+        val retryAfter: Long = Long.MAX_VALUE
+    )
+
+    private val cache = ConcurrentHashMap<String, CachedPrefs>()
     @Volatile
     private var testProvider: ((Context, String) -> SharedPreferences)? = null
 
@@ -27,16 +27,55 @@ object SecurePrefs {
         cache.clear()
     }
 
+    /**
+     * Returns encrypted preferences when Keystore is available. On a transient
+     * create failure it returns a process-memory-only store: callers keep running,
+     * but no secret is ever persisted as plaintext and the encrypted file is left
+     * untouched. Creation is retried later in the same process.
+     */
     fun get(context: Context, name: String): SharedPreferences {
         testProvider?.let { provider -> return provider(context, name) }
-        return cache.getOrPut(name) {
-            runCatching { createEncrypted(context.applicationContext, name) }
-                .getOrElse { e ->
-                    Log.e(TAG, "EncryptedSharedPreferences 不可用（$name），回退明文存储", e)
-                    context.applicationContext.getSharedPreferences(name, Context.MODE_PRIVATE)
-                }
+        val now = System.currentTimeMillis()
+        cache[name]?.let { cached ->
+            if (cached.encryptedAvailable || now < cached.retryAfter) return cached.prefs
+        }
+        synchronized(cache) {
+            val current = cache[name]
+            val retryNow = System.currentTimeMillis()
+            if (current != null && (current.encryptedAvailable || retryNow < current.retryAfter)) {
+                return current.prefs
+            }
+            val appContext = context.applicationContext
+            return runCatching { createEncrypted(appContext, name) }
+                .fold(
+                    onSuccess = { encrypted ->
+                        cache[name] = CachedPrefs(encrypted, encryptedAvailable = true)
+                        encrypted
+                    },
+                    onFailure = { error ->
+                        safeStorageLog(
+                            TAG,
+                            "EncryptedSharedPreferences unavailable ($name); using volatile memory only",
+                            error
+                        )
+                        val volatile = current?.prefs?.takeIf { !current.encryptedAvailable }
+                            ?: VolatileSharedPreferences()
+                        cache[name] = CachedPrefs(
+                            prefs = volatile,
+                            encryptedAvailable = false,
+                            retryAfter = retryNow + RETRY_AFTER_FAILURE_MS
+                        )
+                        volatile
+                    }
+                )
         }
     }
+
+    /** False means writes are volatile/no-op with respect to durable storage. */
+    fun isStorageAvailable(prefs: SharedPreferences): Boolean =
+        prefs !is VolatileSharedPreferences
+
+    internal fun unavailablePreferencesForTests(): SharedPreferences = VolatileSharedPreferences()
 
     private fun createEncrypted(context: Context, name: String): SharedPreferences {
         val masterKey = MasterKey.Builder(context)
@@ -49,12 +88,18 @@ object SecurePrefs {
             EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
             EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
         )
-        migratePlainPrefs(context, name, encrypted)
+        // Migration failure must not make a healthy encrypted target unavailable.
+        runCatching { migratePlainPrefs(context, name, encrypted) }
+            .onFailure { safeStorageLog(TAG, "Plaintext migration deferred for $name", it) }
         return encrypted
     }
 
-    /** 把旧明文 prefs 的数据搬进加密存储（已存在的键不覆盖），随后清空明文文件。 */
-    private fun migratePlainPrefs(context: Context, plainName: String, encrypted: SharedPreferences) {
+    /** Clear legacy plaintext only after the encrypted transaction commits. */
+    private fun migratePlainPrefs(
+        context: Context,
+        plainName: String,
+        encrypted: SharedPreferences
+    ) {
         val plain = context.getSharedPreferences(plainName, Context.MODE_PRIVATE)
         val entries = plain.all
         if (entries.isEmpty()) return
@@ -71,10 +116,108 @@ object SecurePrefs {
                     @Suppress("UNCHECKED_CAST")
                     editor.putStringSet(key, value as Set<String>)
                 }
+                else -> return // Unknown value: preserve the entire legacy file.
             }
         }
-        editor.apply()
-        plain.edit().clear().apply()
-        Log.i(TAG, "已迁移 ${entries.size} 项明文配置到加密存储：$plainName")
+        if (!editor.commit()) return
+        if (plain.edit().clear().commit()) {
+            Log.i(TAG, "Migrated ${entries.size} plaintext entries to encrypted storage: $plainName")
+        }
+    }
+
+    /** Stable process-local fallback. It never writes a filesystem preference. */
+    private class VolatileSharedPreferences : SharedPreferences {
+        private val lock = Any()
+        private val values = mutableMapOf<String, Any?>()
+        private val listeners = mutableSetOf<SharedPreferences.OnSharedPreferenceChangeListener>()
+
+        override fun getAll(): MutableMap<String, *> = synchronized(lock) { HashMap(values) }
+        override fun getString(key: String?, defValue: String?): String? =
+            synchronized(lock) { values[key] as? String ?: defValue }
+
+        override fun getStringSet(key: String?, defValues: MutableSet<String>?): MutableSet<String>? =
+            synchronized(lock) {
+                @Suppress("UNCHECKED_CAST")
+                (values[key] as? Set<String>)?.toMutableSet() ?: defValues
+            }
+
+        override fun getInt(key: String?, defValue: Int): Int =
+            synchronized(lock) { values[key] as? Int ?: defValue }
+
+        override fun getLong(key: String?, defValue: Long): Long =
+            synchronized(lock) { values[key] as? Long ?: defValue }
+
+        override fun getFloat(key: String?, defValue: Float): Float =
+            synchronized(lock) { values[key] as? Float ?: defValue }
+
+        override fun getBoolean(key: String?, defValue: Boolean): Boolean =
+            synchronized(lock) { values[key] as? Boolean ?: defValue }
+
+        override fun contains(key: String?): Boolean = synchronized(lock) { values.containsKey(key) }
+        override fun edit(): SharedPreferences.Editor = Editor()
+
+        override fun registerOnSharedPreferenceChangeListener(
+            listener: SharedPreferences.OnSharedPreferenceChangeListener?
+        ) {
+            if (listener != null) synchronized(lock) { listeners.add(listener) }
+        }
+
+        override fun unregisterOnSharedPreferenceChangeListener(
+            listener: SharedPreferences.OnSharedPreferenceChangeListener?
+        ) {
+            if (listener != null) synchronized(lock) { listeners.remove(listener) }
+        }
+
+        private inner class Editor : SharedPreferences.Editor {
+            private val pending = mutableMapOf<String, Any?>()
+            private var clearAll = false
+
+            override fun putString(key: String?, value: String?) = apply {
+                if (key != null) pending[key] = value
+            }
+
+            override fun putStringSet(key: String?, values: MutableSet<String>?) = apply {
+                if (key != null) pending[key] = values?.toSet()
+            }
+
+            override fun putInt(key: String?, value: Int) = apply { if (key != null) pending[key] = value }
+            override fun putLong(key: String?, value: Long) = apply { if (key != null) pending[key] = value }
+            override fun putFloat(key: String?, value: Float) = apply { if (key != null) pending[key] = value }
+            override fun putBoolean(key: String?, value: Boolean) = apply {
+                if (key != null) pending[key] = value
+            }
+
+            override fun remove(key: String?) = apply { if (key != null) pending[key] = null }
+            override fun clear() = apply { clearAll = true }
+            override fun apply() { commit() }
+
+            override fun commit(): Boolean {
+                val changed = mutableSetOf<String>()
+                val snapshot: List<SharedPreferences.OnSharedPreferenceChangeListener>
+                synchronized(lock) {
+                    if (clearAll) {
+                        changed.addAll(values.keys)
+                        values.clear()
+                    }
+                    for ((key, value) in pending) {
+                        changed.add(key)
+                        if (value == null) values.remove(key) else values[key] = value
+                    }
+                    snapshot = listeners.toList()
+                }
+                changed.forEach { key ->
+                    snapshot.forEach { it.onSharedPreferenceChanged(this@VolatileSharedPreferences, key) }
+                }
+                return true
+            }
+        }
+    }
+}
+
+internal fun safeStorageLog(tag: String, message: String, error: Throwable? = null) {
+    // android.jar logging methods throw in local JVM tests; diagnostics must never
+    // turn a handled storage failure back into an application crash.
+    runCatching {
+        if (error == null) Log.e(tag, message) else Log.e(tag, message, error)
     }
 }

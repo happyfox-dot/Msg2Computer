@@ -7,6 +7,7 @@ import kotlin.math.min
 import kotlin.math.pow
 
 object BusReliabilityStore {
+    private const val TAG = "BusReliabilityStore"
     private const val PREFS = "bus_reliability"
     private const val KEY_SEEN = "seen"
     private const val KEY_OUTBOX = "outbox"
@@ -25,7 +26,7 @@ object BusReliabilityStore {
         if (key.isBlank()) return true
         synchronized(lock) {
             val now = System.currentTimeMillis()
-            val seen = loadSeen(context)
+            val seen = loadSeen(context) ?: return false
             pruneSeen(seen, now)
             if (seen.has(key)) {
                 saveSeen(context, seen)
@@ -33,8 +34,7 @@ object BusReliabilityStore {
             }
             seen.put(key, now)
             trimObject(seen, SEEN_LIMIT)
-            saveSeen(context, seen)
-            return true
+            return saveSeen(context, seen)
         }
     }
 
@@ -45,7 +45,7 @@ object BusReliabilityStore {
         if (!shouldPersistOutbound(envelope)) return
         val envelopeCopy = safeEnvelopeCopy(envelope) ?: return
         synchronized(lock) {
-            val outbox = loadOutbox(context)
+            val outbox = loadOutbox(context) ?: return
             val key = outboxKey(messageId, target)
             val now = System.currentTimeMillis()
             outbox.put(
@@ -68,7 +68,7 @@ object BusReliabilityStore {
 
     fun markDelivered(context: Context, messageId: String, targetNodeId: String) {
         synchronized(lock) {
-            val outbox = loadOutbox(context)
+            val outbox = loadOutbox(context) ?: return
             outbox.remove(outboxKey(messageId, targetNodeId))
             saveOutbox(context, outbox)
         }
@@ -76,7 +76,7 @@ object BusReliabilityStore {
 
     fun markFailed(context: Context, messageId: String, targetNodeId: String, reason: String = "") {
         synchronized(lock) {
-            val outbox = loadOutbox(context)
+            val outbox = loadOutbox(context) ?: return
             val key = outboxKey(messageId, targetNodeId)
             val item = outbox.optJSONObject(key) ?: return
             val attempts = item.optInt("attempts", 0) + 1
@@ -99,7 +99,7 @@ object BusReliabilityStore {
     fun dueOutbound(context: Context, limit: Int = 30): List<JSONObject> {
         synchronized(lock) {
             val now = System.currentTimeMillis()
-            val outbox = loadOutbox(context)
+            val outbox = loadOutbox(context) ?: return emptyList()
             val records = mutableListOf<JSONObject>()
             val remove = mutableListOf<String>()
             val keys = outbox.keys()
@@ -132,46 +132,54 @@ object BusReliabilityStore {
     private fun outboxKey(messageId: String, targetNodeId: String): String =
         "${messageId.trim()}|${targetNodeId.trim()}"
 
-    private fun loadSeen(context: Context): JSONObject =
-        runCatching { JSONObject(prefs(context).getString(KEY_SEEN, "{}").orEmpty()) }
-            .getOrElse { JSONObject() }
-
-    private fun saveSeen(context: Context, seen: JSONObject) {
-        prefs(context).edit().putString(KEY_SEEN, seen.toString()).apply()
+    private fun loadSeen(context: Context): JSONObject? {
+        val preferences = prefs(context)
+        if (!SecurePrefs.isStorageAvailable(preferences)) return null
+        return runCatching { JSONObject(preferences.getString(KEY_SEEN, "{}").orEmpty()) }
+            .onFailure { safeStorageLog(TAG, "Unable to read encrypted inbound dedupe state", it) }
+            .getOrNull()
     }
 
-    private fun loadOutbox(context: Context): JSONObject =
-        runCatching {
-            val raw = prefs(context).getString(KEY_OUTBOX, "{}").orEmpty()
+    private fun saveSeen(context: Context, seen: JSONObject): Boolean {
+        val preferences = prefs(context)
+        if (!SecurePrefs.isStorageAvailable(preferences)) return false
+        return runCatching { preferences.edit().putString(KEY_SEEN, seen.toString()).commit() }
+            .onFailure { safeStorageLog(TAG, "Unable to save encrypted inbound dedupe state", it) }
+            .getOrDefault(false)
+    }
+
+    private fun loadOutbox(context: Context): JSONObject? {
+        val preferences = prefs(context)
+        if (!SecurePrefs.isStorageAvailable(preferences)) return null
+        return runCatching {
+            val raw = preferences.getString(KEY_OUTBOX, "{}").orEmpty()
             if (raw.toByteArray(Charsets.UTF_8).size > MAX_OUTBOX_BYTES * 2) {
-                prefs(context).edit().remove(KEY_OUTBOX).apply()
-                JSONObject()
+                throw IllegalStateException("encrypted outbox exceeds safety limit")
             } else {
                 JSONObject(raw)
             }
-        }.getOrElse {
-            runCatching { prefs(context).edit().remove(KEY_OUTBOX).apply() }
-            JSONObject()
-        }
+        }.onFailure { safeStorageLog(TAG, "Unable to read encrypted outbox; preserving source", it) }
+            .getOrNull()
+    }
 
-    private fun saveOutbox(context: Context, outbox: JSONObject) {
+    private fun saveOutbox(context: Context, outbox: JSONObject): Boolean {
         pruneOutbox(outbox)
         val serialized = runCatching { outbox.toString() }.getOrElse {
-            runCatching { prefs(context).edit().remove(KEY_OUTBOX).apply() }
-            return
+            safeStorageLog(TAG, "Unable to serialize outbox; preserving stored value", it)
+            return false
         }
         if (serialized.toByteArray(Charsets.UTF_8).size > MAX_OUTBOX_BYTES) {
             shrinkOutboxToBudget(outbox)
         }
         val compact = runCatching { outbox.toString() }.getOrElse {
-            runCatching { prefs(context).edit().remove(KEY_OUTBOX).apply() }
-            return
+            safeStorageLog(TAG, "Unable to compact outbox; preserving stored value", it)
+            return false
         }
-        runCatching {
-            prefs(context).edit().putString(KEY_OUTBOX, compact).apply()
-        }.onFailure {
-            runCatching { prefs(context).edit().remove(KEY_OUTBOX).apply() }
-        }
+        val preferences = prefs(context)
+        if (!SecurePrefs.isStorageAvailable(preferences)) return false
+        return runCatching { preferences.edit().putString(KEY_OUTBOX, compact).commit() }
+            .onFailure { safeStorageLog(TAG, "Unable to save encrypted outbox; preserving stored value", it) }
+            .getOrDefault(false)
     }
 
     private fun pruneSeen(seen: JSONObject, now: Long) {
@@ -205,11 +213,14 @@ object BusReliabilityStore {
     private fun shouldPersistOutbound(envelope: JSONObject): Boolean {
         val topic = envelope.optString("topic")
         val payload = envelope.optJSONObject("payload")
+        val expiresAt = envelope.optLong("expiresAt", 0L).takeIf { it > 0L }
+            ?: payload?.optLong("expiresAt", 0L)?.takeIf { it > 0L }
+        if (expiresAt != null && expiresAt <= System.currentTimeMillis()) return false
         val manifest = payload?.optJSONObject("fileManifest")
         if (manifest != null) {
             if (manifest.optBoolean("inline", false)) return false
-            val expiresAt = manifest.optLong("expiresAt", 0L)
-            if (expiresAt > 0L && expiresAt <= System.currentTimeMillis()) return false
+            val manifestExpiresAt = manifest.optLong("expiresAt", 0L)
+            if (manifestExpiresAt > 0L && manifestExpiresAt <= System.currentTimeMillis()) return false
         } else if (
             topic == ContentBus.Topic.CLIPBOARD_IMAGE ||
             topic == ContentBus.Topic.CLIPBOARD_FILE ||

@@ -23,8 +23,8 @@ android {
         applicationId = "com.codesync"
         minSdk = 23
         targetSdk = 34
-        versionCode = 49
-        versionName = "1.0.49"
+        versionCode = 50
+        versionName = "1.0.50"
     }
 
     signingConfigs {

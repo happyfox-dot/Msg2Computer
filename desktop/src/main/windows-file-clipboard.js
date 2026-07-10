@@ -3,7 +3,7 @@
 const fs = require('fs')
 const os = require('os')
 const path = require('path')
-const { execFileSync } = require('child_process')
+const { execFile, execFileSync } = require('child_process')
 
 function normalizeFileDropPaths(filePaths, options = {}) {
   const allowDirectories = options.allowDirectories === true
@@ -182,11 +182,90 @@ $paths | ConvertTo-Json -Compress
   }
 }
 
+/**
+ * Reads the native Windows file-drop clipboard without blocking Electron's
+ * main thread. The sequence number and paths are captured in the same STA
+ * process, so callers can ignore unchanged snapshots without guessing from
+ * filenames or repeatedly treating cached paths as a new clipboard value.
+ */
+function readWindowsFileDropSnapshot(options = {}) {
+  if (process.platform !== 'win32' && options.force !== true) {
+    return Promise.resolve({ sequence: 0, paths: [] })
+  }
+  const execFileImpl = options.execFile || execFile
+  const script = `
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class CodeBridgeClipboardNative {
+  [DllImport("user32.dll")]
+  public static extern uint GetClipboardSequenceNumber();
+}
+'@
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$list = [System.Windows.Forms.Clipboard]::GetFileDropList()
+$paths = @()
+foreach ($p in $list) {
+  $s = [string]$p
+  if ([System.IO.File]::Exists($s) -or [System.IO.Directory]::Exists($s)) { $paths += $s }
+}
+[PSCustomObject]@{
+  sequence = [UInt64][CodeBridgeClipboardNative]::GetClipboardSequenceNumber()
+  paths = @($paths)
+} | ConvertTo-Json -Compress -Depth 3
+`
+
+  return new Promise((resolve, reject) => {
+    const args = [
+      '-NoProfile',
+      '-STA',
+      '-ExecutionPolicy',
+      'Bypass',
+      '-EncodedCommand',
+      powershellEncodedCommand(script)
+    ]
+    const execOptions = {
+      windowsHide: true,
+      timeout: Number(options.timeoutMs || 2500),
+      maxBuffer: 256 * 1024,
+      encoding: 'utf8'
+    }
+    try {
+      execFileImpl('powershell.exe', args, execOptions, (error, stdout) => {
+        if (error) {
+          reject(error)
+          return
+        }
+        try {
+          const output = String(stdout || '').replace(/^\uFEFF/, '').trim()
+          const parsed = output ? JSON.parse(output) : {}
+          const rawPaths = Array.isArray(parsed.paths)
+            ? parsed.paths
+            : (parsed.paths ? [parsed.paths] : [])
+          resolve({
+            sequence: Math.max(0, Number(parsed.sequence || 0) || 0),
+            paths: normalizeFileDropPaths(rawPaths, {
+              allowDirectories: options.allowDirectories === true
+            })
+          })
+        } catch (error) {
+          reject(error)
+        }
+      })
+    } catch (error) {
+      reject(error)
+    }
+  })
+}
+
 module.exports = {
   normalizeFileDropPaths,
   hasWindowsFileDropFormat,
   readClipboardFilePathsFromClipboard,
   powershellEncodedCommand,
   writeWindowsFileDropList,
-  readWindowsFileDropList
+  readWindowsFileDropList,
+  readWindowsFileDropSnapshot
 }

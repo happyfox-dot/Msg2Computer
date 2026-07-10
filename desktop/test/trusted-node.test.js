@@ -45,3 +45,58 @@ test('route-only trusted node can enter routing but not direct import', () => {
   assert.equal(trustedNode.shouldImportTrustedTopologyNode(node), false)
   assert.equal(trustedNode.shouldRouteTrustedTopologyNode(node), true)
 })
+
+test('discovery host is only a candidate until authenticated', () => {
+  const peer = {
+    id: 'desktop-b',
+    host: '192.168.1.10',
+    lastIP: '192.168.1.10',
+    tsHost: '100.64.0.10',
+    pairingKey: 'secret'
+  }
+  const before = { ...peer }
+  const candidates = trustedNode.connectionCandidateHosts(peer, {
+    id: 'desktop-b',
+    host: '192.168.1.99'
+  })
+
+  assert.deepEqual(peer, before)
+  assert.deepEqual(candidates, ['192.168.1.10', '100.64.0.10', '192.168.1.99'])
+
+  const authenticated = trustedNode.withAuthenticatedHost(peer, '192.168.1.99')
+  assert.equal(authenticated.host, '192.168.1.99')
+  assert.equal(authenticated.lastIP, '192.168.1.99')
+  assert.deepEqual(authenticated.altHosts, ['192.168.1.10'])
+})
+
+test('discovery candidate must match the paired node id', () => {
+  assert.deepEqual(trustedNode.connectionCandidateHosts(
+    { id: 'desktop-b', host: '192.168.1.10' },
+    { id: 'attacker', host: '192.168.1.99' }
+  ), ['192.168.1.10'])
+})
+
+test('HTTP delivery retains stored hosts and appends only a same-id discovery host', () => {
+  const phone = {
+    id: 'phone-b',
+    lastIP: '192.168.1.10',
+    tsHost: '100.64.0.10'
+  }
+  const before = { ...phone }
+
+  assert.deepEqual(trustedNode.deliveryCandidateHosts(
+    phone,
+    { id: 'phone-b', host: '192.168.1.99' },
+    '192.168.1.20'
+  ), [
+    '192.168.1.20',
+    '192.168.1.10',
+    '100.64.0.10',
+    '192.168.1.99'
+  ])
+  assert.deepEqual(phone, before)
+  assert.deepEqual(trustedNode.deliveryCandidateHosts(
+    phone,
+    { id: 'attacker', host: '192.168.1.77' }
+  ), ['192.168.1.10', '100.64.0.10'])
+})

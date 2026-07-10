@@ -47,6 +47,7 @@ data class DesktopDevice(
 )
 
 object DeviceStore {
+    private const val TAG = "DeviceStore"
     private const val PREFS_NAME = "paired_desktop_devices"
     private const val KEY_DEVICES = "devices"
     private const val DESKTOP_WS_PORT = 19527
@@ -54,13 +55,20 @@ object DeviceStore {
     // 剪贴板策略 v2 一次性迁移标记：v1 存储里的 allowClipboard:false 是旧默认值
     // 而非用户选择，首次读取时统一翻转为新默认 true（此后用户的显式关闭原样保留）
     private const val KEY_CLIPBOARD_POLICY_V2 = "clipboard_policy_v2"
+    private var lastKnownDevices: List<DesktopDevice>? = null
 
-    fun getDevices(context: Context): List<DesktopDevice> {
-        ensureClipboardPolicyUpgrade(context)
-        val raw = prefs(context).getString(KEY_DEVICES, "[]") ?: "[]"
+    private fun loadDevices(context: Context): List<DesktopDevice>? {
         val devices = mutableListOf<DesktopDevice>()
 
         try {
+            // 加密存储读取（getString 会触发解密）与策略升级都要纳入 try：
+            // Keystore 失效/加密数据损坏时会抛 SecurityException/AEADBadTagException，
+            // 而 getDevices 在启动、路由刷新、拓扑广播等大量路径被调用，
+            // 一旦这里未捕获就会反复崩溃。降级为返回空设备表远好过闪退。
+            val preferences = prefs(context)
+            if (!SecurePrefs.isStorageAvailable(preferences)) return null
+            if (!ensureClipboardPolicyUpgrade(preferences)) return null
+            val raw = preferences.getString(KEY_DEVICES, "[]") ?: "[]"
             val array = JSONArray(raw)
             for (i in 0 until array.length()) {
                 val item = array.optJSONObject(i) ?: continue
@@ -122,11 +130,19 @@ object DeviceStore {
                     )
                 )
             }
-        } catch (_: Exception) {
-            return emptyList()
+        } catch (error: Exception) {
+            safeStorageLog(TAG, "Unable to decrypt/read device table; preserving encrypted data", error)
+            return null
         }
 
         return devices.sortedByDescending { it.updatedAt }
+    }
+
+    @Synchronized
+    fun getDevices(context: Context): List<DesktopDevice> {
+        val loaded = loadDevices(context)
+        if (loaded != null) lastKnownDevices = loaded
+        return loaded ?: lastKnownDevices ?: emptyList()
     }
 
     fun getEnabledDevices(context: Context): List<DesktopDevice> =
@@ -135,6 +151,7 @@ object DeviceStore {
     fun findDevice(context: Context, id: String): DesktopDevice? =
         getDevices(context).firstOrNull { it.id == id }
 
+    @Synchronized
     fun upsertDevice(
         context: Context,
         host: String,
@@ -172,7 +189,9 @@ object DeviceStore {
         // 只有用户显式配对（扫码/局域网配对）才传 true 表达重新启用意图。
         enabled: Boolean? = null
     ): DesktopDevice {
-        val devices = getDevices(context).toMutableList()
+        val loaded = loadDevices(context)
+        if (loaded != null) lastKnownDevices = loaded
+        val devices = (loaded ?: lastKnownDevices ?: emptyList()).toMutableList()
         val now = System.currentTimeMillis()
         val normalizedId = deviceId.ifBlank { "" }
         val normalizedType = deviceType.ifBlank { "WINDOWS_DESKTOP" }
@@ -272,7 +291,7 @@ object DeviceStore {
         } else {
             devices.add(device)
         }
-        saveDevices(context, devices)
+        if (loaded != null) saveDevices(context, devices)
         return device
     }
 
@@ -322,13 +341,16 @@ object DeviceStore {
             old.capabilities != next.capabilities
     }
 
+    @Synchronized
     fun setDeviceEnabled(context: Context, id: String, enabled: Boolean) {
-        val devices = getDevices(context).map {
+        val current = loadDevices(context) ?: return
+        val devices = current.map {
             if (it.id == id) it.copy(enabled = enabled, updatedAt = System.currentTimeMillis()) else it
         }
         saveDevices(context, devices)
     }
 
+    @Synchronized
     fun setDeviceContentPolicy(
         context: Context,
         id: String,
@@ -343,7 +365,8 @@ object DeviceStore {
         maxFileSizeMb: Int? = null,
         autoAcceptFiles: Boolean? = null
     ) {
-        val devices = getDevices(context).map {
+        val current = loadDevices(context) ?: return
+        val devices = current.map {
             if (it.id == id) {
                 it.copy(
                     allowSmsCodes = allowSmsCodes,
@@ -365,29 +388,65 @@ object DeviceStore {
         saveDevices(context, devices)
     }
 
+    @Synchronized
     fun markDeviceSynced(context: Context, id: String, timestamp: Long = System.currentTimeMillis()) {
-        val devices = getDevices(context).map {
+        val current = loadDevices(context) ?: return
+        val devices = current.map {
             if (it.id == id) it.copy(lastSyncAt = timestamp) else it
         }
         saveDevices(context, devices)
     }
 
+    @Synchronized
     fun markDeviceConnectionChanged(context: Context, id: String, timestamp: Long = System.currentTimeMillis()) {
-        val devices = getDevices(context).map {
+        val current = loadDevices(context) ?: return
+        val devices = current.map {
             if (it.id == id) it.copy(connectionUpdatedAt = timestamp) else it
         }
         saveDevices(context, devices)
     }
 
-    fun removeDevice(context: Context, id: String) {
-        saveDevices(context, getDevices(context).filterNot { it.id == id })
+    /**
+     * Promotes a previously stored candidate only after an authenticated exchange.
+     * No trust, route, or content-policy field is reconstructed or overwritten.
+     */
+    @Synchronized
+    fun promoteSuccessfulHost(context: Context, id: String, successfulHost: String): Boolean {
+        val promoted = successfulHost.trim()
+        if (id.isBlank() || promoted.isBlank()) return false
+        val current = loadDevices(context) ?: return false
+        val index = current.indexOfFirst { it.id == id }
+        if (index < 0) return false
+        val existing = current[index]
+        val knownHosts = (listOf(existing.host) + existing.altHosts)
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .distinct()
+        if (promoted !in knownHosts) return false
+        if (existing.host == promoted) return true
+
+        val devices = current.toMutableList()
+        devices[index] = existing.copy(
+            host = promoted,
+            altHosts = knownHosts.filter { it != promoted },
+            updatedAt = System.currentTimeMillis()
+        )
+        return saveDevices(context, devices)
     }
 
+    @Synchronized
+    fun removeDevice(context: Context, id: String) {
+        val current = loadDevices(context) ?: return
+        saveDevices(context, current.filterNot { it.id == id })
+    }
+
+    @Synchronized
     fun rewriteNetworkId(context: Context, targetNetworkId: String, mergeFromNetworkIds: List<String>) {
         val target = targetNetworkId.trim()
         if (target.isBlank()) return
         val mergeFrom = mergeFromNetworkIds.map { it.trim() }.filter { it.isNotBlank() && it != target }.toSet()
-        val devices = getDevices(context).map { device ->
+        val currentDevices = loadDevices(context) ?: return
+        val devices = currentDevices.map { device ->
             val current = device.networkId.trim()
             if (current.isBlank() || current == target || current in mergeFrom) {
                 device.copy(networkId = target, updatedAt = System.currentTimeMillis())
@@ -398,7 +457,7 @@ object DeviceStore {
         saveDevices(context, devices)
     }
 
-    private fun saveDevices(context: Context, devices: List<DesktopDevice>) {
+    private fun saveDevices(context: Context, devices: List<DesktopDevice>): Boolean {
         val array = JSONArray()
         devices.forEach { device ->
             array.put(
@@ -439,7 +498,14 @@ object DeviceStore {
                     .put("capabilities", device.capabilities)
             )
         }
-        prefs(context).edit().putString(KEY_DEVICES, array.toString()).apply()
+        val preferences = prefs(context)
+        if (!SecurePrefs.isStorageAvailable(preferences)) return false
+        val committed = runCatching {
+            preferences.edit().putString(KEY_DEVICES, array.toString()).commit()
+        }.onFailure { safeStorageLog(TAG, "Unable to persist encrypted device table", it) }
+            .getOrDefault(false)
+        if (committed) lastKnownDevices = devices.sortedByDescending { it.updatedAt }
+        return committed
     }
 
     private fun jsonArrayToList(array: JSONArray?): List<String> {
@@ -450,13 +516,12 @@ object DeviceStore {
     }
 
     /** v1→v2：把存量设备的 allowClipboard 统一翻转为 true（详见 KEY_CLIPBOARD_POLICY_V2）。 */
-    private fun ensureClipboardPolicyUpgrade(context: Context) {
-        val p = prefs(context)
-        val needsTextUpgrade = !p.getBoolean(KEY_CLIPBOARD_POLICY_V2, false)
-        val needsImageUpgrade = !p.getBoolean(KEY_CLIPBOARD_IMAGE_POLICY_V3, false)
-        if (!needsTextUpgrade && !needsImageUpgrade) return
-        val raw = p.getString(KEY_DEVICES, "[]") ?: "[]"
-        runCatching {
+    private fun ensureClipboardPolicyUpgrade(p: android.content.SharedPreferences): Boolean {
+        return runCatching {
+            val needsTextUpgrade = !p.getBoolean(KEY_CLIPBOARD_POLICY_V2, false)
+            val needsImageUpgrade = !p.getBoolean(KEY_CLIPBOARD_IMAGE_POLICY_V3, false)
+            if (!needsTextUpgrade && !needsImageUpgrade) return@runCatching true
+            val raw = p.getString(KEY_DEVICES, "[]") ?: "[]"
             val array = JSONArray(raw)
             for (i in 0 until array.length()) {
                 val item = array.optJSONObject(i) ?: continue
@@ -472,13 +537,10 @@ object DeviceStore {
                 .putString(KEY_DEVICES, array.toString())
                 .putBoolean(KEY_CLIPBOARD_POLICY_V2, true)
                 .putBoolean(KEY_CLIPBOARD_IMAGE_POLICY_V3, true)
-                .apply()
+                .commit()
         }.onFailure {
-            p.edit()
-                .putBoolean(KEY_CLIPBOARD_POLICY_V2, true)
-                .putBoolean(KEY_CLIPBOARD_IMAGE_POLICY_V3, true)
-                .apply()
-        }
+            safeStorageLog(TAG, "Unable to read/upgrade encrypted device policy; preserving source", it)
+        }.getOrDefault(false)
     }
 
     // 设备表里存有各对端的配对密钥，走加密存储（SecurePrefs 自动迁移旧明文数据）

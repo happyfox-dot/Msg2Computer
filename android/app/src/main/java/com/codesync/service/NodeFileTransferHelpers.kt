@@ -10,6 +10,7 @@ import java.security.MessageDigest
 import java.util.Locale
 
 private const val NODE_FILE_TRANSFER_TIMEOUT_MS = 20_000
+private val receivedFilePublishLock = Any()
 
 data class TransferBlock(val index: Int, val from: Long, val to: Long) {
     val length: Long get() = to - from + 1
@@ -139,6 +140,28 @@ fun uniqueFile(dir: File, name: String): File {
     }
     return File(dir, "$stem-${System.currentTimeMillis()}$ext")
 }
+
+/**
+ * Publishes a completed part file without allowing concurrent transfers to
+ * select and replace the same final path. The name lookup and move/copy stay
+ * under one process-wide lock because all node downloads run in this process.
+ */
+fun publishReceivedFile(partFile: File, dir: File, name: String): File =
+    synchronized(receivedFilePublishLock) {
+        require(partFile.isFile) { "missing_part_file" }
+        if (!dir.isDirectory && !dir.mkdirs()) {
+            throw IllegalStateException("unable_to_create_destination_directory")
+        }
+
+        val finalFile = uniqueFile(dir, name)
+        if (!partFile.renameTo(finalFile)) {
+            // Never use overwrite=true here. If another actor creates the path
+            // despite the in-process lock, fail instead of replacing its file.
+            partFile.copyTo(finalFile, overwrite = false)
+            partFile.delete()
+        }
+        finalFile
+    }
 
 fun urlEncode(value: String): String =
     URLEncoder.encode(value, Charsets.UTF_8.name())

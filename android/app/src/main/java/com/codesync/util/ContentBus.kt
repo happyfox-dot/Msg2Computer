@@ -14,6 +14,13 @@ object ContentBus {
     private const val BUS_NONCE_LIMIT_PER_SENDER = 300
     private val recentBusNonces = mutableMapOf<String, LinkedHashMap<String, Long>>()
 
+    data class ParsedTransportEnvelope(
+        val senderId: String,
+        val envelope: JSONObject,
+        val authenticatedPeerKey: String,
+        val nonce: String
+    )
+
     object Topic {
         const val TOPOLOGY_DELTA = "topology.delta"
         const val SMS_CODE = "sms.code"
@@ -148,7 +155,7 @@ object ContentBus {
         context: Context,
         transport: JSONObject,
         peerKeyResolver: (String) -> String? = { null }
-    ): Pair<String, JSONObject>? {
+    ): ParsedTransportEnvelope? {
         if (transport.optString("type") != "codebridge_bus") return null
         val identity = PhoneIdentityStore.get(context)
         val senderId = transport.optString("senderId").trim()
@@ -168,7 +175,11 @@ object ContentBus {
             if (isReplayedBusNonce(senderId, nonce)) return null
             val envelope = runCatching { JSONObject(CryptoUtil.decrypt(encryptedPayload, peerKey)) }.getOrNull()
                 ?: return null
-            return if (isEnvelope(envelope)) senderId to envelope else null
+            return if (isEnvelope(envelope)) {
+                ParsedTransportEnvelope(senderId, envelope, peerKey, nonce)
+            } else {
+                null
+            }
         }
         return null
     }

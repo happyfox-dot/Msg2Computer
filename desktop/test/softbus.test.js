@@ -5,6 +5,7 @@ const assert = require('node:assert/strict')
 const http = require('node:http')
 
 const busEnvelope = require('../src/main/bus-envelope')
+const busAck = require('../src/main/bus-ack')
 const relayClient = require('../src/main/relay-client')
 const {
   buildPeerRoutes,
@@ -209,6 +210,32 @@ test('bus reliability store deduplicates inbound messages and retries pending ou
   assert.equal(saved.version, 1)
 })
 
+test('bus reliability drops expired codes and terminal failures from outbox', () => {
+  const expiredStore = createBusReliabilityStore()
+  const expiredCode = {
+    networkId: 'net',
+    topic: 'sms.code',
+    originNodeId: 'A',
+    sourceNodeId: 'A',
+    messageId: 'expired',
+    timestamp: Date.now() - 3 * 60 * 1000,
+    payload: { type: 'sms', code: '839201' }
+  }
+  assert.equal(expiredStore.rememberOutbound(expiredCode, 'B'), null)
+
+  const failedStore = createBusReliabilityStore({ maxAttempts: 1 })
+  const pending = {
+    ...expiredCode,
+    messageId: 'pending',
+    timestamp: Date.now(),
+    payload: { type: 'sms', code: '123456', expiresAt: Date.now() + 60_000 }
+  }
+  assert.ok(failedStore.rememberOutbound(pending, 'B'))
+  failedStore.markFailed('pending', 'B', 'network')
+  assert.equal(failedStore.size().outbox, 0)
+  assert.deepEqual(failedStore.exportState().outbox, [])
+})
+
 test('content bus waits for async websocket ack before marking delivered', async () => {
   const delivered = []
   const failed = []
@@ -258,6 +285,36 @@ test('relay HTTP client treats rejected bus ack as delivery failure', async () =
     const { port } = server.address()
     const ok = await relayClient.postJsonToNode('127.0.0.1', port, { hello: 'bus' }, { path: '/bus/message' })
     assert.equal(ok, false)
+  } finally {
+    await new Promise(resolve => server.close(resolve))
+  }
+})
+
+test('relay HTTP response validator rejects fake ACK and accepts a nonce-bound signed ACK', async () => {
+  const pairingKey = Buffer.alloc(32, 13).toString('base64')
+  const expected = {
+    nonce: 'request-nonce',
+    messageId: 'message-123',
+    accepted: true
+  }
+  let signed = false
+  const server = http.createServer((req, res) => {
+    req.resume()
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
+    res.end(JSON.stringify(signed
+      ? busAck.buildBusAck(pairingKey, expected)
+      : { type: 'bus_ack', accepted: true, messageId: expected.messageId }))
+  })
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+  try {
+    const { port } = server.address()
+    const options = {
+      path: '/bus/message',
+      validateResponse: ack => busAck.verifyBusAck(ack, pairingKey, expected)
+    }
+    assert.equal(await relayClient.postJsonToNode('127.0.0.1', port, {}, options), false)
+    signed = true
+    assert.equal(await relayClient.postJsonToNode('127.0.0.1', port, {}, options), true)
   } finally {
     await new Promise(resolve => server.close(resolve))
   }

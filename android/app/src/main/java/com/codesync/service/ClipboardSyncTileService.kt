@@ -1,9 +1,11 @@
 package com.codesync.service
 
+import android.annotation.SuppressLint
 import android.app.PendingIntent
 import android.content.Intent
 import android.os.Build
 import android.service.quicksettings.TileService
+import androidx.annotation.RequiresApi
 import com.codesync.ClipboardSyncActivity
 
 /**
@@ -11,8 +13,10 @@ import com.codesync.ClipboardSyncActivity
  * 无需打开应用。磁贴自身不是焦点应用、读不到剪贴板（Android 10+ 限制），
  * 点击后拉起透明的 [ClipboardSyncActivity]，由它在获焦后读取并投递。
  */
+@RequiresApi(Build.VERSION_CODES.N)
 class ClipboardSyncTileService : TileService() {
 
+    @SuppressLint("StartActivityAndCollapseDeprecated")
     override fun onClick() {
         super.onClick()
         val intent = Intent(this, ClipboardSyncActivity::class.java)

@@ -16,7 +16,7 @@
           const msgId = typeof message.msgId === 'string' ? message.msgId : ''
           // 手机端 ACK 丢失后会重连重发同一 msgId：重复消息只补 ACK，不再次弹泡/写剪贴板
           if (msgId && hasRecentDelivery(connectionPhoneId, msgId)) {
-            ws.send(JSON.stringify({ type: 'code_ack', msgId }))
+            sendAuthenticatedCodeAck(ws, connectionSessionKey, msgId)
             return
           }
           const decrypted = decryptMessage(message.payload, connectionSessionKey)
@@ -28,7 +28,7 @@
             codeData.phoneId = codeData.phoneId || codeData.sourceDeviceId || connectionPhoneId
             codeData.phoneName = codeData.phoneName || codeData.sourceDeviceName || connectionPhoneName
             if (msgId && hasRecentDelivery(connectionPhoneId, msgId, codeData)) {
-              ws.send(JSON.stringify({ type: 'code_ack', msgId }))
+              sendAuthenticatedCodeAck(ws, connectionSessionKey, msgId)
               return
             }
             dispatchInboundCodeData(codeData, connectionPhoneId)
@@ -36,7 +36,7 @@
               rememberDelivery(connectionPhoneId, msgId, codeData)
             }
             // 回 ACK：按需连接模型下手机收到 ACK 才安全断开，确保消息已落地
-            ws.send(JSON.stringify({ type: 'code_ack', msgId }))
+            sendAuthenticatedCodeAck(ws, connectionSessionKey, msgId)
           }
         }
       } catch (e) {
@@ -44,16 +44,6 @@
       }
     })
 
-    ws.on('close', () => {
-      phoneSessionKeys.delete(ws)
-      if (connectionPhoneId) {
-        failPendingWsAcksForPeer(connectionPhoneId)
-        removeActivePhoneConnection(connectionPhoneId, ws)
-      }
-      if (mainWindow) {
-        mainWindow.webContents.send('device-disconnected')
-      }
-    })
   })
 }
 
@@ -479,7 +469,8 @@ function handleVerifyCode(codeData) {
     fileManifest,
     dataBase64,
     clipVersion,
-    batchId
+    batchId,
+    expiresAt
   } = codeData
   const desktopIdentity = getDesktopIdentity()
   const normalizedTargets = Array.isArray(targetDevices)
@@ -534,7 +525,8 @@ function handleVerifyCode(codeData) {
     fileManifest: fileManifest || null,
     dataBase64: dataBase64 || '',
     clipVersion: clipVersion || null,
-    batchId: batchId || ''
+    batchId: batchId || '',
+    expiresAt: Number(expiresAt || 0) || 0
   }
 
   let codeInfoEmitted = false
@@ -634,10 +626,10 @@ function handleIncomingClipboardTextManifest(codeInfo, codeData, manifest, onApp
         if (shortHash && actualHash !== shortHash) return
         if (isSameGlobalClipHash(actualHash)) return
         if (!isNewerClipVersion(ts, origin)) return
-        rememberClipVersion(ts, origin, text)
+        clipboard.writeText(text)
         lastClipboardText = text
         clearIncomingClipboardFiles()
-        clipboard.writeText(text)
+        rememberClipVersion(ts, origin, text)
         const info = { ...codeInfo, rawMessage: text }
         if (typeof onApplied === 'function') onApplied(info)
         offerClipboardTextAsFile(text, ts, actualHash, { origin }).catch(error => {
@@ -689,10 +681,9 @@ function handleIncomingClipboardImageManifest(codeInfo, codeData, manifest, onAp
           const appliedHash = shortHash || hashBuffer(buffer).slice(0, 24)
           if (isSameGlobalClipHash(appliedHash)) return
           if (!isNewerClipImageVersion(ts, origin)) return
-          rememberClipImageVersion(ts, origin, appliedHash)
-          // 先同步本地快照再写剪贴板，防轮询把这次远端写入当成本机新复制
-          clearIncomingClipboardFiles()
           clipboard.writeImage(image)
+          clearIncomingClipboardFiles()
+          rememberClipImageVersion(ts, origin, appliedHash)
           refreshClipboardImageSnapshotAfterWrite(appliedHash)
           if (typeof onApplied === 'function') onApplied(codeInfo)
         }
@@ -749,12 +740,7 @@ function fileManifestPromptKey(codeInfo = {}, codeData = {}, manifest = {}) {
 }
 
 function incomingClipboardFileKey(codeInfo, codeData, manifest) {
-  const version = (codeData && codeData.clipVersion) || codeInfo.clipVersion || {}
-  const ts = Number(version.ts) || Number(codeInfo.timestamp) || 0
-  const origin = String(version.origin || codeInfo.originDeviceId || codeInfo.sourceDeviceId || '')
-  const hash = String(version.hash || version.signature || '').trim()
-  if (ts > 0 && origin) return [ts, origin, hash].join('|')
-  return String((codeData && codeData.clipboardBatchId) || codeInfo.clipboardBatchId || codeInfo.batchId || manifest.fileId || Date.now())
+  return clipboardFileSession.incomingClipboardFileKey(codeInfo, codeData, manifest)
 }
 
 function incomingClipboardVersion(codeInfo = {}, codeData = {}, manifest = {}, kind = 'file') {
@@ -1224,6 +1210,7 @@ function forwardMessageToNode(targetId, payload, messageKey) {
 // 与手机端 enqueueRelayPayload 的防环/范围规则一致。
 function forwardRelayedMessage(codeData, lastHopDeviceId = '') {
   try {
+    if (messageRouter.isExpiredContentPayload(codeData, Date.now(), CODE_TYPES)) return
     const identity = getDesktopIdentity()
     const type = String(codeData.contentType || codeData.type || '').trim()
     if (!RELAY_FORWARD_TYPES.has(type)) return
@@ -1275,6 +1262,12 @@ function forwardRelayedMessage(codeData, lastHopDeviceId = '') {
 // 统一分发一条已解密的入站业务消息（手机入站 / 桌面对端两个方向共用）：
 // 本机在目标列表内才本地消费；带 relayTtl 的消息续传给其余目标。
 function dispatchInboundCodeData(codeData, lastHopDeviceId = '') {
+  // Transport ACKs may still be returned so the source can stop retrying, but
+  // delayed verification codes must never be displayed, copied, or forwarded.
+  if (messageRouter.isExpiredContentPayload(codeData, Date.now(), CODE_TYPES)) {
+    console.log('Expired verification code discarded:', codeData.originMessageId || codeData.msgId || '')
+    return
+  }
   if (lastHopDeviceId && !codeData.lastHopDeviceId) codeData.lastHopDeviceId = lastHopDeviceId
   if (
     codeData.type === 'topology_delta' ||
@@ -1734,13 +1727,20 @@ registerDesktopIpc(ipcMain, {
   getDesktopTotps: () => getDesktopTotps(),
   requestTotpResync: targetIds => requestFullTotpSync(targetIds),
   getTopology: () => getTopologySnapshot(),
-  getMessageSettings: () => normalizeMessageSettings(desktopMessageSettings),
+  getMessageSettings: () => ({
+    ...normalizeMessageSettings(desktopMessageSettings),
+    currentPlatform: process.platform,
+    supportedPlatforms: {
+      clipboardFileSync: ['win32']
+    }
+  }),
   setMessageSettings: updates => {
     const previousSettings = normalizeMessageSettings(desktopMessageSettings)
     desktopMessageSettings = normalizeMessageSettings({
       ...desktopMessageSettings,
       ...(updates || {})
     })
+    if (process.platform !== 'win32') desktopMessageSettings.syncClipboardFile = false
     savePairingKey()
     if (
       desktopMessageSettings.syncClipboardText === true ||
@@ -1757,8 +1757,22 @@ registerDesktopIpc(ipcMain, {
         } else {
           lastClipboardImageHash = readClipboardImageSyncHash()
         }
-        if (desktopMessageSettings.syncClipboardFile !== true || previousSettings.syncClipboardFile !== true) {
-          lastClipboardFileSignature = getClipboardFileSignature(readClipboardFilePaths())
+        if (desktopMessageSettings.syncClipboardFile === true && previousSettings.syncClipboardFile !== true) {
+          // Force a fresh native sequence snapshot when the watcher is enabled;
+          // a cache captured before enablement must not be emitted as a new copy.
+          nativeClipboardFileSnapshotReady = false
+          nativeClipboardFileSnapshotStartedAt = 0
+          const filePaths = readClipboardFilePaths()
+          if (lastClipboardFileReadReady) {
+            lastClipboardFileSignature = getClipboardFileSignature(filePaths)
+            clipboardFileWatcherPrimed = true
+          } else {
+            lastClipboardFileSignature = ''
+            clipboardFileWatcherPrimed = false
+          }
+        } else if (desktopMessageSettings.syncClipboardFile !== true) {
+          lastClipboardFileSignature = ''
+          clipboardFileWatcherPrimed = false
         }
       } catch (_) {
         lastClipboardText = ''
@@ -1769,7 +1783,13 @@ registerDesktopIpc(ipcMain, {
         setTimeout(pollClipboardForSync, 25)
       }
     }
-    return normalizeMessageSettings(desktopMessageSettings)
+    return {
+      ...normalizeMessageSettings(desktopMessageSettings),
+      currentPlatform: process.platform,
+      supportedPlatforms: {
+        clipboardFileSync: ['win32']
+      }
+    }
   },
   fileSelectAndSend: targetIds => selectAndSendFile(targetIds),
   fileSelectAndSendFolder: targetIds => selectAndSendFolder(targetIds),

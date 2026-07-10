@@ -151,7 +151,7 @@ async function sendClipboardFileBatch(candidate) {
   const transfer = initFileTransfer()
   const identity = getDesktopIdentity()
   if (!candidate.batchMeta) {
-    const clipTs = Date.now()
+    const clipTs = nextLocalClipboardTimestamp()
     const signatureHash = hashClipText(candidate.signature)
     const plannedFileCount = eligible.length + retryableSkippedPaths.length
     candidate.batchMeta = {
@@ -161,6 +161,8 @@ async function sendClipboardFileBatch(candidate) {
       clipboardFileCount: plannedFileCount,
       clipboardFileTotalBytes: eligible.reduce((sum, item) => sum + item.size, 0)
     }
+    rememberGlobalClipVersion(clipTs, identity.id, signatureHash, 'file')
+    savePairingKey()
   }
   const batchMeta = candidate.batchMeta
   let sent = 0
@@ -235,7 +237,14 @@ async function dispatchPendingClipboardFileBatch(candidate) {
 
 function pollClipboardFilesForSync() {
   const filePaths = readClipboardFilePaths()
+  if (!lastClipboardFileReadReady) return
   const signature = getClipboardFileSignature(filePaths)
+  if (!clipboardFileWatcherPrimed) {
+    lastClipboardFileSignature = signature
+    pendingClipboardFileBatch = null
+    clipboardFileWatcherPrimed = true
+    return
+  }
   if (!signature) {
     lastClipboardFileSignature = ''
     pendingClipboardFileBatch = null
@@ -436,11 +445,18 @@ function applyRemoteClipboard(codeInfo, codeData) {
   const origin = String(version.origin || codeInfo.originDeviceId || codeInfo.sourceDeviceId || '')
   if (isSameGlobalClipHash(hashClipText(text))) return false
   if (!isNewerClipVersion(ts, origin)) return false
-  rememberClipVersion(ts, origin, text)
-  // 先同步本地快照再写剪贴板，防 900ms 轮询把这次远端写入当成本机新复制
+  try {
+    // writeText is synchronous; update LWW only after Electron confirms the
+    // clipboard write did not throw.
+    clipboard.writeText(text)
+  } catch (error) {
+    console.warn('Failed to apply remote clipboard text:', error.message)
+    try { lastClipboardText = clipboard.readText() || '' } catch (_) {}
+    return false
+  }
   lastClipboardText = text
   clearIncomingClipboardFiles()
-  clipboard.writeText(text)
+  rememberClipVersion(ts, origin, text)
   return true
 }
 
@@ -463,9 +479,14 @@ function applyRemoteClipboardImage(codeInfo, codeData) {
   if (!isNewerClipImageVersion(ts, origin)) return false
   const image = nativeImage.createFromBuffer(buffer)
   if (image.isEmpty()) return false
-  rememberClipImageVersion(ts, origin, shortHash)
+  try {
+    clipboard.writeImage(image)
+  } catch (error) {
+    console.warn('Failed to apply remote clipboard image:', error.message)
+    return false
+  }
   clearIncomingClipboardFiles()
-  clipboard.writeImage(image)
+  rememberClipImageVersion(ts, origin, shortHash)
   refreshClipboardImageSnapshotAfterWrite(shortHash)
   return true
 }
@@ -584,7 +605,9 @@ function pushClipboardStateToDesktopPeer(ws, sessionKey, peerId) {
 // 通过 relay HTTP 把一条用户消息负载发给单台手机（拓扑 relay 的同款信封格式）。
 // 剪贴板推送与桌面续传共用：每次发送独立打 relaySentAt 时间戳供对端做重放窗口校验。
 async function sendRelayEnvelopeToPhone(phone, basePayload, options = {}) {
-  if (!phone || !phone.pairingKey || !hasDirectNodeAddress(phone)) return false
+  if (!phone || !phone.pairingKey) return false
+  const hosts = httpDeliveryCandidateHosts(phone)
+  if (hosts.length === 0) return false
   if (options.skipBus !== true && nodeSupportsSoftBus(phone)) {
     const envelope = busEnvelope.fromLegacyPayload(basePayload, {
       identity: getDesktopIdentity(),
@@ -610,7 +633,6 @@ async function sendRelayEnvelopeToPhone(phone, basePayload, options = {}) {
     payload: encryptedPayload,
     authToken
   }
-  const hosts = collectNetworkHosts(phone.lastIP, phone.host, phone.relayHost, phone.tsHost, phone.altHosts)
   for (const host of hosts) {
     const ok = await postJsonToNode(host, Number(phone.relayPort || phone.port) || 19529, envelope)
     if (ok) return true
@@ -928,6 +950,29 @@ function handleDesktopPeerTotpSync(peer, encryptedPayload, sessionKey) {
   }
 }
 
+function sendAuthenticatedCodeAck(ws, sessionKey, msgId) {
+  const normalizedMsgId = typeof msgId === 'string' ? msgId : ''
+  if (!ws || !sessionKey || !normalizedMsgId) return false
+  const { createCodeAckToken } = require('./src/main/websocket-security')
+  const ackToken = createCodeAckToken(sessionKey, normalizedMsgId)
+  if (!ackToken) return false
+  try {
+    ws.send(JSON.stringify({ type: 'code_ack', msgId: normalizedMsgId, ackToken }))
+    return true
+  } catch (_) {
+    return false
+  }
+}
+
+function isAuthenticatedCodeAck(message, sessionKey) {
+  if (!message || !sessionKey) return false
+  const msgId = typeof message.msgId === 'string' ? message.msgId : ''
+  const ackToken = typeof message.ackToken === 'string' ? message.ackToken : ''
+  if (!msgId || !ackToken) return false
+  const { verifyCodeAckToken } = require('./src/main/websocket-security')
+  return verifyCodeAckToken(sessionKey, msgId, ackToken)
+}
+
 function connectDesktopPeer(peer, options = {}) {
   if (!peer || peer.enabled === false) return false
   const existing = activeDesktopPeerConnections.get(peer.id)
@@ -939,10 +984,30 @@ function connectDesktopPeer(peer, options = {}) {
   const identity = getDesktopIdentity()
   const phoneNonce = generateNonce()
   // 候选地址轮换：主地址连不上时下一次尝试换 Tailscale 地址（跨网段对端）
-  const hostCandidates = [peer.host, peer.tsHost].filter(Boolean).filter((h, i, arr) => arr.indexOf(h) === i)
+  const discoveredPeer = discoveredLanDevices.get(peer.id) || {}
+  const hostCandidates = trustedNode.connectionCandidateHosts(peer, discoveredPeer)
   const attempt = desktopPeerHostAttempts.get(peer.id) || 0
   const connectHost = hostCandidates[attempt % hostCandidates.length] || peer.host
-  const ws = new WebSocket(`ws://${connectHost}:${peer.port}`)
+  let ws
+  try {
+    ws = new WebSocket(`ws://${formatHttpHost(connectHost)}:${peer.port}`, {
+      maxPayload: WS_MAX_PAYLOAD_BYTES,
+      perMessageDeflate: false,
+      handshakeTimeout: WS_AUTH_TIMEOUT_MS
+    })
+  } catch (error) {
+    console.error(`Invalid desktop peer address ${peer.name}@${connectHost}:`, error.message)
+    desktopPeerHostAttempts.set(peer.id, attempt + 1)
+    return false
+  }
+  let peerAuthenticated = false
+  const peerAuthTimer = setTimeout(() => {
+    if (peerAuthenticated || activeDesktopPeerConnections.get(peer.id) !== ws) return
+    console.warn(`Desktop peer authentication timed out: ${peer.name}@${connectHost}`)
+    try { ws.close(1008, 'authentication timeout') } catch (_) {}
+    try { ws.terminate() } catch (_) {}
+  }, WS_AUTH_TIMEOUT_MS)
+  peerAuthTimer.unref?.()
   ws.isAlive = true
   ws.on('pong', () => { ws.isAlive = true })
   activeDesktopPeerConnections.set(peer.id, ws)
@@ -974,15 +1039,31 @@ function connectDesktopPeer(peer, options = {}) {
     try {
       const message = JSON.parse(data.toString())
       if (message.type === 'code_ack') {
+        if (!peerAuthenticated || !isAuthenticatedCodeAck(message, ws.__codebridgeSessionKey)) {
+          console.warn(`Rejected unauthenticated code_ack from ${peer.name}`)
+          return
+        }
         resolveWsCodeAck(peer.id, message.msgId)
         return
       }
       if (message.type === 'auth_ok') {
-        const sessionKey = message.keyMode === 'derived'
-          ? deriveSessionKeyWithPairingKey(peer.pairingKey, phoneNonce, message.serverNonce)
-          : message.sessionKey
+        const sessionKey = resolveDerivedSessionKey(message, {
+          pairingKey: peer.pairingKey,
+          clientId: identity.id,
+          expectedServerId: peer.id,
+          clientNonce: phoneNonce,
+          deriveSessionKey: deriveSessionKeyWithPairingKey
+        })
+        if (!sessionKey) {
+          console.warn(`Rejected insecure or malformed auth_ok from ${peer.name}`)
+          try { ws.close(1008, 'derived session key required') } catch (_) {}
+          return
+        }
+        peerAuthenticated = true
+        clearTimeout(peerAuthTimer)
         ws.__codebridgeSessionKey = sessionKey
         desktopPeerHostAttempts.delete(peer.id)
+        Object.assign(peer, trustedNode.withAuthenticatedHost(peer, connectHost))
         peer.connected = true
         peer.connectionUpdatedAt = Date.now()
         peer.lastSeen = peer.connectionUpdatedAt
@@ -1005,7 +1086,7 @@ function connectDesktopPeer(peer, options = {}) {
         if (plain) {
           applyTopologyDeltaPayload(plain, { excludeNodeId: peer.id })
           if (msgId) {
-            ws.send(JSON.stringify({ type: 'code_ack', msgId }))
+            sendAuthenticatedCodeAck(ws, ws.__codebridgeSessionKey, msgId)
           }
         }
         return
@@ -1027,11 +1108,11 @@ function connectDesktopPeer(peer, options = {}) {
         const envelope = JSON.parse(plain)
         if (busEnvelope.isEnvelope(envelope)) {
           if (msgId && hasRecentDelivery(peer.id, msgId, busEnvelope.toLegacyPayload(envelope))) {
-            ws.send(JSON.stringify({ type: 'code_ack', msgId }))
+            sendAuthenticatedCodeAck(ws, ws.__codebridgeSessionKey, msgId)
             return
           }
           getContentBus().receiveEnvelope(envelope, { lastHopDeviceId: peer.id })
-          if (msgId) ws.send(JSON.stringify({ type: 'code_ack', msgId }))
+          if (msgId) sendAuthenticatedCodeAck(ws, ws.__codebridgeSessionKey, msgId)
         }
         return
       }
@@ -1041,7 +1122,7 @@ function connectDesktopPeer(peer, options = {}) {
       if (message.type === 'verify_code') {
         const msgId = typeof message.msgId === 'string' ? message.msgId : ''
         if (msgId && hasRecentDelivery(peer.id, msgId)) {
-          ws.send(JSON.stringify({ type: 'code_ack', msgId }))
+          sendAuthenticatedCodeAck(ws, ws.__codebridgeSessionKey, msgId)
           return
         }
         const plain = decryptMessage(message.payload, ws.__codebridgeSessionKey)
@@ -1051,13 +1132,13 @@ function connectDesktopPeer(peer, options = {}) {
         codeData.lastHopDeviceId = peer.id
         codeData.lastHopDeviceName = peer.name
         if (msgId && hasRecentDelivery(peer.id, msgId, codeData)) {
-          ws.send(JSON.stringify({ type: 'code_ack', msgId }))
+          sendAuthenticatedCodeAck(ws, ws.__codebridgeSessionKey, msgId)
           return
         }
         dispatchInboundCodeData(codeData, peer.id)
         if (msgId) {
           rememberDelivery(peer.id, msgId, codeData)
-          ws.send(JSON.stringify({ type: 'code_ack', msgId }))
+          sendAuthenticatedCodeAck(ws, ws.__codebridgeSessionKey, msgId)
         }
         return
       }
@@ -1082,6 +1163,10 @@ function connectDesktopPeer(peer, options = {}) {
   })
 
   ws.on('close', () => {
+    clearTimeout(peerAuthTimer)
+    // A superseded socket may close after a replacement is already healthy.
+    // Never let that stale callback remove the new socket or mark it offline.
+    if (activeDesktopPeerConnections.get(peer.id) !== ws) return
     failPendingWsAcksForPeer(peer.id)
     activeDesktopPeerConnections.delete(peer.id)
     const latest = pairedDesktopPeers.get(peer.id)
@@ -1095,7 +1180,9 @@ function connectDesktopPeer(peer, options = {}) {
 
   ws.on('error', (error) => {
     console.error(`连接桌面设备失败 ${peer.name}@${connectHost}:`, error.message)
-    desktopPeerHostAttempts.set(peer.id, attempt + 1)
+    if (activeDesktopPeerConnections.get(peer.id) === ws) {
+      desktopPeerHostAttempts.set(peer.id, attempt + 1)
+    }
   })
 
   if (options.showNotification !== false) {
@@ -1821,25 +1908,69 @@ function startWsHeartbeat() {
   }, WS_HEARTBEAT_INTERVAL_MS)
 }
 
-function startWebSocketServer() {
-  wss = new WebSocketServer({ port: WS_PORT })
+function scheduleWebSocketServerRestart(failedServer) {
+  if (app.isQuitting || wsServerRestartTimer) return
+  if (wss && wss !== failedServer) return
+  if (wss === failedServer) wss = null
+  try { failedServer?.close() } catch (_) {}
+  wsServerRestartAttempts += 1
+  const delay = Math.min(60_000, 1000 * Math.pow(2, Math.min(5, wsServerRestartAttempts - 1)))
+  console.warn(`WebSocket server will retry in ${delay}ms`)
+  wsServerRestartTimer = setTimeout(() => {
+    wsServerRestartTimer = null
+    if (!app.isQuitting) startWebSocketServer()
+  }, delay)
+  wsServerRestartTimer.unref?.()
+}
 
-  wss.on('error', (error) => {
+function startWebSocketServer() {
+  const server = new WebSocketServer({
+    port: WS_PORT,
+    maxPayload: WS_MAX_PAYLOAD_BYTES,
+    perMessageDeflate: false,
+    clientTracking: true
+  })
+  wss = server
+
+  server.on('listening', () => {
+    if (wss === server) wsServerRestartAttempts = 0
+  })
+
+  server.on('error', (error) => {
     console.error('WebSocket server error:', error)
     if (error.code === 'EADDRINUSE') {
-      showNotification('验证码同步启动失败', `端口 ${WS_PORT} 已被占用，请确认是否已有一个桌面端正在运行。`)
-      showMainWindow()
+      if (wsServerRestartAttempts === 0) {
+        showNotification('验证码同步启动失败', `端口 ${WS_PORT} 已被占用，将自动重试。`)
+        showMainWindow()
+      }
     }
+    scheduleWebSocketServerRestart(server)
   })
 
   startWsHeartbeat()
 
-  wss.on('connection', (ws, req) => {
+  server.on('connection', (ws, req) => {
     const clientIP = req.socket.remoteAddress
     let isAuthenticated = false
     let connectionSessionKey = null
     let connectionPhoneId = null
     let connectionPhoneName = null
+
+    const connectionGuard = guardUnauthenticatedWebSocket(ws, {
+      authTimeoutMs: WS_AUTH_TIMEOUT_MS,
+      onAuthTimeout: () => console.warn(`Unauthenticated WebSocket timed out: ${clientIP}`),
+      onError: error => console.warn(`Inbound WebSocket error from ${clientIP}:`, error?.message || error),
+      onCleanup: () => {
+        phoneSessionKeys.delete(ws)
+        if (connectionPhoneId) {
+          removeActivePhoneConnection(connectionPhoneId, ws)
+          if (!activePhoneConnections.has(connectionPhoneId)) {
+            failPendingWsAcksForPeer(connectionPhoneId)
+            if (mainWindow) mainWindow.webContents.send('device-disconnected')
+          }
+        }
+      }
+    })
 
     ws.isAlive = true
     ws.on('pong', () => { ws.isAlive = true })
@@ -1848,11 +1979,19 @@ function startWebSocketServer() {
       try {
         const message = JSON.parse(data.toString())
         if (message.type === 'code_ack') {
+          if (!isAuthenticated || !isAuthenticatedCodeAck(message, connectionSessionKey)) {
+            console.warn(`Rejected unauthenticated code_ack from ${clientIP}`)
+            return
+          }
           resolveWsCodeAck(connectionPhoneId, message.msgId)
           return
         }
 
         if (message.type === 'auth') {
+          if (isAuthenticated) {
+            try { ws.close(1008, 'already authenticated') } catch (_) {}
+            return
+          }
           const phoneId = normalizePhoneId(message.phoneId, clientIP)
           const phoneName = normalizePhoneName(message.phoneName, clientIP)
           const deviceType = normalizeDeviceType(message.deviceType || message.phoneDeviceType, 'ANDROID_PHONE')
@@ -1890,17 +2029,34 @@ function startWebSocketServer() {
               ws.close()
               return
             }
+            const serverNonce = generateNonce()
+            const serverId = getDesktopIdentity().id
+            const derivedSessionKey = deriveSessionKey(phoneNonce, serverNonce)
+            const { createServerProof } = require('./src/main/websocket-security')
+            const serverProof = createServerProof(pairingKey, {
+              clientId: phone.id,
+              serverId,
+              clientNonce: phoneNonce,
+              serverNonce
+            })
+            if (!serverProof || !connectionGuard.markAuthenticated()) {
+              console.warn(`Inbound authentication guard closed before commit: ${phone.id}@${clientIP}`)
+              try { ws.close(1008, 'authentication aborted') } catch (_) {}
+              try { ws.terminate() } catch (_) {}
+              return
+            }
             isAuthenticated = true
             connectionPhoneId = phone.id
             connectionPhoneName = phone.name
-            const serverNonce = generateNonce()
-            connectionSessionKey = deriveSessionKey(phoneNonce, serverNonce)
+            connectionSessionKey = derivedSessionKey
             addActivePhoneConnection(phone.id, ws)
             phoneSessionKeys.set(ws, connectionSessionKey)
             ws.send(JSON.stringify({
               type: 'auth_ok',
               keyMode: 'derived',
-              serverNonce
+              serverNonce,
+              serverId,
+              serverProof
             }))
             if (requestTopologyOnAuth) {
               sendTopologyToPhone(phone.id, ws, connectionSessionKey)
@@ -1956,7 +2112,7 @@ function startWebSocketServer() {
           if (plain) {
             applyTopologyDeltaPayload(plain, { excludeNodeId: connectionPhoneId })
             if (msgId) {
-              ws.send(JSON.stringify({ type: 'code_ack', msgId }))
+              sendAuthenticatedCodeAck(ws, connectionSessionKey, msgId)
             }
           }
           return
@@ -1978,8 +2134,8 @@ function startWebSocketServer() {
           const envelope = JSON.parse(plain)
           if (busEnvelope.isEnvelope(envelope)) {
             if (msgId && hasRecentDelivery(connectionPhoneId, msgId, busEnvelope.toLegacyPayload(envelope))) {
-              ws.send(JSON.stringify({ type: 'code_ack', msgId }))
+              sendAuthenticatedCodeAck(ws, connectionSessionKey, msgId)
               return
             }
             getContentBus().receiveEnvelope(envelope, { lastHopDeviceId: connectionPhoneId })
-            if (msgId) ws.send(JSON.stringify({ type: 'code_ack', msgId }))
+            if (msgId) sendAuthenticatedCodeAck(ws, connectionSessionKey, msgId)
