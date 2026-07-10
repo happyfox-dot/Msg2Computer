@@ -301,15 +301,37 @@ class MainActivity : AppCompatActivity() {
 
     private fun maybeAutoSyncClipboard() {
         if (!SettingsStore.isSyncClipboardEnabled(this)) return
+        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+        val clip = clipboard.primaryClip?.takeIf { it.itemCount > 0 } ?: return
+        val uriItems = clipboardUriItems(clip)
+        if (uriItems.isNotEmpty()) {
+            // A URI clip written by our receiver is already represented by the stored LWW
+            // version. Re-uploading it on focus would manufacture a new file-batch version and
+            // cause a clipboard echo between nodes.
+            if (clip.description.label?.toString()?.startsWith("codebridge_clipboard_") == true) return
+            val fingerprint = ClipboardSyncState.hash(
+                uriItems.joinToString("|") { it.toString() }
+            )
+            val now = System.currentTimeMillis()
+            if (fingerprint == lastAutoClipboardHash && now - lastAutoClipboardAt < 5_000L) return
+            lastAutoClipboardHash = fingerprint
+            lastAutoClipboardAt = now
+            if (uriItems.size == 1 && isClipboardImageUri(clip, uriItems.first())) {
+                sendClipboardImage(uriItems.first())
+            } else {
+                sendClipboardFiles(uriItems)
+            }
+            return
+        }
         if (RouteManager.targetsForType(
                 context = this,
                 type = "clipboard_text",
                 reachableOnly = WebSocketService.requiresLiveDeliveryTarget("clipboard_text")
             ).isEmpty()
         ) return
-        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
-        val text = clipboard.primaryClip?.takeIf { it.itemCount > 0 }
-            ?.getItemAt(0)?.coerceToText(this)?.toString()?.trim().orEmpty()
+        // URI clips are handled above. Do not coerce content:// into text, and preserve leading
+        // and trailing whitespace in real text clips.
+        val text = clip.getItemAt(0).coerceToText(this)?.toString().orEmpty()
         if (text.isBlank()) return
         val hash = ClipboardSyncState.hash(text)
         if (hash == ClipboardSyncState.appliedHash(this)) return
@@ -804,18 +826,18 @@ class MainActivity : AppCompatActivity() {
             return
         }
         val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
-        val item = clipboard.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)
-        val uri = item?.uri
-        val uriMime = uri?.let { contentResolver.getType(it).orEmpty() }.orEmpty()
-        if (uri != null && uriMime.startsWith("image/")) {
-            sendClipboardImage(uri)
+        val clip = clipboard.primaryClip?.takeIf { it.itemCount > 0 }
+        if (clip == null) {
+            Toast.makeText(this, R.string.clipboard_empty, Toast.LENGTH_SHORT).show()
             return
         }
-        val fileUris = (0 until (clipboard.primaryClip?.itemCount ?: 0))
-            .mapNotNull { index -> clipboard.primaryClip?.getItemAt(index)?.uri }
-            .filter { candidate -> !contentResolver.getType(candidate).orEmpty().startsWith("image/") }
-        if (fileUris.isNotEmpty()) {
-            sendClipboardFiles(fileUris)
+        val uriItems = clipboardUriItems(clip)
+        if (uriItems.isNotEmpty()) {
+            if (uriItems.size == 1 && isClipboardImageUri(clip, uriItems.first())) {
+                sendClipboardImage(uriItems.first())
+            } else {
+                sendClipboardFiles(uriItems)
+            }
             return
         }
         if (RouteManager.targetsForType(
@@ -827,7 +849,7 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, R.string.clipboard_no_target, Toast.LENGTH_SHORT).show()
             return
         }
-        val text = item?.coerceToText(this)?.toString()?.trim().orEmpty()
+        val text = clip.getItemAt(0).coerceToText(this)?.toString().orEmpty()
         if (text.isBlank()) {
             Toast.makeText(this, R.string.clipboard_empty, Toast.LENGTH_SHORT).show()
             return
@@ -863,6 +885,19 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, "没有启用图片剪贴板的推送目标", Toast.LENGTH_SHORT).show()
             return
         }
+        val appliedTs = ClipboardSyncState.appliedTs(this)
+        val capturedAt = maxOf(
+            System.currentTimeMillis(),
+            if (appliedTs == Long.MAX_VALUE) Long.MAX_VALUE else appliedTs + 1L
+        )
+        val identity = PhoneIdentityStore.get(this)
+        ClipboardSyncState.rememberHash(
+            this,
+            capturedAt,
+            identity.id,
+            ClipboardSyncState.hash("pending-image:$capturedAt:$uri"),
+            "image"
+        )
         lifecycleScope.launch {
             val prepared = withContext(Dispatchers.IO) {
                 runCatching { prepareClipboardImageFile(uri) }
@@ -887,6 +922,7 @@ class MainActivity : AppCompatActivity() {
                     putExtra(WebSocketService.EXTRA_FILE_PATH, file.absolutePath)
                     putExtra(WebSocketService.EXTRA_FILE_NAME, file.name)
                     putExtra(WebSocketService.EXTRA_FILE_MIME, image.mime)
+                    putExtra(WebSocketService.EXTRA_CLIP_VERSION_TS, capturedAt)
                 }
                 Toast.makeText(this@MainActivity, "图片剪贴板已发送", Toast.LENGTH_SHORT).show()
                 renderClipboardHistory()
@@ -915,7 +951,23 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, R.string.file_no_target, Toast.LENGTH_SHORT).show()
             return
         }
-        val batchId = if (uris.size > 1) "clip-files-${java.util.UUID.randomUUID()}" else ""
+        // Capture the LWW version before asynchronous content:// copies start. Every file in the
+        // clip carries this batch id, so preparation order cannot split one clipboard value into
+        // multiple versions. The service parses the embedded timestamp.
+        val appliedTs = ClipboardSyncState.appliedTs(this)
+        val clipTs = maxOf(
+            System.currentTimeMillis(),
+            if (appliedTs == Long.MAX_VALUE) Long.MAX_VALUE else appliedTs + 1L
+        )
+        val batchId = "clip-files-$clipTs-${java.util.UUID.randomUUID()}"
+        val identity = PhoneIdentityStore.get(this)
+        ClipboardSyncState.rememberHash(
+            this,
+            clipTs,
+            identity.id,
+            ClipboardSyncState.hash("clipboard-file-batch:$batchId"),
+            "file"
+        )
         pendingFileTransferTargetIds = emptyList()
         uris.forEach { uri ->
             handleFileForTransfer(
@@ -926,6 +978,17 @@ class MainActivity : AppCompatActivity() {
             )
         }
         Toast.makeText(this, "文件剪贴板已开始同步", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun clipboardUriItems(clip: ClipData): List<Uri> =
+        (0 until clip.itemCount).mapNotNull { index -> clip.getItemAt(index).uri }
+
+    private fun isClipboardImageUri(clip: ClipData, uri: Uri): Boolean {
+        val resolverMime = runCatching { contentResolver.getType(uri).orEmpty() }.getOrDefault("")
+        if (resolverMime.startsWith("image/", ignoreCase = true)) return true
+        if (clip.itemCount == 1 && clip.description.hasMimeType("image/*")) return true
+        return FileTransferRegistry.guessMime(uri.lastPathSegment.orEmpty())
+            .startsWith("image/", ignoreCase = true)
     }
 
     private fun sendSelectedFile() {

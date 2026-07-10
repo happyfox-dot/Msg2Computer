@@ -1,6 +1,7 @@
 })
 
 app.on('before-quit', () => {
+  app.isQuitting = true
   // 退出前把防抖中未落盘的配对数据写掉
   flushPendingPairingSave({ sync: true })
   busReliabilityStore?.flushSave?.()
@@ -15,6 +16,10 @@ app.on('before-quit', () => {
   if (wsHeartbeatTimer) {
     clearInterval(wsHeartbeatTimer)
     wsHeartbeatTimer = null
+  }
+  if (wsServerRestartTimer) {
+    clearTimeout(wsServerRestartTimer)
+    wsServerRestartTimer = null
   }
   if (wss) wss.close()
   if (discoverySocket) {

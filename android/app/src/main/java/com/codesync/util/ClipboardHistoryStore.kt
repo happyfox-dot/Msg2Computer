@@ -23,21 +23,30 @@ data class ClipboardHistoryEntry(
 )
 
 object ClipboardHistoryStore {
+    private const val TAG = "ClipboardHistory"
     private const val PREFS = "clipboard_history"
     private const val KEY_ITEMS = "items"
     private const val LIMIT = 50
+    private val historyLock = Any()
+    private var lastKnownEntries: List<ClipboardHistoryEntry>? = null
 
-    fun get(context: Context): List<ClipboardHistoryEntry> {
-        val raw = prefs(context).getString(KEY_ITEMS, "[]").orEmpty()
-        val array = runCatching { JSONArray(raw) }.getOrDefault(JSONArray())
+    private fun readEntries(context: Context): List<ClipboardHistoryEntry>? {
+        val preferences = prefs(context)
+        if (!SecurePrefs.isStorageAvailable(preferences)) return null
+        val raw = runCatching { preferences.getString(KEY_ITEMS, "[]").orEmpty() }
+            .onFailure { safeStorageLog(TAG, "Unable to read encrypted clipboard history", it) }
+            .getOrNull() ?: return null
+        val array = runCatching { JSONArray(raw) }
+            .onFailure { safeStorageLog(TAG, "Malformed encrypted clipboard history; preserving source", it) }
+            .getOrNull() ?: return null
         val items = mutableListOf<ClipboardHistoryEntry>()
         for (index in 0 until array.length()) {
-            val item = array.optJSONObject(index) ?: continue
+            val item = array.optJSONObject(index) ?: return null
             val kind = item.optString("kind", "text").ifBlank { "text" }
             val path = item.optString("path")
             val text = item.optString("text")
-            if (kind == "text" && text.isBlank()) continue
-            if (kind != "text" && path.isBlank()) continue
+            if (kind == "text" && text.isBlank()) return null
+            if (kind != "text" && path.isBlank()) return null
             items += ClipboardHistoryEntry(
                 id = item.optString("id").ifBlank { "${kind}-${item.optLong("createdAt")}-$index" },
                 kind = kind,
@@ -66,6 +75,12 @@ object ClipboardHistoryStore {
             )
         }
         return items.sortedByDescending { it.createdAt }.take(LIMIT)
+    }
+
+    fun get(context: Context): List<ClipboardHistoryEntry> = synchronized(historyLock) {
+        val loaded = readEntries(context)
+        if (loaded != null) lastKnownEntries = loaded
+        loaded ?: lastKnownEntries ?: emptyList()
     }
 
     fun addText(
@@ -149,13 +164,25 @@ object ClipboardHistoryStore {
     }
 
     private fun add(context: Context, entry: JSONObject) {
-        val contentKey = entry.optString("contentKey")
-        val existing = get(context)
-            .filterNot { it.id == entry.optString("id") || (contentKey.isNotBlank() && it.contentKey == contentKey) }
-            .map(::toJson)
-        val next = JSONArray().put(entry)
-        existing.take(LIMIT - 1).forEach { next.put(it) }
-        prefs(context).edit().putString(KEY_ITEMS, next.toString()).apply()
+        synchronized(historyLock) {
+            val contentKey = entry.optString("contentKey")
+            val loaded = readEntries(context) ?: return
+            val existing = loaded
+                .filterNot { it.id == entry.optString("id") || (contentKey.isNotBlank() && it.contentKey == contentKey) }
+                .map(::toJson)
+            val next = JSONArray().put(entry)
+            existing.take(LIMIT - 1).forEach { next.put(it) }
+            // commit keeps the read/modify/write transaction durable before the lock
+            // is released. Clipboard content is sensitive, so it lives in encrypted
+            // preferences and never in the legacy plaintext preference file.
+            val preferences = prefs(context)
+            if (!SecurePrefs.isStorageAvailable(preferences)) return
+            val committed = runCatching {
+                preferences.edit().putString(KEY_ITEMS, next.toString()).commit()
+            }.onFailure { safeStorageLog(TAG, "Unable to persist encrypted clipboard history", it) }
+                .getOrDefault(false)
+            if (committed) readEntries(context)?.let { lastKnownEntries = it }
+        }
     }
 
     private fun toJson(entry: ClipboardHistoryEntry): JSONObject =
@@ -204,5 +231,5 @@ object ClipboardHistoryStore {
     }
 
     private fun prefs(context: Context) =
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        SecurePrefs.get(context, PREFS)
 }

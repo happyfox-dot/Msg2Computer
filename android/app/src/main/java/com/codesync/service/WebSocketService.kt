@@ -16,6 +16,7 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.codesync.MainActivity
 import com.codesync.R
+import com.codesync.util.BusAckAuth
 import com.codesync.util.BusReliabilityStore
 import com.codesync.util.ClipboardSyncState
 import com.codesync.util.ContentBus
@@ -53,6 +54,15 @@ import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
+import kotlin.math.max
+
+internal fun nextClipboardTimestamp(now: Long, appliedTs: Long): Long {
+    val afterApplied = if (appliedTs == Long.MAX_VALUE) Long.MAX_VALUE else appliedTs + 1L
+    return max(now, afterApplied)
+}
+
+internal fun clipboardBatchTimestamp(batchId: String): Long =
+    Regex("^clip-files-(\\d+)-").find(batchId)?.groupValues?.getOrNull(1)?.toLongOrNull() ?: 0L
 
 /**
  * 按需投递服务（事件驱动）。
@@ -80,6 +90,7 @@ class WebSocketService : Service() {
         const val ACTION_SEND_NOTIFICATION_REMOVED = "com.codesync.SEND_NOTIFICATION_REMOVED"
         const val ACTION_SEND_CLIPBOARD = "com.codesync.SEND_CLIPBOARD"
         const val ACTION_SEND_FILE = "com.codesync.SEND_FILE"
+        const val ACTION_FLUSH_OUTBOX = "com.codesync.FLUSH_OUTBOX"
 
         const val EXTRA_CODE = "code"
         const val EXTRA_SOURCE = "source"
@@ -108,6 +119,7 @@ class WebSocketService : Service() {
         const val EXTRA_RELATIVE_PATH = "file_relative_path"
         const val EXTRA_BATCH_ID = "file_batch_id"
         const val EXTRA_BATCH_COUNT = "file_batch_count"
+        const val EXTRA_CLIP_VERSION_TS = "clip_version_ts"
         const val EXTRA_TARGET_DEVICE_IDS = "target_device_ids"
 
         const val NOTIFICATION_ID = 1001
@@ -121,6 +133,10 @@ class WebSocketService : Service() {
         // 投递时限：一次任务最多尝试这么久（覆盖目标设备暂时离线时的几次退避重试），
         // 超时就放弃并停服务，避免无限挂着重连耗电。
         private const val DELIVERY_MAX_LIFETIME_MS = 90_000L
+        // A verification code that arrives minutes late is both useless and dangerous if it
+        // replaces the user's current clipboard. This TTL is carried in the encrypted payload.
+        private const val SMS_CODE_TTL_MS = 2 * 60 * 1000L
+        private const val OUTBOX_RETRY_POLL_MS = 5_000L
         // 单次连接尝试的重试退避：2s → 4s → 8s，封顶 15s。
         private const val RECONNECT_BASE_DELAY_MS = 2_000L
         private const val RECONNECT_MAX_DELAY_MS = 15_000L
@@ -150,6 +166,7 @@ class WebSocketService : Service() {
         fun reportExternalStatus(context: Context, message: String) {
             lastStatusMessage = message
             val intent = Intent(CONNECTION_STATE_ACTION).apply {
+                setPackage(context.packageName)
                 putExtra("connected", isConnected)
                 putExtra("connected_count", connectedCount)
                 putExtra("status_message", message)
@@ -170,6 +187,8 @@ class WebSocketService : Service() {
     internal val reconnectAttempts = ConcurrentHashMap<String, Int>()
     private val pendingPayloads = mutableListOf<PendingPayload>()
     private var deliveryDeadlineJob: Job? = null
+    private var outboxRetryJob: Job? = null
+    private val clipboardBatchVersions = ConcurrentHashMap<String, LocalClipboardVersion>()
     private val msgIdSeq = AtomicLong(0)
     private val relayHttpClient = OkHttpClient.Builder()
         .connectTimeout(5, TimeUnit.SECONDS)
@@ -198,6 +217,13 @@ class WebSocketService : Service() {
     private var lastNotificationText = ""
     private var lastNotificationUpdateAt = 0L
 
+    private data class LocalClipboardVersion(
+        val ts: Long,
+        val origin: String,
+        val hash: String,
+        val kind: String
+    )
+
     override fun onCreate() {
         super.onCreate()
         isRunning = true
@@ -206,6 +232,7 @@ class WebSocketService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startForeground(NOTIFICATION_ID, buildNotification())
+        if (intent?.action != ACTION_FLUSH_OUTBOX) ensureOutboxRetryLoop()
 
         when (intent?.action) {
             ACTION_CONNECT -> handleConnect(intent)
@@ -222,11 +249,12 @@ class WebSocketService : Service() {
             ACTION_REVOKE_TOTP_ACCESS -> handleRevokeTotpAccess(intent)
             ACTION_RELAY_SMS -> handleRelaySms(intent)
             ACTION_BROADCAST_TOPOLOGY -> handleBroadcastTopology(intent)
+            ACTION_FLUSH_OUTBOX -> handleFlushOutbox()
             else -> stopIfNothingPending("空闲")
         }
 
-        // 按需模型：任务自然结束后会自行 stopSelf，不需要系统自动重启
-        serviceScope.launch { flushBusOutbox() }
+        // 按需模型：任务自然结束后会自行 stopSelf，不需要系统自动重启。
+        // 服务存活期间由 ensureOutboxRetryLoop 按 nextAttemptAt 持续扫描到期记录。
         return START_NOT_STICKY
     }
 
@@ -252,6 +280,46 @@ class WebSocketService : Service() {
 
     private fun handleDisconnect() {
         stopService("已停止")
+    }
+
+    /**
+     * Advances the single clipboard LWW register across text, image and file kinds. A local
+     * timestamp is always greater than the last applied timestamp, even if the wall clock moved
+     * backwards. A caller-supplied capture timestamp is kept as-is so a slowly prepared old URI
+     * cannot overwrite clipboard content copied later.
+     */
+    private fun resolveLocalClipboardVersion(
+        hash: String,
+        kind: String,
+        requestedTs: Long = 0L,
+        batchKey: String = ""
+    ): LocalClipboardVersion {
+        if (batchKey.isNotBlank()) {
+            clipboardBatchVersions[batchKey]?.let { return it }
+        }
+        val identity = PhoneIdentityStore.get(this)
+        val appliedTs = ClipboardSyncState.appliedTs(this)
+        val appliedOrigin = ClipboardSyncState.appliedOrigin(this)
+        val sameAppliedValue = hash.isNotBlank() &&
+            hash == ClipboardSyncState.appliedHash(this) &&
+            kind == ClipboardSyncState.appliedKind(this) &&
+            appliedTs > 0L
+        val version = if (sameAppliedValue) {
+            LocalClipboardVersion(appliedTs, appliedOrigin.ifBlank { identity.id }, hash, kind)
+        } else {
+            val ts = requestedTs.takeIf { it > 0L }
+                ?: nextClipboardTimestamp(System.currentTimeMillis(), appliedTs)
+            LocalClipboardVersion(ts, identity.id, hash, kind).also {
+                val finalizesLocalReservation = requestedTs > 0L &&
+                    requestedTs == appliedTs &&
+                    appliedOrigin == identity.id
+                if (ClipboardSyncState.isNewer(this, it.ts, it.origin) || finalizesLocalReservation) {
+                    ClipboardSyncState.rememberHash(this, it.ts, it.origin, it.hash, it.kind)
+                }
+            }
+        }
+        if (batchKey.isNotBlank()) clipboardBatchVersions[batchKey] = version
+        return version
     }
 
     private fun handleSendSms(intent: Intent) {
@@ -335,19 +403,12 @@ class WebSocketService : Service() {
         holdForwardLocks()
         // 剪贴板 LWW 版本：内容与已应用版本相同 → 复用现有版本（等于把当前状态
         // 重新推一遍，接收端按版本去重/丢弃，天然幂等）；新内容 → 产生新版本
-        val identity = PhoneIdentityStore.get(this)
-        val clipTs: Long
-        val clipOrigin: String
-        if (ClipboardSyncState.hash(text) == ClipboardSyncState.appliedHash(this) &&
-            ClipboardSyncState.appliedTs(this) > 0L
-        ) {
-            clipTs = ClipboardSyncState.appliedTs(this)
-            clipOrigin = ClipboardSyncState.appliedOrigin(this).ifBlank { identity.id }
-        } else {
-            clipTs = System.currentTimeMillis()
-            clipOrigin = identity.id
-            ClipboardSyncState.remember(this, clipTs, clipOrigin, text)
-        }
+        val version = resolveLocalClipboardVersion(
+            hash = ClipboardSyncState.hash(text),
+            kind = "text"
+        )
+        val clipTs = version.ts
+        val clipOrigin = version.origin
         if (text.toByteArray(Charsets.UTF_8).size > MAX_INLINE_CLIPBOARD_TEXT_BYTES) {
             handleSendClipboardTextAsFile(text, clipTs, clipOrigin)
             return
@@ -417,7 +478,7 @@ class WebSocketService : Service() {
             .put("sourceDeviceId", identity.id)
             .put("sourceDeviceName", identity.name)
             .put("sourceDeviceType", "ANDROID_PHONE")
-            .put("originDeviceId", identity.id)
+            .put("originDeviceId", clipOrigin.ifBlank { identity.id })
             .put("originDeviceName", identity.name)
             .put("originMessageId", fileId)
             .put("relayMessageId", fileId)
@@ -524,19 +585,37 @@ class WebSocketService : Service() {
             relativePath = relativePath
         )
         val fileId = manifest.optString("fileId")
+        val clipboardVersion = if (payloadType == "clipboard_file") {
+            val versionKey = batchId.ifBlank { fileId }
+            val versionHash = if (batchId.isNotBlank()) {
+                ClipboardSyncState.hash("clipboard-file-batch:$batchId")
+            } else {
+                manifest.optString("sha256").take(24).ifBlank {
+                    ClipboardSyncState.hash("clipboard-file:$fileId")
+                }
+            }
+            resolveLocalClipboardVersion(
+                hash = versionHash,
+                kind = "file",
+                requestedTs = clipboardBatchTimestamp(batchId),
+                batchKey = versionKey
+            )
+        } else {
+            null
+        }
         val payload = JSONObject()
             .put("type", payloadType)
             .put("code", "")
             .put("source", if (payloadType == "clipboard_file") "文件剪贴板" else "文件传输")
             .put("label", fileName)
             .put("rawMessage", if (payloadType == "clipboard_file") "文件剪贴板 $fileName" else "文件 $fileName")
-            .put("timestamp", System.currentTimeMillis())
+            .put("timestamp", clipboardVersion?.ts ?: System.currentTimeMillis())
             .put("phoneId", identity.id)
             .put("phoneName", identity.name)
             .put("sourceDeviceId", identity.id)
             .put("sourceDeviceName", identity.name)
             .put("sourceDeviceType", "ANDROID_PHONE")
-            .put("originDeviceId", identity.id)
+            .put("originDeviceId", clipboardVersion?.origin ?: identity.id)
             .put("originDeviceName", identity.name)
             .put("originMessageId", fileId)
             .put("relayMessageId", fileId)
@@ -552,6 +631,17 @@ class WebSocketService : Service() {
             .put("sourceAltHosts", JSONArray(altHosts))
             .put("fileManifest", manifest)
             .apply {
+                if (clipboardVersion != null) {
+                    put(
+                        "clipVersion",
+                        JSONObject()
+                            .put("ts", clipboardVersion.ts)
+                            .put("origin", clipboardVersion.origin)
+                            .put("hash", clipboardVersion.hash)
+                            .put("kind", clipboardVersion.kind)
+                    )
+                    if (batchId.isNotBlank()) put("clipboardBatchId", batchId)
+                }
                 // 同批文件带相同 batchId：接收端只确认一次，结论对整批生效
                 if (batchId.isNotBlank()) {
                     put("batchId", batchId)
@@ -593,26 +683,34 @@ class WebSocketService : Service() {
 
         holdForwardLocks()
         val identity = PhoneIdentityStore.get(this)
-        val bytes = file.readBytes()
+        val bytes = runCatching { file.readBytes() }.getOrElse {
+            stopIfNothingPending("图片剪贴板读取失败")
+            return
+        }
         val fullHash = sha256Hex(bytes)
         val shortHash = fullHash.take(24)
-        val clipTs = System.currentTimeMillis()
+        val clipVersion = resolveLocalClipboardVersion(
+            hash = shortHash,
+            kind = "image",
+            requestedTs = intent.getLongExtra(EXTRA_CLIP_VERSION_TS, 0L)
+        )
+        val clipTs = clipVersion.ts
         val mime = intent.getStringExtra(EXTRA_FILE_MIME).orEmpty()
             .ifBlank { if (file.extension.equals("jpg", ignoreCase = true) || file.extension.equals("jpeg", ignoreCase = true)) "image/jpeg" else "image/png" }
         val defaultExt = if (mime.equals("image/jpeg", ignoreCase = true)) "jpg" else "png"
         val fileName = intent.getStringExtra(EXTRA_FILE_NAME).orEmpty()
             .ifBlank { "clipboard-$clipTs.$defaultExt" }
-        val msgId = "clip-img-${identity.id}-$clipTs-$shortHash"
+        val msgId = "clip-img-${clipVersion.origin}-$clipTs-$shortHash"
         val manifest = JSONObject()
             .put("fileId", msgId)
             .put("name", fileName)
             .put("mime", mime)
             .put("size", bytes.size)
             .put("sha256", fullHash)
-            .put("originDeviceId", identity.id)
+            .put("originDeviceId", clipVersion.origin)
             .put("originDeviceName", identity.name)
             .put("targetDeviceIds", JSONArray(targetDevices.map { it.id }))
-            .put("expiresAt", clipTs + 10 * 60 * 1000L)
+            .put("expiresAt", System.currentTimeMillis() + 10 * 60 * 1000L)
             .put("inline", true)
 
         val payload = JSONObject()
@@ -627,7 +725,7 @@ class WebSocketService : Service() {
             .put("sourceDeviceId", identity.id)
             .put("sourceDeviceName", identity.name)
             .put("sourceDeviceType", "ANDROID_PHONE")
-            .put("originDeviceId", identity.id)
+            .put("originDeviceId", clipVersion.origin)
             .put("originDeviceName", identity.name)
             .put("originMessageId", msgId)
             .put("relayMessageId", msgId)
@@ -642,7 +740,7 @@ class WebSocketService : Service() {
                 "clipVersion",
                 JSONObject()
                     .put("ts", clipTs)
-                    .put("origin", identity.id)
+                    .put("origin", clipVersion.origin)
                     .put("hash", shortHash)
                     .put("kind", "image")
             )
@@ -670,7 +768,6 @@ class WebSocketService : Service() {
 
         holdForwardLocks()
         val identity = PhoneIdentityStore.get(this)
-        val clipTs = System.currentTimeMillis()
         val fileName = intent.getStringExtra(EXTRA_FILE_NAME).orEmpty().ifBlank { file.name }
         val mime = intent.getStringExtra(EXTRA_FILE_MIME).orEmpty()
             .ifBlank { if (file.extension.equals("jpg", ignoreCase = true) || file.extension.equals("jpeg", ignoreCase = true)) "image/jpeg" else "image/png" }
@@ -692,6 +789,12 @@ class WebSocketService : Service() {
         )
         val fileId = manifest.optString("fileId")
         val shortHash = manifest.optString("sha256").take(24)
+        val clipVersion = resolveLocalClipboardVersion(
+            hash = shortHash,
+            kind = "image",
+            requestedTs = intent.getLongExtra(EXTRA_CLIP_VERSION_TS, 0L)
+        )
+        val clipTs = clipVersion.ts
         val payload = JSONObject()
             .put("type", "clipboard_image")
             .put("code", "")
@@ -704,7 +807,7 @@ class WebSocketService : Service() {
             .put("sourceDeviceId", identity.id)
             .put("sourceDeviceName", identity.name)
             .put("sourceDeviceType", "ANDROID_PHONE")
-            .put("originDeviceId", identity.id)
+            .put("originDeviceId", clipVersion.origin)
             .put("originDeviceName", identity.name)
             .put("originMessageId", fileId)
             .put("relayMessageId", fileId)
@@ -722,7 +825,7 @@ class WebSocketService : Service() {
                 "clipVersion",
                 JSONObject()
                     .put("ts", clipTs)
-                    .put("origin", identity.id)
+                    .put("origin", clipVersion.origin)
                     .put("hash", shortHash)
                     .put("kind", "image")
             )
@@ -993,7 +1096,8 @@ class WebSocketService : Service() {
 
         val phoneIdentity = PhoneIdentityStore.get(this)
         val targetTopology = buildTargetTopology(targetDevices)
-        val msgId = "m-${phoneIdentity.id}-${System.currentTimeMillis()}-${msgIdSeq.incrementAndGet()}"
+        val createdAt = System.currentTimeMillis()
+        val msgId = "m-${phoneIdentity.id}-$createdAt-${msgIdSeq.incrementAndGet()}"
         // 剪贴板：originMessageId 与 LWW 版本绑定（clip-<origin>-<ts>），同一版本经
         // 多条路径/重复推送到达同一节点时，接收端用既有去重表即可收敛为一次处理
         val originMessageId = if (isClipboardTextType(type) && clipVersionTs > 0L) {
@@ -1006,7 +1110,7 @@ class WebSocketService : Service() {
             .put("code", code)
             .put("source", source)
             .put("type", type)
-            .put("timestamp", System.currentTimeMillis())
+            .put("timestamp", createdAt)
             .put("phoneId", phoneIdentity.id)
             .put("phoneName", phoneIdentity.name)
             .put("sourceDeviceId", phoneIdentity.id)
@@ -1017,6 +1121,7 @@ class WebSocketService : Service() {
             .put("pushAuthority", "source_device")
             .put("pushAuthorityDeviceId", phoneIdentity.id)
             .apply {
+                if (type == "sms") put("expiresAt", createdAt + SMS_CODE_TTL_MS)
                 if (isUserMessageType(type)) {
                     put("originDeviceId", if (isClipboardTextType(type) && clipVersionOrigin.isNotBlank()) clipVersionOrigin else phoneIdentity.id)
                     put("originDeviceName", phoneIdentity.name)
@@ -1056,6 +1161,10 @@ class WebSocketService : Service() {
         val identity = PhoneIdentityStore.get(this)
         val payload = runCatching { JSONObject(plainPayload) }.getOrNull() ?: run {
             stopIfNothingPending("中继负载无效")
+            return
+        }
+        if (isExpiredBusinessPayload(payload)) {
+            stopIfNothingPending("验证码已过期，已取消中继")
             return
         }
         val payloadType = payload.optString("type")
@@ -1470,6 +1579,11 @@ class WebSocketService : Service() {
         type: String,
         force: Boolean = false
     ) {
+        if (isExpiredBusinessPayload(payload)) {
+            failDelivery(device.id, msgId)
+            checkAllDoneAndStop()
+            return
+        }
         val busEnvelope = buildBusinessBusEnvelope(payload, type)
         if (busEnvelope != null && deviceSupportsSoftBus(device)) {
             serviceScope.launch {
@@ -1572,6 +1686,13 @@ class WebSocketService : Service() {
         busEnvelope: JSONObject,
         rememberOutbound: Boolean = true
     ): Boolean {
+        if (isExpiredBusEnvelope(busEnvelope)) {
+            val expiredMessageId = busEnvelope.optString("messageId")
+            if (expiredMessageId.isNotBlank()) {
+                BusReliabilityStore.markDelivered(this, expiredMessageId, device.id)
+            }
+            return false
+        }
         val targetPort = relayHttpPort(device)
         if (targetPort <= 0 || device.pairingKey.isBlank()) return false
         val hosts = candidateHosts(device)
@@ -1579,6 +1700,7 @@ class WebSocketService : Service() {
         val messageId = busEnvelope.optString("messageId")
         if (rememberOutbound) BusReliabilityStore.rememberOutbound(this, busEnvelope, device.id)
         val busTransport = ContentBus.wrapTransportEnvelope(this, busEnvelope, device.pairingKey)
+        val requestNonce = busTransport.optString("nonce")
         for (host in hosts) {
             try {
                 val body = busTransport.toString()
@@ -1588,8 +1710,9 @@ class WebSocketService : Service() {
                     .post(body)
                     .build()
                 relayHttpClient.newCall(request).execute().use { response ->
-                    if (isAcceptedBusAck(response)) {
+                    if (isAcceptedBusAck(response, messageId, requestNonce, device.pairingKey)) {
                         BusReliabilityStore.markDelivered(this, messageId, device.id)
+                        DeviceStore.promoteSuccessfulHost(this, device.id, host)
                         return true
                     }
                 }
@@ -1597,16 +1720,61 @@ class WebSocketService : Service() {
                 Log.w(TAG, "Bus HTTP unreachable for ${device.name}@$host: ${e.message}")
             }
         }
-        BusReliabilityStore.markFailed(this, messageId, device.id, "bus_http_unreachable")
+        if (isExpiredBusEnvelope(busEnvelope)) {
+            BusReliabilityStore.markDelivered(this, messageId, device.id)
+        } else {
+            BusReliabilityStore.markFailed(this, messageId, device.id, "bus_http_unreachable")
+        }
         return false
     }
 
-    private fun isAcceptedBusAck(response: Response): Boolean {
+    private fun isAcceptedBusAck(
+        response: Response,
+        expectedMessageId: String,
+        requestNonce: String,
+        pairingKey: String
+    ): Boolean {
         if (!response.isSuccessful) return false
         val text = runCatching { response.body?.string().orEmpty() }.getOrDefault("")
-        if (text.isBlank()) return true
-        val ack = runCatching { JSONObject(text) }.getOrNull() ?: return true
-        return ack.optString("type") != "bus_ack" || ack.optBoolean("accepted", true)
+        if (text.isBlank()) return false
+        val ack = runCatching { JSONObject(text) }.getOrNull() ?: return false
+        return BusAckAuth.isAcceptedAck(ack, expectedMessageId, requestNonce, pairingKey)
+    }
+
+    private fun isExpiredBusinessPayload(payload: String, now: Long = System.currentTimeMillis()): Boolean =
+        runCatching { isExpiredBusinessPayload(JSONObject(payload), now) }.getOrDefault(false)
+
+    private fun isExpiredBusinessPayload(payload: JSONObject, now: Long = System.currentTimeMillis()): Boolean {
+        val expiresAt = payload.optLong("expiresAt", 0L)
+        return expiresAt > 0L && expiresAt <= now
+    }
+
+    private fun isExpiredBusEnvelope(envelope: JSONObject, now: Long = System.currentTimeMillis()): Boolean {
+        val expiresAt = envelope.optLong("expiresAt", 0L).takeIf { it > 0L }
+            ?: envelope.optJSONObject("payload")?.optLong("expiresAt", 0L).orZero()
+        return expiresAt > 0L && expiresAt <= now
+    }
+
+    private fun Long?.orZero(): Long = this ?: 0L
+
+    private fun ensureOutboxRetryLoop() {
+        if (outboxRetryJob?.isActive == true) return
+        outboxRetryJob = serviceScope.launch {
+            while (true) {
+                runCatching { flushBusOutbox() }
+                    .onFailure { Log.w(TAG, "Outbox retry scan failed: ${it.message}") }
+                delay(OUTBOX_RETRY_POLL_MS)
+            }
+        }
+    }
+
+    private fun handleFlushOutbox() {
+        val dedicatedWake = outboxRetryJob?.isActive != true
+        serviceScope.launch {
+            runCatching { flushBusOutbox() }
+                .onFailure { Log.w(TAG, "Outbox wake flush failed: ${it.message}") }
+            if (dedicatedWake) stopIfNothingPending("离线消息重试完成")
+        }
     }
 
     private fun flushBusOutbox() {
@@ -1614,13 +1782,22 @@ class WebSocketService : Service() {
         for (record in due) {
             val targetId = record.optString("targetNodeId").trim()
             val envelope = record.optJSONObject("envelope") ?: continue
-            val device = DeviceStore.findDevice(this, targetId) ?: continue
-            if (!device.enabled || !deviceSupportsSoftBus(device)) continue
+            val messageId = envelope.optString("messageId")
+            if (isExpiredBusEnvelope(envelope)) {
+                BusReliabilityStore.markDelivered(this, messageId, targetId)
+                continue
+            }
+            val device = DeviceStore.findDevice(this, targetId)
+            if (device == null || !device.enabled || !deviceSupportsSoftBus(device)) {
+                BusReliabilityStore.markFailed(this, messageId, targetId, "target_unavailable")
+                continue
+            }
             deliverBusEnvelopeHttp(device, envelope, rememberOutbound = false)
         }
     }
 
     private fun sendRelayHttp(device: DesktopDevice, payload: String, preferBus: Boolean = true): Boolean {
+        if (isExpiredBusinessPayload(payload)) return false
         val targetPort = relayHttpPort(device)
         if (targetPort <= 0 || device.pairingKey.isBlank()) return false
         val hosts = candidateHosts(device)
@@ -1935,23 +2112,41 @@ class WebSocketService : Service() {
 
     /** 发本地广播，通知界面 TOTP 列表已因同步而变化。 */
     internal fun notifyTotpSynced() {
-        sendBroadcast(Intent(TOTP_SYNCED_ACTION))
+        sendBroadcast(Intent(TOTP_SYNCED_ACTION).setPackage(packageName))
     }
 
     /** 向已鉴权且有待投递负载的设备发送，返回是否发出了至少一条。 */
     internal fun flushPendingForDevice(deviceId: String): Boolean {
         val connection = connections[deviceId] ?: return false
         var sentAny = false
-        synchronized(pendingPayloads) {
-            pendingPayloads
-                .filter { deviceId in it.targetIds }
-                .forEach { pending ->
-                    if (sendPayload(connection, pending.payload, pending.msgId, pending.type)) {
-                        sentAny = true
-                    }
-                }
+        pruneExpiredPending()
+        val due = synchronized(pendingPayloads) {
+            pendingPayloads.filter { deviceId in it.targetIds }.toList()
+        }
+        due.forEach { pending ->
+            if (sendPayload(connection, pending.payload, pending.msgId, pending.type)) {
+                sentAny = true
+            }
         }
         return sentAny
+    }
+
+    private fun pruneExpiredPending(now: Long = System.currentTimeMillis()) {
+        val expiredDeliveries = mutableListOf<Pair<PendingPayload, String>>()
+        synchronized(pendingPayloads) {
+            val iterator = pendingPayloads.iterator()
+            while (iterator.hasNext()) {
+                val pending = iterator.next()
+                if (!isExpiredBusinessPayload(pending.payload, now)) continue
+                pending.targetIds.forEach { targetId ->
+                    expiredDeliveries.add(pending to targetId)
+                }
+                iterator.remove()
+            }
+        }
+        expiredDeliveries.forEach { (pending, targetId) ->
+            markPendingBusDelivered(targetId, pending)
+        }
     }
 
     private fun sendPayload(connection: DeviceConnection, payload: String, msgId: String, payloadType: String): Boolean {
@@ -2022,12 +2217,14 @@ class WebSocketService : Service() {
     }
 
     internal fun deviceHasPending(deviceId: String): Boolean {
+        pruneExpiredPending()
         synchronized(pendingPayloads) {
             return pendingPayloads.any { deviceId in it.targetIds }
         }
     }
 
     internal fun deviceHasPendingType(deviceId: String, type: String): Boolean {
+        pruneExpiredPending()
         synchronized(pendingPayloads) {
             return pendingPayloads.any { deviceId in it.targetIds && it.type == type }
         }
@@ -2072,6 +2269,7 @@ class WebSocketService : Service() {
         deliveryDeadlineJob?.cancel()
         deliveryDeadlineJob = serviceScope.launch {
             delay(DELIVERY_MAX_LIFETIME_MS)
+            pruneExpiredPending()
             val remaining = synchronized(pendingPayloads) { pendingPayloads.size }
             if (remaining > 0) {
                 Log.w(TAG, "Delivery deadline reached, giving up $remaining pending")
@@ -2083,6 +2281,7 @@ class WebSocketService : Service() {
     }
 
     internal fun checkAllDoneAndStop() {
+        pruneExpiredPending()
         val remaining = synchronized(pendingPayloads) { pendingPayloads.size }
         val activeConns = connections.values.count { it.webSocket != null || it.authenticated }
         if (remaining == 0 && activeConns == 0) {
@@ -2091,6 +2290,7 @@ class WebSocketService : Service() {
     }
 
     internal fun stopIfNothingPending(statusMessage: String) {
+        pruneExpiredPending()
         val remaining = synchronized(pendingPayloads) { pendingPayloads.size }
         val topologyBroadcastPending = pendingTopologyBroadcastJob?.isActive == true
         if (remaining == 0 && connections.isEmpty() && !topologyBroadcastPending) {
@@ -2100,6 +2300,7 @@ class WebSocketService : Service() {
 
     private fun stopService(statusMessage: String) {
         deliveryDeadlineJob?.cancel()
+        outboxRetryJob?.cancel()
         lockReleaseJob?.cancel()
         pendingTopologyBroadcastJob?.cancel()
         releaseForwardLocks()
@@ -2187,6 +2388,7 @@ class WebSocketService : Service() {
 
     private fun broadcastConnectionState(connected: Boolean, connectedCount: Int, statusMessage: String) {
         val intent = Intent(CONNECTION_STATE_ACTION).apply {
+            setPackage(packageName)
             putExtra("connected", connected)
             putExtra("connected_count", connectedCount)
             putExtra("status_message", statusMessage)
@@ -2266,6 +2468,7 @@ class WebSocketService : Service() {
 
     override fun onDestroy() {
         deliveryDeadlineJob?.cancel()
+        outboxRetryJob?.cancel()
         lockReleaseJob?.cancel()
         releaseForwardLocks()
         connections.keys.toList().forEach { cleanupConnection(it) }

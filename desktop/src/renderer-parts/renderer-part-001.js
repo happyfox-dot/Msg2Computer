@@ -21,7 +21,7 @@ let messageSettings = {
   // 剪贴板同步默认关闭，需用户显式开启
   syncClipboard: false,
   syncClipboardText: false,
-  syncClipboardImage: true,
+  syncClipboardImage: false,
   syncClipboardFile: false,
   receiveFileTransfer: false
 }
@@ -382,7 +382,8 @@ async function setupMessageSettings() {
     receiveNotifications: document.getElementById('chk-receive-notifications'),
     syncClipboardText: document.getElementById('chk-sync-clipboard-text'),
     syncClipboardImage: document.getElementById('chk-sync-clipboard-image'),
-    syncClipboardFile: document.getElementById('chk-sync-clipboard-file')
+    syncClipboardFile: document.getElementById('chk-sync-clipboard-file'),
+    receiveFileTransfer: document.getElementById('chk-receive-file-transfer')
   }
   if (!fields.receiveSmsCodes || !window.electronAPI.getMessageSettings) return
 
@@ -390,11 +391,21 @@ async function setupMessageSettings() {
     Object.entries(fields).forEach(([key, element]) => {
       if (!element) return
       if (key.startsWith('syncClipboard')) {
-        element.checked = key === 'syncClipboardFile'
-          ? (messageSettings.syncClipboardFile === true || messageSettings.receiveFileTransfer === true)
-          : messageSettings[key] === true
+        element.checked = messageSettings[key] === true
       } else {
         element.checked = messageSettings[key] !== false
+      }
+      if (key === 'syncClipboardFile') {
+        const supported = !Array.isArray(messageSettings.supportedPlatforms?.clipboardFileSync) ||
+          messageSettings.supportedPlatforms.clipboardFileSync.includes(messageSettings.currentPlatform)
+        element.disabled = !supported
+        element.title = supported ? '' : '文件剪贴板同步目前仅支持 Windows'
+        const label = element.closest('label')?.querySelector('.settings-label')
+        if (label) {
+          const base = label.dataset.baseLabel || label.textContent.replace(/（仅支持 Windows）$/, '')
+          label.dataset.baseLabel = base
+          label.textContent = supported ? base : `${base}（仅支持 Windows）`
+        }
       }
     })
   }
@@ -412,8 +423,7 @@ async function setupMessageSettings() {
       const nextSettings = {
         ...messageSettings,
         [key]: element.checked,
-        syncClipboard: key === 'syncClipboardText' ? element.checked : messageSettings.syncClipboard,
-        receiveFileTransfer: key === 'syncClipboardFile' ? element.checked : messageSettings.receiveFileTransfer
+        syncClipboard: key === 'syncClipboardText' ? element.checked : messageSettings.syncClipboard
       }
       try {
         messageSettings = await window.electronAPI.setMessageSettings(nextSettings)

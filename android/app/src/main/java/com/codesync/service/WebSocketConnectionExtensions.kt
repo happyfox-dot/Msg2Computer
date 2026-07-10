@@ -24,6 +24,7 @@ import com.codesync.util.DesktopDevice
 import com.codesync.util.DeviceStore
 import com.codesync.util.FileTransferRegistry
 import com.codesync.util.LanDiscovery
+import com.codesync.util.LanTrustStore
 import com.codesync.util.PhoneIdentityStore
 import com.codesync.util.PolicyManager
 import com.codesync.util.RouteManager
@@ -58,6 +59,77 @@ private const val REGISTER_HOLD_MS = 1_500L
 private const val RECONNECT_BASE_DELAY_MS = 2_000L
 private const val RECONNECT_MAX_DELAY_MS = 15_000L
 private const val LSDB_SEQ_PREFS = "topology_lsdb_seq"
+
+// A 16-byte nonce encoded as canonical RFC 4648 base64 is exactly 24 characters and ends in
+// two padding characters. Restricting the final data character also verifies zero padding bits.
+private val HANDSHAKE_NONCE_PATTERN = Regex("^[A-Za-z0-9+/]{21}[AQgw]==$")
+
+internal fun isValidHandshakeNonce(value: String): Boolean =
+    HANDSHAKE_NONCE_PATTERN.matches(value)
+
+private fun canonicalField(value: String): String =
+    "${value.toByteArray(Charsets.UTF_8).size}:$value"
+
+internal fun canonicalAuthContext(
+    clientId: String,
+    serverId: String,
+    clientNonce: String,
+    serverNonce: String
+): String = listOf(
+    "codebridge-auth-v1",
+    canonicalField(clientId),
+    canonicalField(serverId),
+    canonicalField(clientNonce),
+    canonicalField(serverNonce)
+).joinToString("|")
+
+internal fun canonicalCodeAckContext(msgId: String): String =
+    listOf("codebridge-ack-v1", canonicalField(msgId)).joinToString("|")
+
+private fun constantTimeEquals(expected: String, actual: String): Boolean =
+    expected.isNotEmpty() && actual.isNotEmpty() && MessageDigest.isEqual(
+        expected.toByteArray(Charsets.UTF_8),
+        actual.toByteArray(Charsets.UTF_8)
+    )
+
+private fun verifyServerProof(
+    pairingKey: String,
+    clientId: String,
+    serverId: String,
+    clientNonce: String,
+    serverNonce: String,
+    serverProof: String
+): Boolean = runCatching {
+    val expected = CryptoUtil.hmacSha256Base64(
+        pairingKey,
+        canonicalAuthContext(clientId, serverId, clientNonce, serverNonce)
+    )
+    constantTimeEquals(expected, serverProof)
+}.getOrDefault(false)
+
+private fun codeAckToken(sessionKey: String, msgId: String): String =
+    CryptoUtil.hmacSha256Base64(sessionKey, canonicalCodeAckContext(msgId))
+
+private fun verifyCodeAckToken(sessionKey: String, msgId: String, ackToken: String): Boolean =
+    runCatching { constantTimeEquals(codeAckToken(sessionKey, msgId), ackToken) }.getOrDefault(false)
+
+private fun sendAuthenticatedCodeAck(
+    webSocket: WebSocket,
+    connection: DeviceConnection,
+    msgId: String
+): Boolean {
+    val sessionKey = connection.sessionKey
+    if (!connection.authenticated || sessionKey.isNullOrBlank() || msgId.isBlank()) return false
+    return runCatching {
+        webSocket.send(
+            JSONObject()
+                .put("type", "code_ack")
+                .put("msgId", msgId)
+                .put("ackToken", codeAckToken(sessionKey, msgId))
+                .toString()
+        )
+    }.getOrDefault(false)
+}
 
 fun WebSocketService.connectDevice(device: DesktopDevice, registerOnly: Boolean, force: Boolean = false) {
     if (!force && !device.enabled) return
@@ -142,12 +214,40 @@ fun WebSocketService.connectDevice(device: DesktopDevice, registerOnly: Boolean,
                 val msg = JSONObject(text)
                 when (msg.optString("type")) {
                     "auth_ok" -> {
-                        connection.sessionKey = if (msg.optString("keyMode") == "derived") {
-                            val serverNonce = msg.optString("serverNonce")
-                            CryptoUtil.deriveSessionKey(device.pairingKey, connection.phoneNonce, serverNonce)
-                        } else {
-                            msg.optString("sessionKey")
+                        val serverNonce = msg.optString("serverNonce")
+                        val serverId = msg.optString("serverId").trim()
+                        val serverProof = msg.optString("serverProof")
+                        val clientId = PhoneIdentityStore.get(this@connectDevice).id
+                        if (
+                            msg.optString("keyMode") != "derived" ||
+                            !isValidHandshakeNonce(serverNonce) ||
+                            serverId != device.id ||
+                            !verifyServerProof(
+                                pairingKey = device.pairingKey,
+                                clientId = clientId,
+                                serverId = serverId,
+                                clientNonce = connection.phoneNonce,
+                                serverNonce = serverNonce,
+                                serverProof = serverProof
+                            )
+                        ) {
+                            // Never accept a server-provided sessionKey on ws://. That legacy mode
+                            // lets an active network attacker downgrade the handshake and read the
+                            // node key subsequently sent inside node_info.
+                            Log.e(WebSocketService.TAG, "Rejected insecure auth_ok from ${device.name}")
+                            connection.sessionKey = null
+                            connection.authenticated = false
+                            connection.deniedByDesktop = true
+                            updateConnectionState("目标节点握手协议不安全，请升级 ${device.name}")
+                            dropPendingForDevice(device.id)
+                            webSocket.close(1002, "Derived session key required")
+                            return
                         }
+                        connection.sessionKey = CryptoUtil.deriveSessionKey(
+                            device.pairingKey,
+                            connection.phoneNonce,
+                            serverNonce
+                        )
                         connection.authenticated = true
                         updateConnectionState("已连接 ${device.name}")
                         reconnectAttempts.remove(device.id)
@@ -178,6 +278,16 @@ fun WebSocketService.connectDevice(device: DesktopDevice, registerOnly: Boolean,
                     }
                     "code_ack" -> {
                         val ackedId = msg.optString("msgId")
+                        val sessionKey = connection.sessionKey
+                        if (
+                            !connection.authenticated ||
+                            sessionKey.isNullOrBlank() ||
+                            ackedId.isBlank() ||
+                            !verifyCodeAckToken(sessionKey, ackedId, msg.optString("ackToken"))
+                        ) {
+                            Log.w(WebSocketService.TAG, "Rejected unauthenticated ACK from ${device.name}")
+                            return
+                        }
                         Log.d(WebSocketService.TAG, "ACK ${device.name}: $ackedId")
                         DeviceStore.markDeviceSynced(this@connectDevice, device.id)
                         ackDelivery(device.id, ackedId)
@@ -208,7 +318,7 @@ fun WebSocketService.connectDevice(device: DesktopDevice, registerOnly: Boolean,
                         handleTopologyDelta(connection, msg.optString("payload"))
                         val msgId = msg.optString("msgId")
                         if (msgId.isNotBlank()) {
-                            webSocket.send(JSONObject().put("type", "code_ack").put("msgId", msgId).toString())
+                            sendAuthenticatedCodeAck(webSocket, connection, msgId)
                         }
                     }
                     "topology_snapshot_request" -> {
@@ -477,12 +587,17 @@ fun WebSocketService.handleTopologySync(connection: DeviceConnection, encryptedP
         val sync = JSONObject(plain)
         if (sync.optString("type") != "topology_sync") return
         val identity = PhoneIdentityStore.get(this)
+        val syncNetworkId = sync.optString("networkId").trim()
 
         // OSPF LSA 新鲜度规则的简化版：按来源桌面记录已接受的最大 lsdbSeq，
         // 收到更小的序列号说明是迟到/乱序的旧路由表，整包丢弃。否则手机同时
         // 连接两台桌面时，后到的陈旧 topology_sync 会覆盖更新的路由。
         // 旧版桌面端不带 lsdbSeq（=0）时跳过检查以保持兼容。
         val sourceId = sync.optString("sourceDeviceId").trim().ifBlank { connection.device.id }
+        if (sourceId != connection.device.id) {
+            Log.w(WebSocketService.TAG, "拒绝来源身份不匹配的 topology_sync：$sourceId")
+            return
+        }
         val lsdbSeq = sync.optLong("lsdbSeq", 0L)
         if (lsdbSeq > 0L) {
             val lastSeq = lastAcceptedLsdbSeq(sourceId)
@@ -490,8 +605,48 @@ fun WebSocketService.handleTopologySync(connection: DeviceConnection, encryptedP
                 Log.w(WebSocketService.TAG, "丢弃过期 topology_sync：seq=$lsdbSeq < $lastSeq，来源 ${connection.device.name}")
                 return
             }
-            rememberLsdbSeq(sourceId, lsdbSeq)
         }
+
+        // Only a fresh, authenticated sync may fill a historical blank network id. Once a
+        // desktop is bound to a network, a conflicting topology snapshot cannot migrate the
+        // whole phone; cross-network merging must use the explicit join flow.
+        if (syncNetworkId.isNotBlank()) {
+            val storedDevice = DeviceStore.findDevice(this, connection.device.id) ?: connection.device
+            val storedNetworkId = storedDevice.networkId.trim()
+            if (storedNetworkId.isNotBlank() && storedNetworkId != syncNetworkId) {
+                Log.w(WebSocketService.TAG, "拒绝 networkId 冲突的 topology_sync：${storedDevice.name}")
+                return
+            }
+            val previousNetworkId = LanTrustStore.getNetworkId(this)
+            val hasConflictingBoundNetwork = DeviceStore.getDevices(this).any { device ->
+                val deviceNetworkId = device.networkId.trim()
+                deviceNetworkId.isNotBlank() && deviceNetworkId != syncNetworkId
+            }
+            if (previousNetworkId != syncNetworkId && hasConflictingBoundNetwork) {
+                Log.w(WebSocketService.TAG, "拒绝 topology_sync 隐式跨网络迁移：${storedDevice.name}")
+                return
+            }
+            if (previousNetworkId != syncNetworkId) {
+                LanTrustStore.adoptNetworkId(
+                    context = this,
+                    networkId = syncNetworkId,
+                    allowMerge = true,
+                    mergeFromNetworkIds = listOf(previousNetworkId)
+                )
+            }
+            DeviceStore.upsertDevice(
+                context = this,
+                host = storedDevice.host,
+                port = storedDevice.port,
+                pairingKey = storedDevice.pairingKey,
+                name = storedDevice.name,
+                deviceId = storedDevice.id,
+                deviceType = storedDevice.type,
+                altHosts = storedDevice.altHosts,
+                networkId = syncNetworkId
+            )
+        }
+        if (lsdbSeq > 0L) rememberLsdbSeq(sourceId, lsdbSeq)
 
         val nodes = sync.optJSONArray("nodes") ?: JSONArray()
         val routeByDestination = mutableMapOf<String, JSONObject>()
@@ -505,6 +660,7 @@ fun WebSocketService.handleTopologySync(connection: DeviceConnection, encryptedP
                 .put("sourceDeviceId", sourceId)
                 .put("sourceDeviceName", sync.optString("sourceDeviceName", connection.device.name))
                 .put("sourceDeviceType", sync.optString("sourceDeviceType", connection.device.type))
+                .put("networkId", syncNetworkId)
                 .put("seq", lsdbSeq.takeIf { it > 0L } ?: sync.optLong("updatedAt", System.currentTimeMillis()))
                 .put("ttl", 4)
                 .put("updatedAt", sync.optLong("updatedAt", System.currentTimeMillis()))
@@ -570,6 +726,7 @@ fun WebSocketService.handleTopologySync(connection: DeviceConnection, encryptedP
                 routeUpdatedAt = sync.optLong("updatedAt", 0L).takeIf { it > 0L }
                     ?: route?.optLong("updatedAt", 0L) ?: 0L,
                 altHosts = altHosts.filter { it != host },
+                networkId = node.optString("networkId").trim().ifBlank { syncNetworkId },
                 policyAllowSmsCodes = node.optBoolean("allowSmsCodes", true),
                 policyAllowSmsMessages = node.optBoolean("allowSmsMessages", true),
                 policyAllowNotifications = node.optBoolean("allowNotifications", true),

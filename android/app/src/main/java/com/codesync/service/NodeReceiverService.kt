@@ -5,10 +5,15 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.ClipData
 import android.content.ClipDescription
 import android.content.Context
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
@@ -22,6 +27,7 @@ import com.codesync.R
 import com.codesync.util.ClipboardHistoryStore
 import com.codesync.util.ClipboardSyncState
 import com.codesync.util.BusReliabilityStore
+import com.codesync.util.BusAckAuth
 import com.codesync.util.ContentBus
 import com.codesync.util.CryptoUtil
 import com.codesync.util.DeviceStore
@@ -36,6 +42,7 @@ import com.codesync.util.LanJoinCrypto
 import com.codesync.util.LanTrustStore
 import com.codesync.util.PendingLanJoinRequest
 import com.codesync.util.PhoneIdentityStore
+import com.codesync.util.PolicyManager
 import com.codesync.util.RouteManager
 import com.codesync.util.SettingsStore
 import com.codesync.util.TotpEntry
@@ -49,6 +56,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
@@ -63,10 +71,12 @@ import java.net.URL
 import java.net.URLDecoder
 import java.net.URLEncoder
 import java.security.MessageDigest
+import java.util.Collections
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Semaphore
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 class NodeReceiverService : Service() {
     companion object {
@@ -74,6 +84,7 @@ class NodeReceiverService : Service() {
         private const val NOTIFICATION_ID = 1002
         private const val CHANNEL_ID = "code_sync_node_receiver"
         private const val MAX_BODY_BYTES = 512 * 1024
+        private const val MAX_HEADER_LINE_BYTES = 8 * 1024
         private const val MAX_INLINE_CLIPBOARD_IMAGE_BYTES = 768 * 1024
         private const val FILE_TRANSFER_CHUNK_BYTES = 4 * 1024 * 1024
         private const val FILE_TRANSFER_TIMEOUT_MS = 20_000
@@ -82,6 +93,10 @@ class NodeReceiverService : Service() {
         private const val ACCEPT_TIMEOUT_MS = 1_000
         private const val CLIENT_READ_TIMEOUT_MS = 10_000
         private const val MAX_CONCURRENT_CLIENTS = 16
+        private const val LISTEN_RETRY_INITIAL_MS = 250L
+        private const val LISTEN_RETRY_MAX_MS = 15_000L
+        private const val OUTBOX_MAINTENANCE_INTERVAL_MS = 30_000L
+        private const val OUTBOX_WAKE_MIN_INTERVAL_MS = 30_000L
         private const val CLIPBOARD_TEMP_PREFS = "clipboard_temp_state"
         private const val CLIPBOARD_FILE_TEMP_DIR = "CodeBridgeClipboardFiles"
         private const val CLIPBOARD_IMAGE_TEMP_DIR = "clipboard_images"
@@ -98,6 +113,7 @@ class NodeReceiverService : Service() {
         // 仅内存留存（窗口期外的旧 nonce 必被时间窗拦截，无需跨重启持久化）。
         private const val RELAY_NONCE_TTL_MS = RELAY_REPLAY_WINDOW_MS
         private const val RELAY_NONCE_LIMIT_PER_SENDER = 300
+        private val clipboardApplyLock = Any()
     }
 
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -106,7 +122,30 @@ class NodeReceiverService : Service() {
     private var serverSocket: ServerSocket? = null
     private val clientSlots = Semaphore(MAX_CONCURRENT_CLIENTS)
     private var lanResponderJob: Job? = null
-    private val incomingFileTransfers = ConcurrentHashMap.newKeySet<String>()
+    private var outboxMaintenanceJob: Job? = null
+    private var connectivityCallbackRegistered = false
+    private val lastOutboxWakeAt = AtomicLong(0L)
+    private val connectivityManager: ConnectivityManager by lazy {
+        getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+    }
+    private val connectivityCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            requestOutboxMaintenance()
+        }
+
+        override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
+            requestOutboxMaintenance()
+        }
+
+        override fun onLost(network: Network) {
+            // The periodic pass remains responsible for pruning expired records.
+            // A replacement network, if any, will also produce onAvailable.
+        }
+    }
+    // ConcurrentHashMap.newKeySet() was added in API 24. This Java 6-compatible
+    // construction preserves the app's API 23 minimum without a runtime crash.
+    private val incomingFileTransfers: MutableSet<String> =
+        Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
 
     private data class FileSource(
         val id: String,
@@ -139,6 +178,7 @@ class NodeReceiverService : Service() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+        registerOutboxConnectivityCallback()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -151,7 +191,78 @@ class NodeReceiverService : Service() {
             serviceScope.launch { listenLoop() }
         }
         startLanResponder()
+        startOutboxMaintenance()
         return START_STICKY
+    }
+
+    private fun registerOutboxConnectivityCallback() {
+        if (connectivityCallbackRegistered) return
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                connectivityManager.registerDefaultNetworkCallback(connectivityCallback)
+            } else {
+                connectivityManager.registerNetworkCallback(
+                    NetworkRequest.Builder().build(),
+                    connectivityCallback
+                )
+            }
+            connectivityCallbackRegistered = true
+        } catch (e: RuntimeException) {
+            // Some OEMs restrict callback registration. The periodic maintenance
+            // loop still provides a safe fallback and receiver startup must survive.
+            Log.w(TAG, "Unable to register outbox connectivity callback", e)
+        }
+    }
+
+    private fun startOutboxMaintenance() {
+        if (outboxMaintenanceJob?.isActive == true) return
+        outboxMaintenanceJob = serviceScope.launch {
+            while (running) {
+                maintainPersistentOutbox()
+                delay(OUTBOX_MAINTENANCE_INTERVAL_MS)
+            }
+        }
+    }
+
+    private fun requestOutboxMaintenance() {
+        if (!running) return
+        serviceScope.launch { maintainPersistentOutbox() }
+    }
+
+    private fun maintainPersistentOutbox() {
+        // dueOutbound also removes expired/invalid persisted records, including
+        // while offline, so stale verification codes cannot be replayed later.
+        val hasDueOutbound = runCatching {
+            BusReliabilityStore.dueOutbound(this, limit = 1).isNotEmpty()
+        }.onFailure {
+            Log.w(TAG, "Unable to inspect persistent outbox", it)
+        }.getOrDefault(false)
+        if (!hasDueOutbound) return
+
+        val now = System.currentTimeMillis()
+        val lastWake = lastOutboxWakeAt.get()
+        if (!shouldWakePersistentOutbox(
+                hasDueOutbound = true,
+                networkAvailable = isNetworkCurrentlyAvailable(),
+                webSocketServiceRunning = WebSocketService.isRunning,
+                now = now,
+                lastWakeAt = lastWake,
+                minIntervalMs = OUTBOX_WAKE_MIN_INTERVAL_MS
+            )
+        ) return
+        if (!lastOutboxWakeAt.compareAndSet(lastWake, now)) return
+
+        val intent = Intent(this, WebSocketService::class.java).apply {
+            action = WebSocketService.ACTION_FLUSH_OUTBOX
+        }
+        startServiceSafely(intent, "flush persistent outbox")
+    }
+
+    private fun isNetworkCurrentlyAvailable(): Boolean {
+        return runCatching {
+            val activeNetwork = connectivityManager.activeNetwork ?: return@runCatching false
+            connectivityManager.getNetworkCapabilities(activeNetwork) != null
+        }.getOrDefault(false)
     }
 
     private fun handleRetryFileTransfer(intent: Intent) {
@@ -172,35 +283,46 @@ class NodeReceiverService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    private fun listenLoop() {
-        try {
-            serverSocket = ServerSocket(LanDiscovery.NODE_RELAY_PORT)
-            serverSocket?.soTimeout = ACCEPT_TIMEOUT_MS
-            Log.d(TAG, "Node receiver listening on ${LanDiscovery.NODE_RELAY_PORT}")
-            while (running) {
-                val socket = try {
-                    serverSocket?.accept() ?: break
-                } catch (_: SocketTimeoutException) {
-                    continue
+    private suspend fun listenLoop() {
+        var retryDelayMs = LISTEN_RETRY_INITIAL_MS
+        while (running) {
+            try {
+                val listener = ServerSocket(LanDiscovery.NODE_RELAY_PORT).also {
+                    it.soTimeout = ACCEPT_TIMEOUT_MS
                 }
-                if (!clientSlots.tryAcquire()) {
-                    socket.use { writeHttpResponse(it, 503) }
-                    continue
-                }
-                serviceScope.launch {
-                    try {
-                        handleClient(socket)
-                    } finally {
-                        clientSlots.release()
+                serverSocket = listener
+                Log.d(TAG, "Node receiver listening on ${LanDiscovery.NODE_RELAY_PORT}")
+                while (running) {
+                    val socket = try {
+                        listener.accept()
+                    } catch (_: SocketTimeoutException) {
+                        continue
+                    }
+                    retryDelayMs = LISTEN_RETRY_INITIAL_MS
+                    if (!clientSlots.tryAcquire()) {
+                        socket.use { writeHttpResponse(it, 503) }
+                        continue
+                    }
+                    serviceScope.launch {
+                        try {
+                            handleClient(socket)
+                        } finally {
+                            clientSlots.release()
+                        }
                     }
                 }
+            } catch (e: Exception) {
+                if (!running) break
+                Log.e(TAG, "Node receiver listener failed; retrying in ${retryDelayMs}ms", e)
+            } finally {
+                val listener = serverSocket
+                serverSocket = null
+                runCatching { listener?.close() }
             }
-        } catch (e: Exception) {
-            if (running) Log.e(TAG, "Node receiver failed", e)
-        } finally {
-            runCatching { serverSocket?.close() }
-            serverSocket = null
-            running = false
+            if (running) {
+                delay(retryDelayMs)
+                retryDelayMs = (retryDelayMs * 2).coerceAtMost(LISTEN_RETRY_MAX_MS)
+            }
         }
     }
 
@@ -310,15 +432,28 @@ class NodeReceiverService : Service() {
             return
         }
         val requesterId = request.query["senderId"].orEmpty()
+        if (!PolicyManager.isTrustedNetworkDevice(this, DeviceStore.findDevice(this, requesterId))) {
+            writeHttpResponse(socket, 403)
+            return
+        }
         val baseQuery = listOf("from", "to", "senderId", "nonce", "authToken", "chunkEncoding")
             .mapNotNull { key -> request.query[key]?.let { "$key=${urlEncode(it)}" } }
             .joinToString("&")
         val origin = DeviceStore.findDevice(this, originId)
-        val forwardUrl = if (origin != null && origin.host.isNotBlank()) {
+        val forwardUrl = if (
+            origin != null &&
+            PolicyManager.isTrustedNetworkDevice(this, origin) &&
+            origin.host.isNotBlank()
+        ) {
             "http://${origin.host}:${LanDiscovery.NODE_RELAY_PORT}/file/${urlEncode(fileId)}?$baseQuery"
         } else {
             val next = DeviceStore.getEnabledDevices(this)
-                .firstOrNull { it.id != originId && it.id != requesterId && it.host.isNotBlank() }
+                .firstOrNull {
+                    it.id != originId &&
+                        it.id != requesterId &&
+                        it.host.isNotBlank() &&
+                        PolicyManager.isTrustedNetworkDevice(this, it)
+                }
             if (next == null) {
                 writeHttpResponse(socket, 502)
                 return
@@ -402,7 +537,10 @@ class NodeReceiverService : Service() {
             val b = input.read()
             if (b == -1) return if (sb.isEmpty()) null else sb.toString()
             if (b == '\n'.code) break
-            if (b != '\r'.code) sb.append(b.toChar())
+            if (b != '\r'.code) {
+                if (sb.length >= MAX_HEADER_LINE_BYTES) return null
+                sb.append(b.toChar())
+            }
         }
         return sb.toString()
     }
@@ -523,10 +661,22 @@ class NodeReceiverService : Service() {
             action = WebSocketService.ACTION_BROADCAST_TOPOLOGY
             putExtra(WebSocketService.EXTRA_TOPOLOGY_REASON, reason)
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(intent)
-        } else {
-            startService(intent)
+        startServiceSafely(intent, "broadcast topology: $reason")
+    }
+
+    private fun startServiceSafely(intent: Intent, operation: String): Boolean {
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(intent)
+            } else {
+                startService(intent)
+            }
+            true
+        } catch (e: RuntimeException) {
+            // Android 12+ may reject a foreground-service launch after the app moves
+            // to the background. A rejected relay must not terminate this receiver.
+            Log.w(TAG, "Unable to $operation", e)
+            false
         }
     }
 
@@ -539,6 +689,12 @@ class NodeReceiverService : Service() {
         val authToken = envelope.optString("authToken").trim()
         if (senderId.isBlank() || nonce.isBlank() || encryptedPayload.isBlank() || authToken.isBlank()) {
             return 400
+        }
+
+        val senderDevice = DeviceStore.findDevice(this, senderId)
+        if (!PolicyManager.isTrustedNetworkDevice(this, senderDevice)) {
+            Log.w(TAG, "Relay rejected from disabled, revoked, or foreign-network sender $senderId")
+            return 403
         }
 
         val expected = CryptoUtil.hmacSha256Base64(
@@ -576,6 +732,14 @@ class NodeReceiverService : Service() {
 
         val payloadType = payload.optString("type")
         if (!isSupportedPayload(payloadType)) return 202
+        if (!payloadMatchesCurrentNetwork(payload, allowMissing = true)) {
+            Log.w(TAG, "Relay payload network mismatch from $senderId")
+            return 403
+        }
+        if (isExpiredVerificationCodePayload(payload)) {
+            Log.d(TAG, "Expired verification code dropped before local delivery or relay")
+            return 202
+        }
 
         val relayMessageId = payload.optString("originMessageId")
             .ifBlank { payload.optString("relayMessageId") }
@@ -604,7 +768,7 @@ class NodeReceiverService : Service() {
         if (isTopologyPayload(payloadType)) {
             val changed = TopologyStore.applyDelta(this, payload)
             if (changed) {
-                sendBroadcast(Intent(WebSocketService.TOTP_SYNCED_ACTION))
+                sendBroadcast(Intent(WebSocketService.TOTP_SYNCED_ACTION).setPackage(packageName))
                 WebSocketService.reportExternalStatus(this, "已更新拓扑控制面")
                 broadcastTopologyChange("topology_delta_received")
             }
@@ -694,11 +858,7 @@ class NodeReceiverService : Service() {
                 action = WebSocketService.ACTION_RELAY_SMS
                 putExtra(WebSocketService.EXTRA_RELAY_PAYLOAD, payload.toString())
             }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                startForegroundService(relayIntent)
-            } else {
-                startService(relayIntent)
-            }
+            startServiceSafely(relayIntent, "relay legacy payload")
         }
         return 200
     }
@@ -717,6 +877,7 @@ class NodeReceiverService : Service() {
         }
         val payloadType = payload.optString("type")
         if (!isSupportedPayload(payloadType)) return 202
+        if (isExpiredVerificationCodePayload(payload)) return 202
 
         val messageId = payload.optString("originMessageId")
             .ifBlank { payload.optString("relayMessageId") }
@@ -737,7 +898,7 @@ class NodeReceiverService : Service() {
         if (isTopologyPayload(payloadType)) {
             val changed = TopologyStore.applyDelta(this, payload)
             if (changed) {
-                sendBroadcast(Intent(WebSocketService.TOTP_SYNCED_ACTION))
+                sendBroadcast(Intent(WebSocketService.TOTP_SYNCED_ACTION).setPackage(packageName))
                 WebSocketService.reportExternalStatus(this, "已更新拓扑控制面")
                 broadcastTopologyChange("topology_delta_received")
             }
@@ -821,39 +982,55 @@ class NodeReceiverService : Service() {
                 action = WebSocketService.ACTION_RELAY_SMS
                 putExtra(WebSocketService.EXTRA_RELAY_PAYLOAD, payload.toString())
             }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                startForegroundService(relayIntent)
-            } else {
-                startService(relayIntent)
-            }
+            startServiceSafely(relayIntent, "relay bus payload")
         }
         return 200
     }
 
     private fun handleBusEnvelope(transport: JSONObject): Pair<Int, JSONObject> {
-        val identity = PhoneIdentityStore.get(this)
-        val parsed = ContentBus.parseTransportEnvelope(this, transport) { senderId ->
-            if (senderId == identity.id) {
-                identity.pairingKey
-            } else {
-                DeviceStore.findDevice(this, senderId)?.pairingKey
-            }
-        }
-            ?: return 403 to JSONObject()
-                .put("type", "bus_ack")
-                .put("accepted", false)
-                .put("reason", "invalid_bus_envelope")
-        val senderId = parsed.first
-        val envelope = parsed.second
-        val trusted = senderId == identity.id || DeviceStore.findDevice(this, senderId) != null
-        if (!trusted) {
+        val claimedSenderId = transport.optString("senderId").trim()
+        val senderDevice = DeviceStore.findDevice(this, claimedSenderId)
+        if (!PolicyManager.isTrustedNetworkDevice(this, senderDevice)) {
             return 403 to JSONObject()
                 .put("type", "bus_ack")
                 .put("accepted", false)
                 .put("reason", "untrusted_sender")
         }
+        val parsed = ContentBus.parseTransportEnvelope(this, transport) { senderId ->
+            DeviceStore.findDevice(this, senderId)
+                ?.takeIf { PolicyManager.isTrustedNetworkDevice(this, it) }
+                ?.pairingKey
+        }
+            ?: return 403 to JSONObject()
+                .put("type", "bus_ack")
+                .put("accepted", false)
+                .put("reason", "invalid_bus_envelope")
+        val senderId = parsed.senderId
+        val envelope = parsed.envelope
+        val messageId = envelope.optString("messageId")
+        if (senderId != claimedSenderId ||
+            !PolicyManager.isTrustedNetworkDevice(this, DeviceStore.findDevice(this, senderId)) ||
+            !payloadMatchesCurrentNetwork(envelope)
+        ) {
+            return 403 to BusAckAuth.signedAck(
+                pairingKeyBase64 = parsed.authenticatedPeerKey,
+                nonce = parsed.nonce,
+                messageId = messageId,
+                accepted = false,
+                reason = "untrusted_sender_or_network"
+            )
+        }
 
         val legacyPayload = ContentBus.legacyPayloadFromEnvelope(envelope)
+        if (isExpiredVerificationCodePayload(legacyPayload)) {
+            return 202 to BusAckAuth.signedAck(
+                pairingKeyBase64 = parsed.authenticatedPeerKey,
+                nonce = parsed.nonce,
+                messageId = messageId,
+                accepted = true,
+                reason = "expired"
+            )
+        }
         // 转回 relay 信封时补打 relaySentAt（缺失时 handleRelayEnvelope 会跳过重放窗口校验）
         legacyPayload.put("relaySentAt", System.currentTimeMillis())
         val status = if (BusReliabilityStore.rememberInbound(this, envelope)) {
@@ -861,10 +1038,12 @@ class NodeReceiverService : Service() {
         } else {
             202
         }
-        return status to JSONObject()
-            .put("type", "bus_ack")
-            .put("accepted", status in 200..299)
-            .put("messageId", envelope.optString("messageId"))
+        return status to BusAckAuth.signedAck(
+            pairingKeyBase64 = parsed.authenticatedPeerKey,
+            nonce = parsed.nonce,
+            messageId = messageId,
+            accepted = status in 200..299
+        )
     }
 
     private fun jsonArrayContains(array: JSONArray, value: String): Boolean {
@@ -887,6 +1066,16 @@ class NodeReceiverService : Service() {
             type == "totp_revoke" ||
             type == "totp_resync_request" ||
             isTopologyPayload(type)
+    }
+
+    private fun payloadMatchesCurrentNetwork(payload: JSONObject, allowMissing: Boolean = false): Boolean {
+        val incomingNetworkId = payload.optString("networkId").trim()
+        if (incomingNetworkId.isBlank()) return allowMissing
+        val localNetworkId = LanTrustStore.getNetworkId(this).trim()
+        return localNetworkId.isNotBlank() && MessageDigest.isEqual(
+            localNetworkId.toByteArray(Charsets.UTF_8),
+            incomingNetworkId.toByteArray(Charsets.UTF_8)
+        )
     }
 
     private fun isUserMessagePayload(type: String): Boolean {
@@ -927,7 +1116,7 @@ class NodeReceiverService : Service() {
                     isLocal = false
                 ).withStableId()
                 TotpStore.add(this, entry)
-                sendBroadcast(Intent(WebSocketService.TOTP_SYNCED_ACTION))
+                sendBroadcast(Intent(WebSocketService.TOTP_SYNCED_ACTION).setPackage(packageName))
                 WebSocketService.reportExternalStatus(this, "收到中继 TOTP：${entry.label}")
             }
             "totp_revoke" -> {
@@ -942,7 +1131,7 @@ class NodeReceiverService : Service() {
                     }
                 removed.forEach { TotpStore.removeById(this, it.id) }
                 if (removed.isNotEmpty()) {
-                    sendBroadcast(Intent(WebSocketService.TOTP_SYNCED_ACTION))
+                    sendBroadcast(Intent(WebSocketService.TOTP_SYNCED_ACTION).setPackage(packageName))
                     WebSocketService.reportExternalStatus(this, "已同步删除 ${removed.size} 个中继 TOTP")
                 }
             }
@@ -957,11 +1146,7 @@ class NodeReceiverService : Service() {
             action = WebSocketService.ACTION_SEND_ALL_TOTP_SEEDS
             putStringArrayListExtra(WebSocketService.EXTRA_TARGET_DEVICE_IDS, arrayListOf(requesterId))
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(intent)
-        } else {
-            startService(intent)
-        }
+        startServiceSafely(intent, "send TOTP resync response")
         WebSocketService.reportExternalStatus(this, "收到全量 TOTP 同步请求")
     }
 
@@ -1128,6 +1313,7 @@ class NodeReceiverService : Service() {
     }
 
     private fun notifyFileTransferRequested(payload: JSONObject) {
+        runCatching {
         val sourceName = payload.optString("sourceDeviceName", payload.optString("phoneName", "未知设备"))
         val manifest = payload.optJSONObject("fileManifest")
         val fileName = manifest?.optString("name").orEmpty().ifBlank { payload.optString("label", "文件") }
@@ -1143,9 +1329,11 @@ class NodeReceiverService : Service() {
             .build()
         getSystemService(NotificationManager::class.java)
             .notify((System.currentTimeMillis() % Int.MAX_VALUE).toInt(), notification)
+        }.onFailure { Log.w(TAG, "Unable to show file-transfer request notification", it) }
     }
 
     private fun notifyFileTransferComplete(file: ReceivedFile) {
+        runCatching {
         val openIntent = Intent(Intent.ACTION_VIEW).apply {
             val uri = FileProvider.getUriForFile(
                 this@NodeReceiverService,
@@ -1172,6 +1360,7 @@ class NodeReceiverService : Service() {
             .build()
         getSystemService(NotificationManager::class.java)
             .notify((System.currentTimeMillis() % Int.MAX_VALUE).toInt(), notification)
+        }.onFailure { Log.w(TAG, "Unable to show file-transfer completion notification", it) }
     }
 
     private fun handleIncomingClipboardFilePayload(payload: JSONObject, sourceName: String) {
@@ -1179,41 +1368,53 @@ class NodeReceiverService : Service() {
             val manifest = payload.optJSONObject("fileManifest") ?: return@launch
             val version = clipboardVersionFromPayload(payload, manifest, "file")
             val versionKey = clipboardFileVersionKey(payload, manifest)
-            if (!isCurrentClipboardTempKey("clipboard_file_key", versionKey) &&
-                !isIncomingClipboardVersionNewer(version)
-            ) {
-                return@launch
+            val shouldPull = synchronized(clipboardApplyLock) {
+                if (!isCurrentClipboardTempKey("clipboard_file_key", versionKey) &&
+                    !isIncomingClipboardVersionNewer(version)
+                ) {
+                    false
+                } else {
+                    prepareClipboardTempDirectory("clipboard_file_key", clipboardFileTempRoot(), versionKey)
+                    clearClipboardImageTempFiles()
+                    true
+                }
             }
-            prepareClipboardTempDirectory("clipboard_file_key", clipboardFileTempRoot(), versionKey)
-            clearClipboardImageTempFiles()
+            if (!shouldPull) return@launch
             val received = pullIncomingFileTransfer(
                 payload = payload,
                 saveToHistory = false,
                 subDirectoryName = CLIPBOARD_FILE_TEMP_DIR
             )
-            if (received != null && !isCurrentClipboardTempKey("clipboard_file_key", versionKey)) {
-                runCatching { received.file.delete() }
-                return@launch
+            if (received == null) return@launch
+            val applied = synchronized(clipboardApplyLock) {
+                if (!isCurrentClipboardTempKey("clipboard_file_key", versionKey)) {
+                    runCatching { received.file.delete() }
+                    false
+                } else if (!writeClipboardFilesFromTempRoot()) {
+                    false
+                } else {
+                    ClipboardSyncState.rememberHash(
+                        this@NodeReceiverService,
+                        version.ts,
+                        version.origin,
+                        version.hash,
+                        version.kind
+                    )
+                    ClipboardHistoryStore.addFile(
+                        context = this@NodeReceiverService,
+                        kind = "file",
+                        direction = "incoming",
+                        title = received.name,
+                        path = received.file.absolutePath,
+                        mime = received.mime,
+                        size = received.size,
+                        sourceDeviceId = received.sourceId,
+                        sourceDeviceName = received.sourceName
+                    )
+                    true
+                }
             }
-            if (received != null && writeClipboardFilesFromTempRoot()) {
-                ClipboardSyncState.rememberHash(
-                    this@NodeReceiverService,
-                    version.ts,
-                    version.origin,
-                    version.hash,
-                    version.kind
-                )
-                ClipboardHistoryStore.addFile(
-                    context = this@NodeReceiverService,
-                    kind = "file",
-                    direction = "incoming",
-                    title = received.name,
-                    path = received.file.absolutePath,
-                    mime = received.mime,
-                    size = received.size,
-                    sourceDeviceId = received.sourceId,
-                    sourceDeviceName = received.sourceName
-                )
+            if (applied) {
                 relayClipboardGossipAfterApply(payload, ::rewriteClipboardFileGossipTargets)
                 WebSocketService.reportExternalStatus(
                     this@NodeReceiverService,
@@ -1563,12 +1764,8 @@ class NodeReceiverService : Service() {
                 Log.w(TAG, "文件 hash 校验失败 expected=${expectedHash.take(12)} actual=${actualHash.take(12)}")
                 return null
             }
-            val finalFile = uniqueFile(dir, name)
+            val finalFile = publishReceivedFile(partFile, dir, name)
             sidecarFile.delete()
-            if (!partFile.renameTo(finalFile)) {
-                partFile.copyTo(finalFile, overwrite = true)
-                partFile.delete()
-            }
             getSystemService(NotificationManager::class.java).cancel(progressNotificationId)
             DeviceStore.markDeviceSynced(this, source.id)
             if (saveToHistory) {
@@ -1629,14 +1826,15 @@ class NodeReceiverService : Service() {
             .ifBlank { payload.optString("phoneId") }
             .trim()
         if (sourceId.isBlank()) return null
-        val device = DeviceStore.findDevice(this, sourceId)
+        val device = DeviceStore.findDevice(this, sourceId) ?: return null
+        if (!PolicyManager.isTrustedNetworkDevice(this, device)) return null
         // host 可为空：直连不可达时由 pullIncomingFileTransfer 的代理通道兜底（多跳）
-        val host = device?.host.orEmpty()
+        val host = device.host
             .ifBlank { manifest.optString("host") }
             .ifBlank { payload.optString("sourceHost") }
             .trim()
         val hosts = (listOf(host) +
-            (device?.altHosts ?: emptyList()) +
+            device.altHosts +
             jsonArrayToList(manifest.optJSONArray("altHosts")) +
             jsonArrayToList(payload.optJSONArray("sourceAltHosts")) +
             listOf(manifest.optString("tsHost"), payload.optString("sourceTsHost")))
@@ -1647,31 +1845,34 @@ class NodeReceiverService : Service() {
             "relayPort",
             payload.optInt("relayPort", LanDiscovery.NODE_RELAY_PORT)
         ).takeIf { it > 0 } ?: LanDiscovery.NODE_RELAY_PORT
-        val name = device?.name
-            ?: manifest.optString("originDeviceName")
+        val name = device.name.ifBlank {
+            manifest.optString("originDeviceName")
                 .ifBlank { payload.optString("originDeviceName") }
                 .ifBlank { payload.optString("sourceDeviceName", "未知设备") }
+        }
         return FileSource(
             id = sourceId,
             name = name,
             host = host,
             hosts = hosts,
             port = port,
-            type = device?.type ?: payload.optString("sourceDeviceType", "UNKNOWN_DEVICE"),
-            pairingKey = device?.pairingKey.orEmpty()
+            type = device.type,
+            pairingKey = device.pairingKey
         )
     }
 
-    private fun writeClipboard(text: String) {
-        if (text.isBlank()) return
-        runCatching {
-            clearClipboardFileTempFiles()
-            clearClipboardImageTempFiles()
+    private fun writeClipboard(text: String): Boolean {
+        if (text.isBlank()) return false
+        return runCatching {
             val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
             clipboard.setPrimaryClip(android.content.ClipData.newPlainText("codebridge_clipboard", text))
+            // Keep URI-backed clipboard files alive until the replacement succeeds.
+            clearClipboardFileTempFiles()
+            clearClipboardImageTempFiles()
+            true
         }.onFailure {
             Log.w(TAG, "写入剪贴板失败: ${it.message}")
-        }
+        }.getOrDefault(false)
     }
 
     /**
@@ -1687,24 +1888,30 @@ class NodeReceiverService : Service() {
             ?: payload.optLong("timestamp", 0L)
         val origin = version?.optString("origin").orEmpty()
             .ifBlank { payload.optString("originDeviceId", payload.optString("sourceDeviceId")) }
-        if (ClipboardSyncState.hash(text) == ClipboardSyncState.appliedHash(this)) return false
-        if (!ClipboardSyncState.isNewer(this, ts, origin)) {
-            Log.d(TAG, "剪贴板 LWW：丢弃过期版本 ts=$ts")
-            return false
+        return synchronized(clipboardApplyLock) {
+            if (ClipboardSyncState.hash(text) == ClipboardSyncState.appliedHash(this)) {
+                return@synchronized false
+            }
+            if (!ClipboardSyncState.isNewer(this, ts, origin)) {
+                Log.d(TAG, "剪贴板 LWW：丢弃过期版本 ts=$ts")
+                return@synchronized false
+            }
+            // Advance LWW/history only after ClipboardManager accepted the value.
+            // A transient write failure can then safely retry the same version.
+            if (!writeClipboard(text)) return@synchronized false
+            ClipboardSyncState.remember(this, ts, origin, text)
+            ClipboardHistoryStore.addText(
+                context = this,
+                text = text,
+                direction = "incoming",
+                sourceDeviceId = origin,
+                sourceDeviceName = payload.optString("originDeviceName")
+                    .ifBlank { payload.optString("sourceDeviceName") }
+                    .ifBlank { origin.ifBlank { "未知设备" } },
+                createdAt = ts
+            )
+            true
         }
-        writeClipboard(text)
-        ClipboardSyncState.remember(this, ts, origin, text)
-        ClipboardHistoryStore.addText(
-            context = this,
-            text = text,
-            direction = "incoming",
-            sourceDeviceId = origin,
-            sourceDeviceName = payload.optString("originDeviceName")
-                .ifBlank { payload.optString("sourceDeviceName") }
-                .ifBlank { origin.ifBlank { "未知设备" } },
-            createdAt = ts
-        )
-        return true
     }
 
     /**
@@ -1746,11 +1953,14 @@ class NodeReceiverService : Service() {
         val bytes = runCatching { received.file.readBytes() }.getOrNull()
         runCatching { received.file.delete() }
         if (bytes == null || bytes.isEmpty()) return false
-        if (!isNewerClipboardImageVersion(ts, origin, shortHash)) return false
-        val clipboardFile = writeClipboardImage(bytes, ts, shortHash, mime) ?: return false
-        rememberClipboardImageVersion(ts, origin, shortHash)
-        rememberClipboardImageHistory(payload, clipboardFile, bytes.size.toLong(), ts, origin)
-        return true
+        return synchronized(clipboardApplyLock) {
+            if (!isNewerClipboardImageVersion(ts, origin, shortHash)) return@synchronized false
+            val clipboardFile = writeClipboardImage(bytes, ts, shortHash, mime)
+                ?: return@synchronized false
+            rememberClipboardImageVersion(ts, origin, shortHash)
+            rememberClipboardImageHistory(payload, clipboardFile, bytes.size.toLong(), ts, origin)
+            true
+        }
     }
 
     private suspend fun pullRemoteClipboardText(payload: JSONObject): Boolean {
@@ -1811,11 +2021,14 @@ class NodeReceiverService : Service() {
             ?: payload.optLong("timestamp", 0L)
         val origin = version?.optString("origin").orEmpty()
             .ifBlank { payload.optString("originDeviceId", payload.optString("sourceDeviceId")) }
-        if (!isNewerClipboardImageVersion(ts, origin, shortHash)) return false
-        val clipboardFile = writeClipboardImage(bytes, ts, shortHash, mime) ?: return false
-        rememberClipboardImageVersion(ts, origin, shortHash)
-        rememberClipboardImageHistory(payload, clipboardFile, bytes.size.toLong(), ts, origin)
-        return true
+        return synchronized(clipboardApplyLock) {
+            if (!isNewerClipboardImageVersion(ts, origin, shortHash)) return@synchronized false
+            val clipboardFile = writeClipboardImage(bytes, ts, shortHash, mime)
+                ?: return@synchronized false
+            rememberClipboardImageVersion(ts, origin, shortHash)
+            rememberClipboardImageHistory(payload, clipboardFile, bytes.size.toLong(), ts, origin)
+            true
+        }
     }
 
     private fun writeClipboardImage(bytes: ByteArray, ts: Long, shortHash: String, mime: String): File? {
@@ -1996,7 +2209,55 @@ class NodeReceiverService : Service() {
     override fun onDestroy() {
         running = false
         runCatching { serverSocket?.close() }
+        outboxMaintenanceJob?.cancel()
+        if (connectivityCallbackRegistered) {
+            runCatching { connectivityManager.unregisterNetworkCallback(connectivityCallback) }
+                .onFailure { Log.w(TAG, "Unable to unregister outbox connectivity callback", it) }
+            connectivityCallbackRegistered = false
+        }
         serviceScope.cancel()
         super.onDestroy()
     }
+}
+
+/** Restores the always-on LAN node after reboot without exposing a callable service. */
+class NodeReceiverBootReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+        if (intent.action != Intent.ACTION_BOOT_COMPLETED) return
+        val serviceIntent = Intent(context, NodeReceiverService::class.java)
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(serviceIntent)
+            } else {
+                context.startService(serviceIntent)
+            }
+        } catch (e: RuntimeException) {
+            // Background/FGS policy varies across OEMs; boot must never crash the app.
+            Log.w("NodeReceiverBoot", "Unable to restore node receiver after boot", e)
+        }
+    }
+}
+
+internal fun isExpiredVerificationCodePayload(
+    payload: JSONObject,
+    now: Long = System.currentTimeMillis()
+): Boolean {
+    // Only extracted verification-code messages have the two-minute TTL.
+    // Raw SMS and application notifications may legitimately be delivered later.
+    if (payload.optString("type") != "sms") return false
+    val expiresAt = payload.optLong("expiresAt", 0L)
+    return expiresAt > 0L && now >= expiresAt
+}
+
+internal fun shouldWakePersistentOutbox(
+    hasDueOutbound: Boolean,
+    networkAvailable: Boolean,
+    webSocketServiceRunning: Boolean,
+    now: Long,
+    lastWakeAt: Long,
+    minIntervalMs: Long
+): Boolean {
+    if (!hasDueOutbound || !networkAvailable || webSocketServiceRunning) return false
+    if (lastWakeAt <= 0L || now < lastWakeAt) return true
+    return now - lastWakeAt >= minIntervalMs.coerceAtLeast(0L)
 }

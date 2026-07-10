@@ -7,6 +7,7 @@ const DEFAULT_RETRY_BASE_MS = 15 * 1000
 const DEFAULT_RETRY_MAX_MS = 5 * 60 * 1000
 const DEFAULT_MAX_ATTEMPTS = 8
 const DEFAULT_MAX_RECORD_BYTES = 256 * 1024
+const DEFAULT_SMS_CODE_TTL_MS = 2 * 60 * 1000
 
 function nowMs() {
   return Date.now()
@@ -28,12 +29,22 @@ function outboxKey(messageId, targetNodeId) {
   return `${String(messageId || '').trim()}|${String(targetNodeId || '').trim()}`
 }
 
+function isEnvelopeExpired(envelope = {}, now = nowMs(), fallbackTimestamp = 0) {
+  const payload = envelope.payload && typeof envelope.payload === 'object' ? envelope.payload : {}
+  const explicitExpiresAt = Number(payload.expiresAt || envelope.expiresAt || 0) || 0
+  if (explicitExpiresAt > 0) return explicitExpiresAt <= now
+  if (String(envelope.topic || '').trim() !== 'sms.code') return false
+  const timestamp = Number(envelope.timestamp || payload.timestamp || fallbackTimestamp || 0) || 0
+  return timestamp > 0 && timestamp + DEFAULT_SMS_CODE_TTL_MS <= now
+}
+
 function normalizeRecord(raw = {}) {
   const envelope = raw.envelope && typeof raw.envelope === 'object' ? raw.envelope : null
   const targetNodeId = String(raw.targetNodeId || '').trim()
   const messageId = String(raw.messageId || envelope?.messageId || '').trim()
   if (!envelope || !targetNodeId || !messageId) return null
-  if (!shouldPersistEnvelope(envelope)) return null
+  const createdAt = Number(raw.createdAt || nowMs()) || nowMs()
+  if (!shouldPersistEnvelope(envelope) || isEnvelopeExpired(envelope, nowMs(), createdAt)) return null
   const attempts = Math.max(0, Number(raw.attempts || 0) || 0)
   return {
     id: outboxKey(messageId, targetNodeId),
@@ -43,7 +54,7 @@ function normalizeRecord(raw = {}) {
     envelope: safeJsonClone(envelope),
     status: String(raw.status || 'pending'),
     attempts,
-    createdAt: Number(raw.createdAt || nowMs()) || nowMs(),
+    createdAt,
     updatedAt: Number(raw.updatedAt || nowMs()) || nowMs(),
     nextAttemptAt: Number(raw.nextAttemptAt || 0) || 0,
     ackedAt: Number(raw.ackedAt || 0) || 0,
@@ -55,6 +66,7 @@ function shouldPersistEnvelope(envelope = {}) {
   const topic = String(envelope.topic || '').trim()
   const payload = envelope.payload && typeof envelope.payload === 'object' ? envelope.payload : {}
   const manifest = payload.fileManifest && typeof payload.fileManifest === 'object' ? payload.fileManifest : null
+  if (isEnvelopeExpired(envelope)) return false
   if (manifest) {
     if (manifest.inline === true) return false
     const expiresAt = Number(manifest.expiresAt || 0) || 0
@@ -111,11 +123,13 @@ function createBusReliabilityStore(options = {}) {
       if (record.attempts >= maxAttempts && record.status === 'failed') continue
       outbox.set(record.id, record)
     }
+    pruneOutbox()
     trimSeen()
     trimOutbox()
   }
 
   function exportState() {
+    pruneOutbox()
     return {
       version: 1,
       seen: Array.from(seen.entries()).map(([key, firstSeenAt]) => ({ key, firstSeenAt })),
@@ -146,6 +160,16 @@ function createBusReliabilityStore(options = {}) {
       .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
     for (const record of records.slice(outboxLimit)) {
       outbox.delete(record.id)
+    }
+  }
+
+  function pruneOutbox() {
+    const now = nowMs()
+    for (const [id, record] of outbox) {
+      if (record.status === 'acked' || record.status === 'failed' ||
+        isEnvelopeExpired(record.envelope, now, record.createdAt)) {
+        outbox.delete(id)
+      }
     }
   }
 
@@ -204,8 +228,9 @@ function createBusReliabilityStore(options = {}) {
     record.lastError = String(reason || '')
     record.updatedAt = nowMs()
     if (record.attempts >= maxAttempts) {
-      record.status = 'failed'
-      record.nextAttemptAt = 0
+      // A terminal failure must not leave sensitive payloads parked on disk
+      // forever. Delivery history is already represented by the seen map.
+      outbox.delete(id)
     } else {
       const delay = Math.min(retryMaxMs, retryBaseMs * Math.pow(2, Math.max(0, record.attempts - 1)))
       record.status = 'pending'
@@ -215,6 +240,7 @@ function createBusReliabilityStore(options = {}) {
   }
 
   function dueRecords(limit = 50) {
+    pruneOutbox()
     const now = nowMs()
     return Array.from(outbox.values())
       .filter(record => record.status === 'pending' && (!record.nextAttemptAt || record.nextAttemptAt <= now))
@@ -241,5 +267,6 @@ function createBusReliabilityStore(options = {}) {
 module.exports = {
   createBusReliabilityStore,
   envelopeKey,
-  outboxKey
+  outboxKey,
+  isEnvelopeExpired
 }

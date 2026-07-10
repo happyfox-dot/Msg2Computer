@@ -119,7 +119,8 @@ object FileTransferRegistry {
         if (transfer.targetDeviceIds.isNotEmpty() && requester !in transfer.targetDeviceIds) {
             return ChunkResponse(403)
         }
-        if (DeviceStore.findDevice(context, requester) == null) return ChunkResponse(403)
+        val requesterDevice = DeviceStore.findDevice(context, requester)
+        if (!PolicyManager.isTrustedNetworkDevice(context, requesterDevice)) return ChunkResponse(403)
         val sourceKey = PhoneIdentityStore.get(context).pairingKey
 
         val from = fromRaw?.toLongOrNull() ?: return ChunkResponse(400)
@@ -160,38 +161,52 @@ object FileTransferRegistry {
 
     private fun pruneExpired() {
         val now = System.currentTimeMillis()
-        outgoingTransfers.entries.removeIf { now > it.value.expiresAt }
+        // Collection.removeIf is API 24. Keep the advertised API 23 floor by using
+        // conditional ConcurrentMap removals, which also avoid deleting a replaced
+        // record during concurrent registration.
+        for (entry in outgoingTransfers.entries) {
+            if (now > entry.value.expiresAt) {
+                outgoingTransfers.remove(entry.key, entry.value)
+            }
+        }
         // 内层条目按 TTL 过期；内层清空后外层 senderId 桶也需删除，否则每个曾
         // 交互过的 senderId 会留一个永不回收的空桶（与桌面 recentChunkNonces 同款泄漏）
-        recentNonces.entries.removeIf { (_, seen) ->
+        for (entry in recentNonces.entries) {
+            val seen = entry.value
             synchronized(seen) {
                 val iterator = seen.entries.iterator()
                 while (iterator.hasNext()) {
                     if (now - iterator.next().value > NONCE_TTL_MS) iterator.remove()
                 }
-                seen.isEmpty()
+                if (seen.isEmpty()) recentNonces.remove(entry.key, seen)
             }
         }
     }
 
     private fun isReplayNonce(senderId: String, nonce: String): Boolean {
         if (nonce.isBlank()) return true
-        val now = System.currentTimeMillis()
-        val seen = recentNonces.getOrPut(senderId) {
-            object : LinkedHashMap<String, Long>(NONCE_LIMIT + 1, 0.75f, true) {
-                override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Long>?): Boolean {
-                    return size > NONCE_LIMIT
+        while (true) {
+            val now = System.currentTimeMillis()
+            val seen = recentNonces.getOrPut(senderId) {
+                object : LinkedHashMap<String, Long>(NONCE_LIMIT + 1, 0.75f, true) {
+                    override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Long>?): Boolean {
+                        return size > NONCE_LIMIT
+                    }
                 }
             }
-        }
-        synchronized(seen) {
-            val iterator = seen.entries.iterator()
-            while (iterator.hasNext()) {
-                if (now - iterator.next().value > NONCE_TTL_MS) iterator.remove()
+            synchronized(seen) {
+                // pruneExpired may have detached this empty bucket after getOrPut.
+                // Retry against the current bucket instead of recording a nonce in
+                // an unreachable map and silently losing replay protection.
+                if (recentNonces[senderId] !== seen) return@synchronized
+                val iterator = seen.entries.iterator()
+                while (iterator.hasNext()) {
+                    if (now - iterator.next().value > NONCE_TTL_MS) iterator.remove()
+                }
+                if (seen.containsKey(nonce)) return true
+                seen[nonce] = now
+                return false
             }
-            if (seen.containsKey(nonce)) return true
-            seen[nonce] = now
-            return false
         }
     }
 
