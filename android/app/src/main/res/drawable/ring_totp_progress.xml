@@ -5,8 +5,8 @@
 <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
     <item android:id="@android:id/background">
         <shape android:shape="ring"
-            android:innerRadiusRatio="3.2"
-            android:thicknessRatio="9"
+            android:innerRadiusRatio="3.1"
+            android:thicknessRatio="8"
             android:useLevel="false">
             <solid android:color="@color/bg_surface_variant" />
         </shape>
@@ -18,8 +18,8 @@
             android:pivotX="50%"
             android:pivotY="50%">
             <shape android:shape="ring"
-                android:innerRadiusRatio="3.2"
-                android:thicknessRatio="9"
+                android:innerRadiusRatio="3.1"
+                android:thicknessRatio="8"
                 android:useLevel="true">
                 <solid android:color="@color/accent_green" />
             </shape>

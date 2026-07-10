@@ -1418,6 +1418,7 @@ let topologyBacklogSaveDirty = false
 let topologyBacklogSaveInFlight = null
 
 function saveTopologyDeltaBacklog() {
+  if (!persistenceReadiness.canPersistUserState()) return
   if (topologyBacklogSaveTimer) return
   topologyBacklogSaveTimer = setTimeout(() => {
     topologyBacklogSaveTimer = null
@@ -1431,10 +1432,18 @@ function flushPendingTopologyBacklogSave(options = {}) {
     clearTimeout(topologyBacklogSaveTimer)
     topologyBacklogSaveTimer = null
   }
+  if (!persistenceReadiness.canPersistUserState()) {
+    topologyBacklogSaveDirty = false
+    return Promise.resolve(false)
+  }
   return flushTopologyDeltaBacklogToDisk(options)
 }
 
 function flushTopologyDeltaBacklogToDisk(options = {}) {
+  if (!persistenceReadiness.canPersistUserState()) {
+    topologyBacklogSaveDirty = false
+    return Promise.resolve(false)
+  }
   if (options.sync === true) {
     topologyBacklogSaveDirty = false
     try {
@@ -1458,6 +1467,7 @@ function flushTopologyDeltaBacklogToDisk(options = {}) {
 async function drainTopologyBacklogSaveQueue() {
   while (topologyBacklogSaveDirty) {
     topologyBacklogSaveDirty = false
+    if (!persistenceReadiness.canPersistUserState()) continue
     try {
       await writeJsonAtomic(getTopologyDeltaBacklogPath(), buildTopologyDeltaBacklogState())
     } catch (error) {
@@ -1837,6 +1847,7 @@ function getContentBus() {
 
 function loadOrCreatePairingKey() {
   const configPath = getPairingConfigPath()
+  let shouldPersistTopologyBacklog = false
   try {
     if (fs.existsSync(configPath)) {
       const saved = JSON.parse(fs.readFileSync(configPath, 'utf8'))
@@ -1962,7 +1973,7 @@ function loadOrCreatePairingKey() {
       importSavedTopologyLsdb(saved.topologyLsdb || {})
       importTopologyDeltaBacklog(loadTopologyDeltaBacklogState(saved.topologyDeltaBacklog || []))
       if (Array.isArray(saved.topologyDeltaBacklog) && saved.topologyDeltaBacklog.length > 0) {
-        saveTopologyDeltaBacklog()
+        shouldPersistTopologyBacklog = true
       }
       pruneTotpDeleteTombstones()
       if (saved.pairingKey) {
@@ -1972,10 +1983,14 @@ function loadOrCreatePairingKey() {
         if (restoredKey) {
           pairingKey = restoredKey
           ensureTrustedNetworkId()
+          let shouldPersistPairingConfig = false
           if (!localEventToken) {
             ensureLocalEventToken()
-            savePairingKey()
+            shouldPersistPairingConfig = true
           }
+          persistenceReadiness.markPairingStateLoaded()
+          if (shouldPersistTopologyBacklog) saveTopologyDeltaBacklog()
+          if (shouldPersistPairingConfig) savePairingKey()
           return
         }
         throw new Error('pairing key could not be decrypted')
@@ -1996,6 +2011,8 @@ function loadOrCreatePairingKey() {
   pairingKey = crypto.randomBytes(32).toString('base64')
   ensureTrustedNetworkId()
   ensureLocalEventToken()
+  persistenceReadiness.markPairingStateLoaded()
+  if (shouldPersistTopologyBacklog) saveTopologyDeltaBacklog()
   savePairingKey()
 }
 
@@ -2005,6 +2022,7 @@ let pairingSaveInFlight = null
 
 // 调用极频繁（每次设备上线、每条消息落库都会触发），防抖合并 500ms 内的写盘
 function savePairingKey() {
+  if (!persistenceReadiness.canPersistUserState()) return
   if (pairingSaveTimer) return
   pairingSaveTimer = setTimeout(() => {
     pairingSaveTimer = null
@@ -2018,12 +2036,21 @@ function flushPendingPairingSave(options = {}) {
     clearTimeout(pairingSaveTimer)
     pairingSaveTimer = null
   }
+  if (!persistenceReadiness.canPersistUserState()) {
+    pairingSaveDirty = false
+    flushPendingTopologyBacklogSave(options)
+    return Promise.resolve(false)
+  }
   const sync = options.sync === true || app.isQuitting === true
   flushPendingTopologyBacklogSave({ sync })
   return flushPairingConfigToDisk({ sync })
 }
 
 function flushPairingConfigToDisk(options = {}) {
+  if (!persistenceReadiness.canPersistUserState()) {
+    pairingSaveDirty = false
+    return Promise.resolve(false)
+  }
   if (options.sync === true) {
     pairingSaveDirty = false
     try {
@@ -2049,6 +2076,7 @@ function flushPairingConfigToDisk(options = {}) {
 async function drainPairingConfigSaveQueue() {
   while (pairingSaveDirty) {
     pairingSaveDirty = false
+    if (!persistenceReadiness.canPersistUserState()) continue
     try {
       const nextState = buildPairingConfigState()
       backupPairingConfigBeforeTotpShrink(nextState)

@@ -21,9 +21,27 @@ jobs:
       - name: Resolve release version
         shell: pwsh
         run: |
-          $pkg = Get-Content -Raw -Path desktop/package.json | ConvertFrom-Json
-          "APP_VERSION=$($pkg.version)" >> $env:GITHUB_ENV
-          "RELEASE_TAG=v$($pkg.version)" >> $env:GITHUB_ENV
+          $desktopPackage = Get-Content -Raw -Path desktop/package.json | ConvertFrom-Json
+          $rootPackage = Get-Content -Raw -Path package.json | ConvertFrom-Json
+          $lock = Get-Content -Raw -Path desktop/package-lock.json | ConvertFrom-Json -AsHashtable
+          $androidGradle = Get-Content -Raw -Path android/app/build.gradle.kts
+          $androidVersionName = [regex]::Match($androidGradle, 'versionName\s*=\s*"([^"]+)"').Groups[1].Value
+          $androidVersionCode = [regex]::Match($androidGradle, 'versionCode\s*=\s*(\d+)').Groups[1].Value
+          $appVersion = $desktopPackage.version
+
+          if (-not $appVersion -or -not $androidVersionName -or -not $androidVersionCode) {
+            throw 'Unable to resolve release versions'
+          }
+          if ($rootPackage.version -ne $appVersion -or
+              $lock['version'] -ne $appVersion -or
+              $lock['packages']['']['version'] -ne $appVersion -or
+              $androidVersionName -ne $appVersion) {
+            throw "Release version mismatch: root=$($rootPackage.version), desktop=$appVersion, lock=$($lock['version']), lockRoot=$($lock['packages']['']['version']), android=$androidVersionName"
+          }
+
+          "APP_VERSION=$appVersion" >> $env:GITHUB_ENV
+          "ANDROID_VERSION_CODE=$androidVersionCode" >> $env:GITHUB_ENV
+          "RELEASE_TAG=v$appVersion" >> $env:GITHUB_ENV
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -76,6 +94,66 @@ jobs:
             "-Dorg.gradle.java.home=$env:JAVA_HOME" `
             "-Dorg.gradle.jvmargs=-Xmx1536m -XX:MaxMetaspaceSize=512m -Dfile.encoding=UTF-8" `
             :app:testDebugUnitTest :app:lintDebug :app:assembleRelease --no-daemon
+
+      - name: Verify Android release identity
+        shell: pwsh
+        env:
+          EXPECTED_ANDROID_CERT_SHA256: 3ff4b892c305394b406e4ee43aa41197e84d690755a8667eaff46a6ebf774239
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $apk = (Resolve-Path 'android/app/build/outputs/apk/release/app-release.apk').Path
+          $sdkRoot = if ($env:ANDROID_SDK_ROOT) { $env:ANDROID_SDK_ROOT } else { $env:ANDROID_HOME }
+          $buildTools = Get-ChildItem -Path (Join-Path $sdkRoot 'build-tools') -Directory |
+            Sort-Object { [version]$_.Name } -Descending |
+            Select-Object -First 1
+          if (-not $buildTools) { throw 'Android build-tools not found' }
+
+          $apksigner = Join-Path $buildTools.FullName 'apksigner.bat'
+          $aapt = Join-Path $buildTools.FullName 'aapt.exe'
+          if (-not (Test-Path $apksigner) -or -not (Test-Path $aapt)) {
+            throw "Required APK verification tools not found in $($buildTools.FullName)"
+          }
+
+          $signatureLines = & $apksigner verify --verbose --print-certs $apk 2>&1
+          $signatureText = $signatureLines -join "`n"
+          $certMatch = [regex]::Match(
+            $signatureText,
+            'Signer #1 certificate SHA-256 digest:\s*([0-9a-fA-F]+)'
+          )
+          if (-not $certMatch.Success) { throw 'Unable to read APK signer certificate SHA-256' }
+          $actualCert = $certMatch.Groups[1].Value.ToLowerInvariant()
+          if ($actualCert -ne $env:EXPECTED_ANDROID_CERT_SHA256) {
+            throw "Unexpected Android signing certificate: $actualCert"
+          }
+          if ($signatureText -notmatch 'Number of signers:\s*1' -or
+              $signatureText -notmatch 'Verified using v2 scheme \(APK Signature Scheme v2\): true') {
+            throw 'APK must have exactly one signer and a valid v2 signature'
+          }
+
+          $badgingLines = & $aapt dump badging $apk 2>&1
+          $badging = $badgingLines -join "`n"
+          $escapedVersion = [regex]::Escape($env:APP_VERSION)
+          $escapedVersionCode = [regex]::Escape($env:ANDROID_VERSION_CODE)
+          if ($badging -notmatch "package: name='com\.codesync'") {
+            throw 'Unexpected Android application ID'
+          }
+          if ($badging -notmatch "versionName='$escapedVersion'") {
+            throw "APK versionName does not match $env:APP_VERSION"
+          }
+          if ($badging -notmatch "versionCode='$escapedVersionCode'") {
+            throw "APK versionCode does not match $env:ANDROID_VERSION_CODE"
+          }
+          if ($badging -match '(?m)^application-debuggable') {
+            throw 'Debuggable APKs must never be published'
+          }
+
+          "Verified Android release: com.codesync $env:APP_VERSION ($env:ANDROID_VERSION_CODE), signer $actualCert" >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Stage Android release asset
+        shell: pwsh
+        working-directory: android
+        run: |
           New-Item -ItemType Directory -Force -Path release | Out-Null
           Copy-Item -Force app/build/outputs/apk/release/app-release.apk "release/Msg2Computer-Android-$env:APP_VERSION.apk"
 

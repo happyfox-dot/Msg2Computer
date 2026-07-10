@@ -42,6 +42,11 @@ const {
   guardUnauthenticatedWebSocket
 } = require('./src/main/websocket-security')
 const { readJsonSync, writeJsonAtomic, writeJsonAtomicSync } = require('./src/main/async-json-file')
+const { createPersistenceReadiness } = require('./src/main/persistence-readiness')
+
+// A process may be started only to ask an older instance to quit for an update.
+// Do not let that short-lived process persist the empty in-memory defaults.
+const persistenceReadiness = createPersistenceReadiness()
 
 let mainWindow = null
 let bubbleWindow = null

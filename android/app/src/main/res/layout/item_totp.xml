@@ -1,91 +1,117 @@
 <?xml version="1.0" encoding="utf-8"?>
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
-    android:orientation="horizontal"
-    android:gravity="center_vertical"
+    android:layout_marginBottom="10dp"
     android:background="@drawable/bg_row"
-    android:paddingStart="10dp"
+    android:orientation="vertical"
+    android:paddingStart="14dp"
+    android:paddingTop="12dp"
     android:paddingEnd="10dp"
-    android:paddingTop="8dp"
-    android:paddingBottom="8dp"
-    android:layout_marginBottom="6dp">
-
-    <FrameLayout
-        android:layout_width="34dp"
-        android:layout_height="34dp"
-        android:layout_marginEnd="10dp">
-
-        <ProgressBar
-            android:id="@+id/totpProgress"
-            style="?android:attr/progressBarStyleHorizontal"
-            android:layout_width="34dp"
-            android:layout_height="34dp"
-            android:indeterminate="false"
-            android:max="30"
-            android:progress="30"
-            android:progressDrawable="@drawable/ring_totp_progress" />
-
-        <TextView
-            android:id="@+id/totpRemaining"
-            android:layout_width="match_parent"
-            android:layout_height="match_parent"
-            android:gravity="center"
-            android:textColor="@color/text_secondary"
-            android:textSize="10sp"
-            android:text="30" />
-
-    </FrameLayout>
+    android:paddingBottom="8dp">
 
     <LinearLayout
-        android:layout_width="0dp"
+        android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_weight="1"
-        android:orientation="vertical">
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
 
-        <TextView
-            android:id="@+id/totpLabel"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="TOTP"
-            android:textColor="@color/text_secondary"
-            android:textSize="12sp"
-            android:maxLines="1"
-            android:ellipsize="end" />
+        <FrameLayout
+            android:layout_width="44dp"
+            android:layout_height="44dp"
+            android:layout_marginEnd="12dp">
 
-        <TextView
-            android:id="@+id/totpCode"
-            android:layout_width="match_parent"
+            <ProgressBar
+                android:id="@+id/totpProgress"
+                style="?android:attr/progressBarStyleHorizontal"
+                android:layout_width="44dp"
+                android:layout_height="44dp"
+                android:indeterminate="false"
+                android:max="30"
+                android:progress="30"
+                android:progressDrawable="@drawable/ring_totp_progress" />
+
+            <TextView
+                android:id="@+id/totpRemaining"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:fontFamily="sans-serif-medium"
+                android:gravity="center"
+                android:textColor="@color/accent_green"
+                android:textSize="11sp"
+                tools:text="30" />
+
+        </FrameLayout>
+
+        <LinearLayout
+            android:layout_width="0dp"
             android:layout_height="wrap_content"
-            android:layout_marginTop="2dp"
-            android:text="000000"
-            android:textColor="@color/text_primary"
-            android:textSize="22sp"
-            android:textStyle="bold"
-            android:fontFamily="monospace"
-            android:letterSpacing="0.08" />
+            android:layout_weight="1"
+            android:orientation="vertical">
+
+            <TextView
+                android:id="@+id/totpLabel"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:ellipsize="end"
+                android:fontFamily="sans-serif-medium"
+                android:maxLines="1"
+                android:textColor="@color/text_secondary"
+                android:textSize="13sp"
+                tools:text="GitHub" />
+
+            <com.google.android.material.textview.MaterialTextView
+                android:id="@+id/totpCode"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:fontFamily="monospace"
+                android:letterSpacing="0.06"
+                android:maxLines="1"
+                android:minHeight="32dp"
+                android:textColor="@color/text_primary"
+                android:textSize="24sp"
+                android:textStyle="bold"
+                app:autoSizeMaxTextSize="24sp"
+                app:autoSizeMinTextSize="14sp"
+                app:autoSizeStepGranularity="1sp"
+                app:autoSizeTextType="uniform"
+                tools:text="839201" />
+
+        </LinearLayout>
 
     </LinearLayout>
 
-    <TextView
-        android:id="@+id/totpPin"
-        android:layout_width="28dp"
-        android:layout_height="28dp"
-        android:layout_marginStart="6dp"
-        android:gravity="center"
-        android:text="☆"
-        android:textColor="@color/warning"
-        android:textSize="18sp"
-        android:contentDescription="@string/totp_pin" />
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="48dp"
+        android:layout_marginTop="2dp"
+        android:gravity="end|center_vertical"
+        android:orientation="horizontal">
 
-    <ImageView
-        android:id="@+id/totpCopy"
-        android:layout_width="22dp"
-        android:layout_height="22dp"
-        android:layout_marginStart="6dp"
-        android:src="@drawable/ic_copy"
-        android:contentDescription="@string/copy"
-        app:tint="@color/text_secondary" />
+        <TextView
+            android:id="@+id/totpPin"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="@string/totp_pin"
+            android:gravity="center"
+            android:textColor="@color/text_tertiary"
+            android:textSize="21sp"
+            tools:text="☆" />
+
+        <ImageView
+            android:id="@+id/totpCopy"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="@string/copy"
+            android:padding="14dp"
+            android:src="@drawable/ic_copy"
+            app:tint="@color/accent_cyan" />
+
+    </LinearLayout>
 
 </LinearLayout>

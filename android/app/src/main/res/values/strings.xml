@@ -1,6 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">验证码同步</string>
+    <string name="app_tagline">安全连接 · 即时同步</string>
+    <string name="sync_overview">同步概览</string>
+    <string name="topology_section_desc">查看可信设备、在线状态与当前消息路由</string>
     <string name="scan_qr">扫描配对二维码</string>
     <string name="connected">已连接</string>
     <string name="disconnected">未连接</string>

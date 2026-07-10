@@ -4,23 +4,30 @@
         <item name="colorPrimary">@color/primary</item>
         <item name="colorOnPrimary">@color/on_primary</item>
         <item name="colorPrimaryContainer">@color/primary_container</item>
-        <item name="colorOnPrimaryContainer">@color/text_primary</item>
-        <item name="colorSecondary">@color/accent_green</item>
-        <item name="colorOnSecondary">@color/on_primary</item>
+        <item name="colorOnPrimaryContainer">@color/on_primary_container</item>
+        <item name="colorSecondary">@color/accent_cyan</item>
+        <item name="colorOnSecondary">@color/on_accent_cyan</item>
+        <item name="colorSecondaryContainer">@color/secondary_container</item>
+        <item name="colorOnSecondaryContainer">@color/on_secondary_container</item>
         <item name="colorError">@color/danger</item>
         <item name="android:colorBackground">@color/bg_window</item>
         <item name="colorSurface">@color/bg_surface</item>
         <item name="colorOnSurface">@color/text_primary</item>
         <item name="colorSurfaceVariant">@color/bg_surface_variant</item>
         <item name="colorOnSurfaceVariant">@color/text_secondary</item>
-        <item name="colorOutline">@color/outline</item>
-        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="colorOutline">@color/outline_strong</item>
+        <item name="android:windowBackground">@drawable/bg_app_window</item>
+        <item name="android:fontFamily">sans</item>
+        <item name="android:statusBarColor">@color/bg_window</item>
         <item name="android:navigationBarColor">@color/bg_window</item>
         <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowActionModeOverlay">true</item>
+        <item name="materialButtonStyle">@style/Widget.CodeSync.Button</item>
+        <item name="materialSwitchStyle">@style/Widget.CodeSync.Switch</item>
+        <item name="textInputStyle">@style/Widget.CodeSync.TextInputLayout</item>
     </style>
 
-    <!-- 透明一闪主题：快捷磁贴拉起的 ClipboardSyncActivity 用——获焦读剪贴板后立即关闭，
-         全程不显示任何界面 -->
+    <!-- Invisible trampoline used by the clipboard quick-settings tile. -->
     <style name="Theme.CodeSync.Translucent">
         <item name="android:windowBackground">@android:color/transparent</item>
         <item name="android:windowIsTranslucent">true</item>
@@ -30,26 +37,79 @@
         <item name="android:navigationBarColor">@android:color/transparent</item>
     </style>
 
-    <!-- 卡片：圆角 + 微弱描边 + 轻阴影，从深色背景里浮出来。
-         内部 padding 由各卡片内的 LinearLayout 负责，这里不设 contentPadding 以免叠加。 -->
-    <style name="CardSurface" parent="Widget.Material3.CardView.Elevated">
+    <style name="CardSurface" parent="Widget.Material3.CardView.Filled">
         <item name="android:layout_width">match_parent</item>
         <item name="android:layout_height">wrap_content</item>
-        <item name="android:layout_marginBottom">12dp</item>
+        <item name="android:layout_marginBottom">14dp</item>
         <item name="cardBackgroundColor">@color/bg_surface</item>
-        <item name="cardCornerRadius">18dp</item>
-        <item name="cardElevation">2dp</item>
+        <item name="cardCornerRadius">22dp</item>
+        <item name="cardElevation">0dp</item>
         <item name="strokeColor">@color/outline</item>
         <item name="strokeWidth">1dp</item>
     </style>
 
-    <!-- 区块小标题：灰色、字间距略大 -->
     <style name="SectionTitle">
         <item name="android:layout_width">wrap_content</item>
         <item name="android:layout_height">wrap_content</item>
-        <item name="android:textColor">@color/text_tertiary</item>
+        <item name="android:textColor">@color/text_primary</item>
+        <item name="android:textSize">18sp</item>
+        <item name="android:textStyle">bold</item>
+        <item name="android:fontFamily">sans-serif-medium</item>
+        <item name="android:letterSpacing">0.01</item>
+    </style>
+
+    <style name="SettingTitle">
+        <item name="android:textColor">@color/text_primary</item>
+        <item name="android:textSize">15sp</item>
+        <item name="android:fontFamily">sans-serif-medium</item>
+    </style>
+
+    <style name="SettingDescription">
+        <item name="android:textColor">@color/text_secondary</item>
         <item name="android:textSize">12sp</item>
-        <item name="android:letterSpacing">0.08</item>
+        <item name="android:lineSpacingExtra">2dp</item>
+    </style>
+
+    <style name="Widget.CodeSync.Button" parent="Widget.Material3.Button">
+        <item name="android:minHeight">48dp</item>
+        <item name="android:textSize">14sp</item>
         <item name="android:textAllCaps">false</item>
+        <item name="android:fontFamily">sans-serif-medium</item>
+        <item name="backgroundTint">@color/primary</item>
+        <item name="android:textColor">@color/on_primary</item>
+        <item name="iconTint">@color/on_primary</item>
+        <item name="cornerRadius">14dp</item>
+        <item name="rippleColor">@color/ripple</item>
+    </style>
+
+    <style name="Widget.CodeSync.Switch" parent="Widget.Material3.CompoundButton.MaterialSwitch">
+        <item name="android:minWidth">52dp</item>
+        <item name="android:minHeight">48dp</item>
+    </style>
+
+    <style name="Widget.CodeSync.TextInputLayout" parent="Widget.Material3.TextInputLayout.OutlinedBox">
+        <item name="boxBackgroundColor">@color/bg_surface_variant</item>
+        <item name="boxStrokeColor">@color/primary</item>
+        <item name="boxStrokeWidth">1dp</item>
+        <item name="boxStrokeWidthFocused">2dp</item>
+        <item name="boxCornerRadiusTopStart">14dp</item>
+        <item name="boxCornerRadiusTopEnd">14dp</item>
+        <item name="boxCornerRadiusBottomStart">14dp</item>
+        <item name="boxCornerRadiusBottomEnd">14dp</item>
+        <item name="hintTextColor">@color/text_secondary</item>
+        <item name="android:textColorHint">@color/text_secondary</item>
+    </style>
+
+    <style name="Widget.CodeSync.NavButton" parent="Widget.Material3.Button.TextButton">
+        <item name="android:minHeight">48dp</item>
+        <item name="android:minWidth">72dp</item>
+        <item name="android:paddingStart">16dp</item>
+        <item name="android:paddingEnd">16dp</item>
+        <item name="android:textSize">13sp</item>
+        <item name="android:fontFamily">sans-serif-medium</item>
+        <item name="android:textAllCaps">false</item>
+        <item name="cornerRadius">14dp</item>
+        <item name="strokeColor">@color/primary</item>
+        <item name="rippleColor">@color/ripple</item>
     </style>
 </resources>

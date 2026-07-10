@@ -1,14 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
-    <path android:fillColor="#7C8AFF"
+    <path android:fillColor="@color/primary"
         android:pathData="M54,54m-40,0a40,40 0,1 1,80 0a40,40 0,1 1,-80 0"/>
-    <path android:fillColor="#FFFFFF"
+    <path android:fillColor="#152B4B"
+        android:pathData="M54,54m-34,0a34,34 0,1 1,68 0a34,34 0,1 1,-68 0"/>
+    <path android:fillColor="@color/accent_cyan"
         android:pathData="M38,42h12V30H38V42zM42,34h4v4h-4V34z"/>
-    <path android:fillColor="#FFFFFF" android:strokeColor="#FFFFFF" android:strokeWidth="2"
+    <path android:fillColor="@color/accent_cyan" android:strokeColor="@color/accent_cyan" android:strokeWidth="2"
         android:pathData="M58,30v12h12V30H58zM66,38h-4v-4h4V38z"/>
-    <path android:fillColor="#FFFFFF"
+    <path android:fillColor="@color/accent_cyan"
         android:pathData="M38,78h12V66H38V78zM42,70h4v4h-4V70z"/>
-    <path android:fillColor="#FFFFFF"
+    <path android:fillColor="@color/text_primary"
         android:pathData="M62,58h4v4h-4zM70,58h4v4h-4zM62,66h4v4h-4zM70,66h4v4h-4z"/>
 </vector>
